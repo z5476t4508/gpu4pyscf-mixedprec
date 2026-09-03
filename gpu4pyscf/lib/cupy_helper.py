@@ -289,30 +289,59 @@ def fill_symmetric(a, pair_addresses, nao, p0=0, p1=None, out=None, stream=None)
 
     pair_addresses = cupy.asarray(pair_addresses, dtype=np.int32)
     out_stride = out.strides[-2] // out.itemsize
-    if a.strides[-1] == 8: # a is in row major
+    if a.strides[-1] == a.itemsize: # a is in row major
         a_stride = a.strides[-2] // a.itemsize
-        err = libcupy_helper.decompress_and_fill(
-            ctypes.cast(stream.ptr, ctypes.c_void_p),
-            ctypes.cast(out.data.ptr, ctypes.c_void_p),
-            ctypes.c_int(out_stride),
-            ctypes.cast(a.data.ptr, ctypes.c_void_p),
-            ctypes.cast(pair_addresses.data.ptr, ctypes.c_void_p),
-            ctypes.c_int(len(pair_addresses)),
-            ctypes.c_int(nao),
-            ctypes.c_int(a_stride),
-            ctypes.c_int(p0), ctypes.c_int(p1))
+        if a.dtype == np.float32:
+            err = libcupy_helper.decompress_and_fill_f32(
+                ctypes.cast(stream.ptr, ctypes.c_void_p),
+                ctypes.cast(out.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(out_stride),
+                ctypes.cast(a.data.ptr, ctypes.c_void_p),
+                ctypes.cast(pair_addresses.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(len(pair_addresses)),
+                ctypes.c_int(nao),
+                ctypes.c_int(a_stride),
+                ctypes.c_int(p0), ctypes.c_int(p1))
+        else:
+            err = libcupy_helper.decompress_and_fill(
+                ctypes.cast(stream.ptr, ctypes.c_void_p),
+                ctypes.cast(out.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(out_stride),
+                ctypes.cast(a.data.ptr, ctypes.c_void_p),
+                ctypes.cast(pair_addresses.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(len(pair_addresses)),
+                ctypes.c_int(nao),
+                ctypes.c_int(a_stride),
+                ctypes.c_int(p0), ctypes.c_int(p1))
         if err != 0:
             raise RuntimeError('decompress_and_fill failed')
     else: # a is in column major
-        err = libcupy_helper.decompress_and_transpose(
-            ctypes.cast(stream.ptr, ctypes.c_void_p),
-            ctypes.cast(out.data.ptr, ctypes.c_void_p),
-            ctypes.c_int(out_stride), ctypes.cast(a.data.ptr, ctypes.c_void_p),
-            ctypes.cast(pair_addresses.data.ptr, ctypes.c_void_p),
-            ctypes.c_int(len(pair_addresses)),
-            ctypes.c_int(nao),
-            ctypes.c_int(p0), ctypes.c_int(p1),
-            ctypes.c_int(1), ctypes.c_int(0))
+        if a.dtype == np.float32 and out.dtype == np.float32:
+            err = libcupy_helper.decompress_and_transpose_f32(
+                ctypes.cast(stream.ptr, ctypes.c_void_p),
+                ctypes.cast(out.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(out_stride), ctypes.cast(a.data.ptr, ctypes.c_void_p),
+                ctypes.cast(pair_addresses.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(len(pair_addresses)),
+                ctypes.c_int(nao),
+                ctypes.c_int(p0), ctypes.c_int(p1),
+                ctypes.c_int(1), ctypes.c_int(0))
+        elif a.dtype == np.float32:
+            # float32 input, float64 output: not supported by the kernels;
+            # cast through a float32 workspace would double memory. The mixed
+            # callers should ensure matching dtypes.
+            raise NotImplementedError(
+                'fill_symmetric with float32 input and float64 output')
+        else:
+            err = libcupy_helper.decompress_and_transpose(
+                ctypes.cast(stream.ptr, ctypes.c_void_p),
+                ctypes.cast(out.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(out_stride), ctypes.cast(a.data.ptr, ctypes.c_void_p),
+                ctypes.cast(pair_addresses.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(len(pair_addresses)),
+                ctypes.c_int(nao),
+                ctypes.c_int(p0), ctypes.c_int(p1),
+                ctypes.c_int(1), ctypes.c_int(0))
         if err != 0:
             raise RuntimeError('decompress_and_transpose failed')
     return out

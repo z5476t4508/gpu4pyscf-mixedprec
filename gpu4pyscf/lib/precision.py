@@ -56,7 +56,11 @@ def get_precision():
 
 @contextlib.contextmanager
 def fp32():
-    '''Context manager to run the enclosed block in float32 mode.'''
+    '''Context manager to run the enclosed block in float32 mode.
+
+    Only the tensor contractions run in float32; persistent data (CDERI
+    storage) keeps float64 precision.
+    '''
     global PRECISION_MODE
     saved = PRECISION_MODE
     PRECISION_MODE = 'fp32'

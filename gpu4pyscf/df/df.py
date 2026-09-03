@@ -26,6 +26,7 @@ from gpu4pyscf.lib.cupy_helper import (
 from gpu4pyscf.lib import logger
 from gpu4pyscf.lib import utils
 from gpu4pyscf.lib import multi_gpu
+from gpu4pyscf.lib import precision
 from gpu4pyscf.df import int3c2e_bdiv
 from gpu4pyscf.df import df_jk
 from gpu4pyscf.gto.mole import SortedMole
@@ -236,7 +237,7 @@ class DF(lib.StreamObject):
         on_gpu = isinstance(cderi_sparse, cp.ndarray)
 
         if unpack:
-            work = cp.zeros((nao, nao, blksize))
+            work = cp.zeros((nao, nao, blksize), dtype=cderi_sparse.dtype)
 
         pair_idx = cp.asarray(self._cderi_idx[0], dtype=np.int32)
         npairs = len(pair_idx)
@@ -251,7 +252,7 @@ class DF(lib.StreamObject):
                     yield out.transpose(2,0,1), cderi_blk
 
         else:
-            buf = cp.empty((blksize, npairs))
+            buf = cp.empty((blksize, npairs), dtype=cderi_sparse.dtype)
             buf_prefetch = cp.empty_like(buf)
 
             comput_stream = cp.cuda.get_current_stream()

@@ -221,15 +221,17 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
 
     # Mixed-precision policy:
     #   None/'fp64' (default) - run everything in fp64;
-    #   'fp32'  - run all iterations in fp32;
+    #   'fp32'  - run all iterations with fp32 contractions (the cderi
+    #             tensor itself stays in fp64; accuracy ~1e-4);
     #   'auto'  - early iterations in fp32; once the energy change drops
     #             below _PRECISION_SWITCH_TOL, switch to fp64 for the tail
     #             iterations and the final energy (restores full accuracy).
-    _mixed_auto = getattr(mf, 'precision_mode', None) == 'auto'
-    if _mixed_auto or getattr(mf, 'precision_mode', None) == 'fp32':
+    _mode = getattr(mf, 'precision_mode', None)
+    if _mode in ('auto', 'fp32'):
         precision.set_precision('fp32')
     else:
         precision.set_precision('fp64')
+    _mixed_auto = _mode == 'auto'
 
     if dm0 is None:
         dm0 = mf.get_init_guess(mol, mf.init_guess)
@@ -329,7 +331,6 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
             # consecutive small changes only wastes fp64 iterations
             if abs(e_tot - last_hf_e) < _PRECISION_SWITCH_TOL:
                 precision.set_precision('fp64')
-
         e_diff = abs(e_tot-last_hf_e)
         if(e_diff < conv_tol and norm_gorb < conv_tol_grad):
             scf_conv = True

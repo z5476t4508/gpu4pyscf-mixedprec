@@ -130,6 +130,35 @@ void decompress_kernel(double *out, size_t out_stride,
     }
 }
 
+// float32 counterpart of decompress_kernel for mixed-precision CDERI
+__global__ static
+void decompress_kernel_f32(float *out, size_t out_stride,
+                           float *cderi, int *pair_idx, int npairs, int nao,
+                           size_t naux, int aux0, int aux1)
+{
+    int thread_id = threadIdx.x;
+    int threads = blockDim.x;
+    int batch_id = blockIdx.x;
+    int dcol = aux1 - aux0;
+    int pair0 = batch_id * RBLKSIZE;
+    int pair1 = min(pair0 + RBLKSIZE, npairs);
+    for (int pair_id = pair0; pair_id < pair1; ++pair_id) {
+        int ij = pair_idx[pair_id];
+        int i = ij / nao;
+        int j = ij - nao * i;
+        float *inp = cderi + pair_id * naux + aux0;
+        float *out_ij = out + ij * out_stride;
+        float *out_ji = out + (j * nao + i) * out_stride;
+        for (int k = thread_id; k < dcol; k += threads) {
+            float s = inp[k];
+            out_ij[k] = s;
+            if (i != j) {
+                out_ji[k] = s;
+            }
+        }
+    }
+}
+
 __global__ static
 void d_t_kernel(double *out, size_t out_stride,
                 double *cderi, int *pair_idx, int npairs, int nao,
@@ -163,6 +192,48 @@ void d_t_kernel(double *out, size_t out_stride,
             int i = pair_ij / nao;
             int j = pair_ij - nao * i;
             double s = buf[aux_id][k];
+            out[(i*Nao+j)*out_stride+aux_start+aux_id] = s;
+            if (fill_triu && i != j) {
+                out[(j*Nao+i)*out_stride+aux_start+aux_id] = s;
+            }
+        }
+    }
+}
+
+// float32 counterpart of d_t_kernel for mixed-precision CDERI blocks
+__global__ static
+void d_t_kernel_f32(float *out, size_t out_stride,
+                    float *cderi, int *pair_idx, int npairs, int nao,
+                    int aux0, int aux1, int fill_triu)
+{
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+    int thread_id = threadIdx.x;
+    int threads = STRIDE * CBLKSIZE;
+    int tx = thread_id % CBLKSIZE;
+    int ty = thread_id / CBLKSIZE;
+    int aux_start = by * RBLKSIZE;
+    int pair_start = bx * CBLKSIZE;
+    int daux = aux1 - aux0;
+    size_t Npairs = npairs;
+    size_t Nao = nao;
+
+    __shared__ float buf[RBLKSIZE][CBLKSIZE+1];
+    if (pair_start+tx < npairs) {
+        for (int k = ty; k < min(RBLKSIZE, daux-aux_start); k += STRIDE) {
+            buf[k][tx] = cderi[(aux_start+k)*Npairs+pair_start+tx];
+        }
+    }
+    __syncthreads();
+    int stride = threads / RBLKSIZE;
+    int pair_id = thread_id / RBLKSIZE;
+    int aux_id = thread_id % RBLKSIZE;
+    if (aux_start+aux_id < daux) {
+        for (int k = pair_id; k < min(CBLKSIZE, npairs-pair_start); k += stride) {
+            int pair_ij = pair_idx[pair_start+k];
+            int i = pair_ij / nao;
+            int j = pair_ij - nao * i;
+            float s = buf[aux_id][k];
             out[(i*Nao+j)*out_stride+aux_start+aux_id] = s;
             if (fill_triu && i != j) {
                 out[(j*Nao+i)*out_stride+aux_start+aux_id] = s;
@@ -276,6 +347,22 @@ int decompress_and_fill(cudaStream_t stream, double *out, int out_stride,
     return 0;
 }
 
+// float32 counterpart of decompress_and_fill for mixed-precision CDERI
+int decompress_and_fill_f32(cudaStream_t stream, float *out, int out_stride,
+                            float *cderi, int *pair_idx, int npairs, int nao,
+                            int naux, int aux0, int aux1)
+{
+    dim3 blocks((npairs+RBLKSIZE-1)/RBLKSIZE);
+    decompress_kernel_f32<<<blocks, 512, 0, stream>>>(
+            out, out_stride, cderi, pair_idx, npairs, nao, naux, aux0, aux1);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "decompress_and_fill error %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
 int decompress_and_transpose(cudaStream_t stream, double *out, int out_stride,
                              double *cderi, int *pair_idx, int npairs, int nao,
                              int aux0, int aux1, int fill_triu, int on_host)
@@ -316,6 +403,31 @@ int z_decompress_and_transpose(cudaStream_t stream, double2 *out, int out_stride
     dim3 blocks((npairs+CBLKSIZE-1)/CBLKSIZE, (aux1-aux0+RBLKSIZE-1)/RBLKSIZE);
     z_d_t_kernel<<<blocks, threads, 0, stream>>>(
             out, out_stride, eri_gpu, pair_idx, npairs, nao, aux0, aux1);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "decompress_and_transpose error %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
+// float32 counterpart of decompress_and_transpose for mixed-precision CDERI
+int decompress_and_transpose_f32(cudaStream_t stream, float *out, int out_stride,
+                                 float *cderi, int *pair_idx, int npairs, int nao,
+                                 int aux0, int aux1, int fill_triu, int on_host)
+{
+    float *eri_gpu = cderi;
+    if (on_host) {
+        cudaError_t err = cudaHostGetDevicePointer(&eri_gpu, cderi, 0);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "decompress_and_transpose address mapping error %s\n", cudaGetErrorString(err));
+            return 1;
+        }
+    }
+    dim3 threads(CBLKSIZE * STRIDE);
+    dim3 blocks((npairs+CBLKSIZE-1)/CBLKSIZE, (aux1-aux0+RBLKSIZE-1)/RBLKSIZE);
+    d_t_kernel_f32<<<blocks, threads, 0, stream>>>(
+            out, out_stride, eri_gpu, pair_idx, npairs, nao, aux0, aux1, fill_triu);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "decompress_and_transpose error %s\n", cudaGetErrorString(err));
