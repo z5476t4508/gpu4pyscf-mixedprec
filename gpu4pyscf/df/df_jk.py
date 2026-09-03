@@ -32,6 +32,7 @@ from gpu4pyscf.scf.jk import _check_rsh_factors
 from gpu4pyscf.scf import ghf
 from gpu4pyscf.lib.cupy_helper import asarray, ndarray, get_avail_mem
 from gpu4pyscf.lib import multi_gpu
+from gpu4pyscf.lib import precision
 num_devices = multi_gpu.num_devices
 
 def density_fit(mf, auxbasis=None, with_df=None, only_dfj=False):
@@ -463,6 +464,7 @@ def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True,
         dfobj.build(omega=omega, lr_factor=lr_factor, sr_factor=sr_factor)
         t1 = log.timer_debug1('init jk', *t0)
 
+    fp32 = precision.get_precision() == 'fp32'
     out_cupy = isinstance(dms, cp.ndarray)
     dm_factor_l, dm_factor_r = factorize_dm(dms, hermi)
     symmetrize = getattr(dms, 'symmetrize', 0)
@@ -504,62 +506,78 @@ def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True,
         factor_r = dm_factor_r
         if factor_r is not None:
             factor_r = cp.asarray(factor_r).reshape(nspin,-1,nao,nocc)
+        if fp32:
+            factor_l = factor_l.astype(cp.float32)
+            if factor_r is not None:
+                factor_r = factor_r.astype(cp.float32)
 
         vj = vk = None
         if with_j:
             _dm_sparse = cp.asarray(dm_sparse)
-            vj = cp.zeros_like(dm_sparse)
+            if fp32:
+                _dm_sparse = _dm_sparse.astype(cp.float32)
+            vj = cp.zeros_like(_dm_sparse)
 
         blksize = dfobj.get_blksize(mem_fraction=0.4)
         if with_k:
-            vk = cupy.zeros((nspin, n_dm, nao, nao))
+            buf_dtype = cp.float32 if fp32 else cp.float64
+            vk = cupy.zeros((nspin, n_dm, nao, nao),
+                            dtype=buf_dtype)
             mem_avail = get_avail_mem(exclude_memory_pool=True)
             dm_batch_size = int(mem_avail * 0.6 / (blksize*nao*nocc * 8))
             if dm_factor_mode == 1:
                 dm_batch_size = dm_batch_size // 2
+            if fp32:
+                # half word size per buffer entry
+                dm_batch_size *= 2
             dm_batch_size = min(dm_batch_size, n_dm)
             assert dm_batch_size > 0
-            log.debug1('blksize=%d, dm_batch_size=%d', blksize, dm_batch_size)
+            log.debug1('blksize=%d, dm_batch_size=%d (fp32=%s)',
+                       blksize, dm_batch_size, fp32)
 
             if dm_factor_mode == 0:
-                buf = cp.empty((dm_batch_size, blksize * nao*nocc))
+                buf = cp.empty((dm_batch_size, blksize * nao*nocc), dtype=buf_dtype)
             elif dm_factor_mode == 1:
-                buf = cp.empty((2 * dm_batch_size, blksize * nao*nocc))
+                buf = cp.empty((2 * dm_batch_size, blksize * nao*nocc), dtype=buf_dtype)
             else:
-                buf = cp.empty((dm_batch_size+1, blksize * nao*nocc))
+                buf = cp.empty((dm_batch_size+1, blksize * nao*nocc), dtype=buf_dtype)
                 buf1 = buf[-1]
 
         for cderi, cderi_tril in dfobj.loop(blksize=blksize, unpack=with_k):
+            if fp32 and cderi_tril is not None:
+                cderi_tril = _cast_cderi(cderi_tril)
             if with_j:
                 auxvec = contract('np,Lp->nL', _dm_sparse, cderi_tril)
                 contract('nL,Lp->np', auxvec, cderi_tril, beta=1, out=vj)
 
             if with_k:
+                if fp32 and cderi is not None:
+                    cderi = _cast_cderi(cderi)
                 nL = len(cderi)
                 for s in range(nspin):
                     if dm_factor_mode == 0:
                         for i0, i1 in lib.prange(0, n_dm, dm_batch_size):
-                            rhok = ndarray((i1-i0,nao,nocc,nL), buffer=buf)
+                            rhok = ndarray((i1-i0,nao,nocc,nL), dtype=buf_dtype, buffer=buf)
                             contract('Lij,njk->nikL', cderi, factor_l[s,i0:i1], out=rhok)
                             contract('nikL,njkL->nij', rhok, rhok, beta=1, out=vk[s,i0:i1])
                     elif dm_factor_mode == 1:
                         for i0, i1 in lib.prange(0, n_dm, dm_batch_size):
-                            rhok, rhok1 = ndarray((2,i1-i0,nao,nocc,nL), buffer=buf)
+                            rhok, rhok1 = ndarray((2,i1-i0,nao,nocc,nL), dtype=buf_dtype, buffer=buf)
                             contract('Lij,njk->nikL', cderi, factor_l[s,i0:i1], out=rhok)
                             contract('Lij,njk->nikL', cderi, factor_r[s,i0:i1], out=rhok1)
                             contract('nikL,njkL->nij', rhok, rhok1, beta=1, out=vk[s,i0:i1])
                     elif dm_factor_mode == 2:
-                        rhok = ndarray((nao,nocc,nL), buffer=buf1)
+                        rhok = ndarray((nao,nocc,nL), dtype=buf_dtype, buffer=buf1)
                         contract('Lij,jk->ikL', cderi, factor_l[s,0], out=rhok)
                         for i0, i1 in lib.prange(0, n_dm, dm_batch_size):
-                            rhok1 = ndarray((i1-i0,nao,nocc,nL), buffer=buf)
+                            rhok1 = ndarray((i1-i0,nao,nocc,nL), dtype=buf_dtype, buffer=buf)
                             contract('Lij,njk->nikL', cderi, factor_r[s,i0:i1], out=rhok1)
                             contract('nikL,jkL->nij', rhok, rhok1, beta=1, out=vk[s,i0:i1])
                     else:
-                        rhok1 = ndarray((nao,nocc,nL), buffer=buf1)
+                        rhok1 = ndarray((nao,nocc,nL), dtype=buf_dtype, buffer=buf1)
                         contract('Lij,jk->ikL', cderi, factor_r[s,0], out=rhok1)
                         for i0, i1 in lib.prange(0, n_dm, dm_batch_size):
-                            rhok = ndarray((i1-i0,nao,nocc,nL), buffer=buf)
+                            rhok = ndarray((i1-i0,nao,nocc,nL), dtype=buf_dtype, buffer=buf)
                             contract('Lij,njk->nikL', cderi, factor_l[s,i0:i1], out=rhok)
                             contract('nikL,jkL->nij', rhok, rhok1, beta=1, out=vk[s,i0:i1])
                 rhok1 = rhok = None
@@ -577,12 +595,29 @@ def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True,
 
     if with_k:
         vk = multi_gpu.array_reduce([x[1] for x in results], inplace=True)
+        if fp32:
+            vk = vk.astype(cp.float64)
         if symmetrize != 0:
             vk = transpose_sum(vk.reshape(-1,nao,nao), hermi=symmetrize)
         vk = vk.reshape(dms.shape)
         if not out_cupy: vk = vk.get()
     t1 = log.timer_debug1('vj and vk', *t1)
     return vj, vk
+
+def _cast_cderi(cderi):
+    '''Cast a CDERI block to float32, avoiding the slow non-coalesced copy
+    on the (nL,nao,nao) transposed views yielded by DF.loop().  Casting the
+    C-contiguous (nao,nao,nL) parent buffer and re-transposing is several
+    times faster; cutensor accepts the resulting strided tensor natively.
+    '''
+    base = cderi.base
+    if (cderi.ndim == 3 and cderi.strides[0] == cderi.itemsize
+            and base is not None and base.ndim == 3
+            and base.flags['C_CONTIGUOUS']
+            and base.shape[2] == cderi.shape[0]
+            and base.shape[:2] == cderi.shape[1:]):
+        return base.astype(cp.float32).transpose(2, 0, 1)
+    return cderi.astype(cp.float32)
 
 def get_j(dfobj, dm, hermi=1):
     from gpu4pyscf.df.int3c2e_bdiv import int2c2e

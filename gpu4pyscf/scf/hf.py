@@ -33,12 +33,17 @@ from gpu4pyscf.scf import diis, jk, j_engine
 from . import dispersion
 from gpu4pyscf.scf.smearing import smearing
 from gpu4pyscf.lib import logger
+from gpu4pyscf.lib import precision
 from gpu4pyscf import __config__
 
 WITH_META_LOWDIN = getattr(__config__, 'scf_analyze_with_meta_lowdin', True)
 
 remove_overlap_zero_eigenvalue = getattr(__config__, 'scf_hf_remove_overlap_zero_eigenvalue', True)
 overlap_zero_eigenvalue_threshold = getattr(__config__, 'scf_hf_overlap_zero_eigenvalue_threshold', 1e-6)
+
+# Threshold on |E_n - E_{n-1}| for switching fp32 -> fp64 in the 'auto'
+# mixed-precision policy
+_PRECISION_SWITCH_TOL = getattr(__config__, 'scf_hf_precision_switch_tol', 1e-4)
 
 __all__ = [
     'get_jk', 'get_occ', 'get_grad', 'damping', 'level_shift', 'get_fock',
@@ -214,6 +219,18 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         conv_tol_grad = conv_tol**.5
         log.info('Set gradient conv threshold to %g', conv_tol_grad)
 
+    # Mixed-precision policy:
+    #   None/'fp64' (default) - run everything in fp64;
+    #   'fp32'  - run all iterations in fp32;
+    #   'auto'  - early iterations in fp32; once the energy change drops
+    #             below _PRECISION_SWITCH_TOL, switch to fp64 for the tail
+    #             iterations and the final energy (restores full accuracy).
+    _mixed_auto = getattr(mf, 'precision_mode', None) == 'auto'
+    if _mixed_auto or getattr(mf, 'precision_mode', None) == 'fp32':
+        precision.set_precision('fp32')
+    else:
+        precision.set_precision('fp64')
+
     if dm0 is None:
         dm0 = mf.get_init_guess(mol, mf.init_guess)
         t1 = log.timer_debug1('generating initial guess', *t1)
@@ -305,6 +322,13 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
 
         if callable(callback):
             callback(locals())
+
+        if _mixed_auto and precision.get_precision() == 'fp32':
+            # single-trigger switch: the fp32 noise floor makes the energy
+            # change bounce around right after switching, so requiring two
+            # consecutive small changes only wastes fp64 iterations
+            if abs(e_tot - last_hf_e) < _PRECISION_SWITCH_TOL:
+                precision.set_precision('fp64')
 
         e_diff = abs(e_tot-last_hf_e)
         if(e_diff < conv_tol and norm_gorb < conv_tol_grad):
