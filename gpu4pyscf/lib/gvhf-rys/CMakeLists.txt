@@ -14,6 +14,7 @@ add_library(gvhf_rys SHARED
   ejk_int3c2e_ip1.cu fill_int3c2e.cu
   int3c2e_recontract.cu decompress.cu
   utils.c
+  ejk_int3c2e_ip1_f32.cu
   ejk_int3c2e_ip2.cu fill_int3c2e_ip1.cu
   e_int2c2e_ip2.cu
 )

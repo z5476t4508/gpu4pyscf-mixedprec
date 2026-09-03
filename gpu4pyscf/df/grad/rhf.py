@@ -18,6 +18,7 @@ import cupy as cp
 from cupyx.scipy.linalg import solve_triangular
 from pyscf import lib
 from gpu4pyscf.lib import logger
+from gpu4pyscf.lib import precision
 from gpu4pyscf.lib.cupy_helper import (
     contract, asarray, ndarray, cholesky, eigh, transpose_sum, get_avail_mem)
 from gpu4pyscf.grad import rhf as rhf_grad
@@ -102,6 +103,11 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, hermi=0,
                mem_free*1e-9, nao_pair, naux, batch_size, blksize)
 
     aux0 = aux1 = 0
+    # Note: the j3c @ dm_factor contractions and the metric solve stay in
+    # float64 even in fp32 mode. The j2c^-1 metric solve amplifies relative
+    # errors of the j3c blocks (~1e-7 in float32) by the auxiliary-basis
+    # condition number, which lands around 1e-3 in the final gradient -
+    # far above the ~1e-5 obtained from the integral kernel alone.
     j3c_full = cp.zeros((nao, nao, blksize))
     buf = cp.empty((batch_size, nao_pair))
     buf1 = cp.empty((blksize, nocc, nao))
@@ -162,18 +168,23 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, hermi=0,
         dm = dm_factor_l.dot(dm_factor_r.T)
 
     int3c2e_envs = int3c2e_opt.int3c2e_envs
-    kern = libvhf_rys.sum_ejk_int3c2e_ip1
+    fp32 = precision.get_precision() == 'fp32'
+    if fp32:
+        kern = libvhf_rys.sum_ejk_int3c2e_ip1_f32
+    else:
+        kern = libvhf_rys.sum_ejk_int3c2e_ip1
     assert lr_factor is None and sr_factor is None
     aux0 = aux1 = 0
-    buf = cp.empty((nao_pair*batch_size))
+    buf = cp.empty((nao_pair*batch_size), dtype=cp.float32 if fp32 else cp.float64)
     buf1 = cp.empty((blksize, nao, nao))
-    buf2 = cp.empty((blksize, nao, nao))
+    buf2 = cp.empty((blksize, nocc, nao))
     ejk = cp.zeros((mol.natm, 3))
     ejk_aux = cp.zeros((mol.natm, 3))
     for kbatch in range(aux_batches):
         naux_in_batch = aux_offsets[kbatch+1] - aux_offsets[kbatch]
         aux_ao_offset = aux_loc[ksh_offsets_cpu[kbatch]]
-        compressed = ndarray((nao_pair, naux_in_batch), buffer=buf)
+        compressed = ndarray((nao_pair, naux_in_batch),
+                             dtype=cp.float32 if fp32 else cp.float64, buffer=buf)
         for k0, k1 in lib.prange(0, naux_in_batch, blksize):
             dk = k1 - k0
             aux0, aux1 = aux1, aux1 + dk
@@ -185,15 +196,20 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, hermi=0,
                 beta = j_factor
             contract('rji,qj->iqr', dm_oo[aux0:aux1], dm_factor_l, out=tmp)
             contract('iqr,pi->pqr', tmp, dm_factor_r, -.5*k_factor, beta, out=dm_tensor)
+            # the pseudo-DM handed to the integral kernel is cast to float32
+            # when the kernel runs in fp32; the pre-contractions above stay
+            # float64 for accuracy
+            if fp32:
+                dm_tensor = dm_tensor.astype(cp.float32)
             if hermi == 1:
                 cp.take(dm_tensor.reshape(-1,dk), pair_addresses, axis=0,
                         out=compressed[:,k0:k1])
             else:
-                dm_tensor1 = ndarray((nao,nao,dk), buffer=buf2)
-                dm_tensor1[:] = dm_tensor.transpose(1,0,2)
-                dm_tensor1[:] += dm_tensor
+                dm_tensor1 = cp.ascontiguousarray(dm_tensor.transpose(1,0,2))
+                dm_tensor1 = dm_tensor1 + dm_tensor
                 cp.take(dm_tensor1.reshape(-1,dk), pair_addresses, axis=0,
                         out=compressed[:,k0:k1])
+            dm_tensor = ndarray((nao,nao,dk), buffer=buf1)
         err = kern(
             ctypes.cast(ejk.data.ptr, ctypes.c_void_p),
             ctypes.cast(ejk_aux.data.ptr, ctypes.c_void_p),
