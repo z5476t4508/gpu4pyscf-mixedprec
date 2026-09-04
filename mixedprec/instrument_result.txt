@@ -1,0 +1,10 @@
+
+=== SCF: wall 18.28s (sync overhead inflates wall) ===
+  contract                   13.49s  ( 96.2% of instrumented)
+  eval_j3c                    0.54s  (  3.8% of instrumented)
+  other (launch/mem/small)    4.24s
+=== GRADIENT: wall 12.26s (sync overhead inflates wall) ===
+  sum_ejk_int3c2e_ip1         9.36s  ( 79.0% of instrumented)
+  contract                    1.47s  ( 12.4% of instrumented)
+  eval_j3c                    1.02s  (  8.6% of instrumented)
+  other (launch/mem/small)    0.41s

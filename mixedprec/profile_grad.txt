@@ -1,0 +1,45 @@
+wall time: 12.27s
+
+         85762 function calls (85757 primitive calls) in 12.273 seconds
+
+   Ordered by: cumulative time
+   List reduced from 490 to 35 due to restriction <35>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.000    0.000   12.273   12.273 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/grad/rhf.py:506(kernel)
+        1    0.000    0.000   12.273   12.273 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/grad/rhf.py:295(grad_elec)
+        1    0.000    0.000   12.088   12.088 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/df/grad/rhf.py:342(energy_ee)
+        1    0.000    0.000   12.088   12.088 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/df/grad/rhf.py:345(jk_energy_per_atom)
+        1    9.374    9.374   12.049   12.049 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/df/grad/rhf.py:58(_jk_energy_per_atom)
+       11    0.000    0.000    2.431    0.221 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/cupy/cuda/compiler.py:624(_compile_module_with_cache)
+       11    0.001    0.000    2.431    0.221 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/cupy/cuda/compiler.py:655(_compile_with_cache_cuda)
+       11    2.157    0.196    2.157    0.196 {method 'load' of 'cupy.cuda.function.Module' objects}
+       13    0.000    0.000    1.205    0.093 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/cupy/_indexing/indexing.py:7(take)
+       13    0.001    0.000    1.205    0.093 {method 'take' of 'cupy._core.core._ndarray_base' objects}
+        5    0.000    0.000    0.271    0.054 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/cupy/cuda/compiler.py:346(_compile_using_nvrtc_no_warning)
+        5    0.000    0.000    0.270    0.054 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/cupy/cuda/compiler.py:352(_compile)
+        5    0.000    0.000    0.270    0.054 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/cupy/cuda/compiler.py:855(compile)
+        5    0.270    0.054    0.270    0.054 {built-in method cupy_backends.cuda.libs.nvrtc.compileProgram}
+        3    0.000    0.000    0.188    0.063 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/cupy/linalg/_einsum.py:443(einsum)
+        3    0.000    0.000    0.187    0.062 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/cupy/linalg/_einsum.py:348(reduced_binary_einsum)
+        3    0.000    0.000    0.187    0.062 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/cupy/_core/_gufuncs.py:611(__call__)
+        3    0.000    0.000    0.187    0.062 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/cupy/linalg/_product.py:17(_try_fastcall_matmul)
+        3    0.187    0.062    0.187    0.062 {built-in method cupy._core._routines_linalg.matmul}
+        1    0.000    0.000    0.184    0.184 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/grad/rhf.py:330(_hcore_energy)
+        1    0.001    0.001    0.174    0.174 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/grad/rhf.py:242(_grad_nuc_without_ecp)
+        6    0.126    0.021    0.126    0.021 {method 'get' of 'cupy._core.core._ndarray_base' objects}
+        2    0.000    0.000    0.074    0.037 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/df/int3c2e_bdiv.py:122(build)
+        2    0.007    0.004    0.070    0.035 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/scf/jk.py:914(_cache_q_cond_and_non0pairs)
+       72    0.005    0.000    0.054    0.001 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/pbc/scf/rsjk.py:2268(_group_by_split_points)
+      658    0.000    0.000    0.042    0.000 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/cupy/_sorting/search.py:175(where)
+      656    0.000    0.000    0.042    0.000 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/cupy/_sorting/search.py:122(nonzero)
+      656    0.039    0.000    0.042    0.000 {method 'nonzero' of 'cupy._core.core._ndarray_base' objects}
+        2    0.000    0.000    0.016    0.008 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/pbc/gto/int1e.py:108(_check_opt)
+        2    0.000    0.000    0.016    0.008 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/pbc/gto/int1e.py:125(__init__)
+        1    0.000    0.000    0.016    0.016 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/df/grad/rhf.py:33(_gen_metric_solver)
+        1    0.015    0.015    0.016    0.016 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/lib/cusolver.py:180(cholesky)
+        2    0.008    0.004    0.014    0.007 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/gto/mole.py:979(generate_shl_pairs)
+        2    0.005    0.002    0.013    0.007 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/pbc/df/int2c2e.py:123(__init__)
+        1    0.000    0.000    0.012    0.012 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/pbc/df/int2c2e.py:62(int2c2e_ip1_per_atom)
+
+

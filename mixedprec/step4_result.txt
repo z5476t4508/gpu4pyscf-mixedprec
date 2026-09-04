@@ -1,0 +1,16 @@
+=== Tamoxifen def2-svp single point ===
+FP64 :   5.23s  -1129.6285081591  14 cycles
+auto :   3.63s  -1129.6285081591  14 cycles  err=2.73e-12  speedup 1.44x
+fp32 :   1.68s  -1129.62833885  11 cycles  abs-err=1.7e-04  speedup 3.12x
+=== Tamoxifen def2-svp gradient ===
+grad FP64 5.04s -> fp32 3.15s  speedup 1.60x  max|diff| 9.6e-06 rel-norm 7.4e-05
+=== Tamoxifen def2-tzvp single point ===
+FP64 :  18.23s  -1130.8497830645  15 cycles
+auto :  13.46s  -1130.8497830645  15 cycles  err=6.82e-12  speedup 1.35x
+fp32 :  10.80s  -1130.84974746  27 cycles  abs-err=3.6e-05  speedup 1.69x
+=== Tamoxifen def2-tzvp gradient ===
+grad FP64 12.09s -> fp32 7.57s  speedup 1.60x  max|diff| 9.4e-06 rel-norm 7.4e-05
+=== Tamoxifen def2-svp geometry optimization (10 steps) ===
+FP64 opt :   97.2s
+mixed opt:   63.8s  speedup 1.52x  final E diff 0.0e+00
+DONE

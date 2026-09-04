@@ -1,0 +1,10 @@
+Tamoxifen def2-TZVP DF-RHF (1042 AOs), switch tol 0.0001
+CPU reference : -1130.8497830645  (161.8s, 15 iters)
+
+FP64   conv1e-10: -1130.8497830645  (18.74s, 15 iters)  err=6.91e-11
+mixed  conv1e-10: -1130.8497830645  (13.59s, 15 iters: 6 fp32 + 9 fp64)  err=5.78e-11
+  -> speedup 1.38x
+
+FP64   conv1e-7 : -1130.8497830574  (14.80s)
+mixed  conv1e-7 : -1130.8497830614  (11.01s, 12 iters: 6 fp32 + 6 fp64)  err=3.06e-09
+  -> speedup 1.34x

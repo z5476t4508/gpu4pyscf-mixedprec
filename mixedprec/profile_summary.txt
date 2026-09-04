@@ -1,0 +1,5 @@
+Tamoxifen def2-TZVP DF-RHF: 1042 AOs
+SCF     : 18.37s (15 iterations)
+gradient: 12.27s
+gradient share: 40.1%
+energy: -1130.8497830645

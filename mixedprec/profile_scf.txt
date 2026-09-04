@@ -1,0 +1,45 @@
+wall time: 18.37s
+
+         162093 function calls (161309 primitive calls) in 18.368 seconds
+
+   Ordered by: cumulative time
+   List reduced from 678 to 35 due to restriction <35>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.000    0.000   18.368   18.368 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/scf/hf.py:377(scf)
+        1    0.001    0.001   18.368   18.368 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/scf/hf.py:218(_kernel)
+       16    0.001    0.000   17.625    1.102 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/df/df_jk.py:273(get_veff)
+       16    0.000    0.000   17.620    1.101 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/df/df_jk.py:138(get_jk)
+       16    0.000    0.000   17.620    1.101 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/df/df.py:110(get_jk)
+       16    0.004    0.000   17.620    1.101 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/df/df_jk.py:450(get_jk)
+       17   17.420    1.025   17.462    1.027 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/lib/multi_gpu.py:29(run)
+        1    0.000    0.000    4.045    4.045 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/df/df.py:91(build)
+        1    0.000    0.000    4.002    4.002 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/df/df.py:449(_cholesky_eri)
+       16    0.000    0.000    0.394    0.025 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/lib/cupy_helper.py:1348(eigh)
+       16    0.000    0.000    0.394    0.025 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/cupy/linalg/_eigenvalue.py:224(eigh)
+       16    0.000    0.000    0.394    0.025 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/cupy/linalg/_eigenvalue.py:22(_syevd)
+       16    0.392    0.025    0.392    0.025 {built-in method cupy_backends.cuda.libs.cusolver.xsyevd}
+       15    0.000    0.000    0.367    0.024 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/scf/hf.py:775(eig)
+      118    0.164    0.001    0.164    0.001 {method 'get' of 'cupy._core.core._ndarray_base' objects}
+        8    0.000    0.000    0.105    0.013 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/cupy/cuda/compiler.py:624(_compile_module_with_cache)
+        8    0.000    0.000    0.105    0.013 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/cupy/cuda/compiler.py:655(_compile_with_cache_cuda)
+        2    0.000    0.000    0.103    0.052 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/cupy/cuda/compiler.py:346(_compile_using_nvrtc_no_warning)
+        2    0.000    0.000    0.103    0.052 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/cupy/cuda/compiler.py:352(_compile)
+        2    0.000    0.000    0.103    0.051 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/cupy/cuda/compiler.py:855(compile)
+        2    0.103    0.051    0.103    0.051 {built-in method cupy_backends.cuda.libs.nvrtc.compileProgram}
+       30    0.000    0.000    0.093    0.003 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/scf/hf.py:169(get_fock)
+       14    0.000    0.000    0.092    0.007 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/scf/diis.py:50(update)
+       14    0.000    0.000    0.090    0.006 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/lib/diis.py:181(update)
+       85    0.000    0.000    0.085    0.001 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/cupy/__init__.py:826(asnumpy)
+       15    0.001    0.000    0.080    0.005 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/scf/hf.py:80(get_occ)
+        1    0.000    0.000    0.078    0.078 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/scf/hf.py:764(check_linear_dependency)
+        1    0.000    0.000    0.078    0.078 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/scf/hf.py:637(check_linear_dependency)
+        2    0.000    0.000    0.076    0.038 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/df/int3c2e_bdiv.py:122(build)
+        1    0.000    0.000    0.075    0.075 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/scf/hf.py:889(get_hcore)
+        1    0.000    0.000    0.075    0.075 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/scf/hf.py:150(get_hcore)
+        2    0.007    0.004    0.071    0.036 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/scf/jk.py:914(_cache_q_cond_and_non0pairs)
+        1    0.000    0.000    0.060    0.060 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/df/int3c2e_bdiv.py:150(int3c2e_evaluator)
+       72    0.005    0.000    0.054    0.001 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/gpu4pyscf/pbc/scf/rsjk.py:2268(_group_by_split_points)
+      674    0.000    0.000    0.043    0.000 /home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/cupy/_sorting/search.py:175(where)
+
+
