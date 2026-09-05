@@ -594,6 +594,17 @@ def _cholesky_eri(intopt, *, omega=None, lr_factor=None, sr_factor=None,
     log.debug1('mem_avail=%.3f MB on_gpu=%s, nao_pairs=%d, naux_per_device=%d, batch_size=%d, num_batches=%d',
                mem_avail, on_gpu, cderi_npairs, naux_per_device, batch_size, num_batches)
 
+    # The aux transformation (j3c . aux_coef) dominates the CDERI build, and
+    # float64 GEMM runs ~36x slower than float32 on consumer GPUs. In fp32
+    # mode run it (and store the result) in float32; _decompose_j2c switches to
+    # the eigendecomposition so that contraction does not cancel badly. The
+    # host-memory path stays float64: its transpose_write kernel is
+    # hard-coded for double.
+    cderi_fp32 = precision.get_cderi_precision() == 'fp32' and on_gpu
+    if precision.get_cderi_precision() == 'fp32' and not on_gpu:
+        log.debug1('cderi does not fit on the GPU; keeping the float64 build')
+    cderi_dtype = cp.float32 if cderi_fp32 else cp.float64
+
     if not on_gpu:
         cderi_cpu = empty_mapped((naux, cderi_npairs))
 
@@ -643,6 +654,8 @@ def _cholesky_eri(intopt, *, omega=None, lr_factor=None, sr_factor=None,
             aux0 = naux_per_device * device_id
             aux1 = min(naux, aux0 + naux_per_device)
             c = cp.asarray(aux_coef[:,aux0:aux1])
+            if cderi_fp32:
+                c = c.astype(cp.float32)
 
             _eval_j3c = eval_j3c
             if device_id != current_device:
@@ -650,16 +663,25 @@ def _cholesky_eri(intopt, *, omega=None, lr_factor=None, sr_factor=None,
                     reorder_aux=True, clone_context=clone_context,
                     omega=omega, lr_factor=lr_factor, sr_factor=sr_factor)[0]
 
-            out = cp.empty((cderi_npairs, aux1-aux0))
+            out = cp.empty((cderi_npairs, aux1-aux0), dtype=cderi_dtype)
             work = cp.empty(naux_sorted * batch_size)
+            if cderi_fp32:
+                # the int3c2e kernel only writes float64; cast each batch into
+                # a preallocated buffer rather than allocating per batch
+                work32 = cp.empty(naux_sorted * batch_size, dtype=cp.float32)
             if needs_recontraction:
-                work1 = cp.empty(naux_per_device * batch_size)
+                work1 = cp.empty(naux_per_device * batch_size, dtype=cderi_dtype)
 
             for batch_id in range(num_batches):
                 j3c = _eval_j3c(batch_id, out=work)
+                if cderi_fp32:
+                    j3c32 = ndarray(j3c.shape, dtype=cp.float32, buffer=work32)
+                    j3c32[:] = j3c
+                    j3c = j3c32
                 p0, p1 = cderi_offsets[batch_id:batch_id+2]
                 if needs_recontraction:
-                    tmp = ndarray((j3c.shape[0], aux1-aux0), buffer=work1)
+                    tmp = ndarray((j3c.shape[0], aux1-aux0), dtype=cderi_dtype,
+                                  buffer=work1)
                     tmp = j3c.dot(c, out=tmp)
                     recontract(batch_id, tmp, out=out[p0:p1])
                 else:
@@ -674,13 +696,22 @@ def _decompose_j2c(auxmol, aux_sorting=None,
     j2c = int3c2e_bdiv.int2c2e(auxmol, omega=omega, lr_factor=lr_factor,
                                sr_factor=sr_factor)
 
-    try:
-        cd_low = cholesky(j2c)
-        aux_coef = auxmol.ctr_coeff
-        aux_coef = solve_triangular(
-            cd_low, aux_coef.T, lower=True, overwrite_b=True).T
-        tag = 'cd'
-    except RuntimeError:
+    # The Cholesky factor is cheaper, but L^-1 is triangular and makes the
+    # subsequent j3c contraction cancel heavily (measured: sum|term|/|result|
+    # ~4400 median), which costs ~200x accuracy in a float32 GEMM. The
+    # eigendecomposition produces an orthogonal-based square root instead, so
+    # fp32 stays usable there.
+    use_eigh = precision.get_cderi_precision() == 'fp32'
+    if not use_eigh:
+        try:
+            cd_low = cholesky(j2c)
+            aux_coef = auxmol.ctr_coeff
+            aux_coef = solve_triangular(
+                cd_low, aux_coef.T, lower=True, overwrite_b=True).T
+            tag = 'cd'
+        except RuntimeError:
+            use_eigh = True
+    if use_eigh:
         w, v = cp.linalg.eigh(j2c)
         idx = cp.where(w > LINEAR_DEP_THR)[0]
         logger.debug1(auxmol, 'discard %d small eigenvectors for auxiliary dimension',

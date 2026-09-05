@@ -197,11 +197,9 @@ def2-SVP + jkfit, fp32 通道, 单卡 5090:
 CDERI 内部: Cholesky 仅 0.09s, 几乎全部时间在 GPU, 其中最大一块是变换
 GEMM `j3c · aux_coef` (Tamoxifen 1.3 TFLOP, Azadirachtin 11.1 TFLOP)。
 
-### ❌ fp32 变换 GEMM: 已实测, 不可行 (2026-09-05, 确认 8 月结论)
+### ❌ fp32 变换 GEMM + Cholesky: 不可行 (2026-09-05, 确认 8 月结论)
 
-**做过完整实现并实测, 结论是撤回。不要再试朴素 fp32 化。**
-
-速度收益巨大但精度不可用:
+朴素 fp32 化 (保留默认的 Cholesky 分解) 精度不可用:
 
 | 分子 | CDERI fp64 | CDERI fp32 | 加速 | 能量误差 |
 |---|---|---|---|---|
@@ -210,18 +208,54 @@ GEMM `j3c · aux_coef` (Tamoxifen 1.3 TFLOP, Azadirachtin 11.1 TFLOP)。
 
 根因 (这次查清了):
 
-- `aux_coef` 是二中心度规的逆平方根, 辅助基近线性相关 → **病态**;
-  点积中大量相消, fp32 **累加器**误差被放大到远超舍入水平。
-- 合成随机矩阵测同尺寸 GEMM 只有 3.1e-6 误差 (fp32 63 TFLOPS vs fp64 1.7
-  TFLOPS, 36.5x) —— **随机矩阵没有相消, 该测试不能代表真实情况**, 曾据此
-  误判为"当年踩的是 TF32"。已证伪: CUPY_TF32 未设, 走的是真 fp32。
-- 对照实验: 用 fp64 GEMM 建好 CDERI **再 cast 成 fp32**, 误差仅 1.47e-4,
-  完全可用 —— 所以问题在 **GEMM 累加**, 不在 fp32 存储。
+- `aux_coef = L^-1 C` 来自二中心度规的 **Cholesky** 分解, L 是三角阵;
+  点积中相消极剧烈 —— 实测相消因子 (sum|term|/|result|) **中位数 4387**,
+  最大 6.2e6。fp32 eps 6e-8 × 4387 ≈ 2.6e-4, 与实测 **4.7e-4** 吻合,
+  也与 8 月记录的 5e-4 精确一致 (同一现象独立复现两次)。
+- 曾误判为"当年踩的是 TF32"。**已证伪**: CUPY_TF32 未设, 走的是真 fp32;
+  同尺寸随机矩阵 GEMM 只有 3.1e-6 误差 —— **随机矩阵没有相消, 该基准
+  不能代表真实情况**, 这是当时误判的来源。
+- 对照: fp64 GEMM 建好 CDERI **再 cast 成 fp32**, 误差仅 1.47e-4 —— 问题在
+  **累加**, 不在 fp32 存储。
+- cuBLAS FP64 仿真 (`cublasSetEmulationStrategy`, cuBLAS 13.2.1 + sm_120):
+  符号存在、调用返回成功、Get 能读回设定值, 但**完全不生效** (1.7 TFLOPS
+  不变, 误差为零)。消费级 Blackwell 未开放。环境变量
+  `CUBLAS_EMULATION_STRATEGY=eager/performant` 同样无效。
 
-**唯一可能的出路**: 补偿式 GEMM (Ozaki scheme / fp32 拆分多次累加,
-需要 error-free transformation 处理累加而非仅拆分输入)。fp32 有 36x 余量,
-即使用 6 次 fp32 GEMM 仍比 fp64 快 6 倍。但这是独立的数值工程项目, 且要
-专门验证病态情形下的误差行为。
+### ✅ fp32 CDERI + 特征分解: 可用, 已实现 (opt-in)
+
+**关键**: `aux_coef` 的平方根不唯一。改用**特征分解** (`V·W^{-1/2}`, V 正交)
+代替 Cholesky, 同一个 GEMM 的 fp32 误差从 4.7e-4 降到 **2.4e-6 (200 倍)**,
+条件数几乎不变 (6.4e4)。eigh 本身很便宜 (naux=2626 只要 0.11s)。
+
+实测 (def2-SVP, fp32 通道, conv 3e-5):
+
+| 分子 | 总计 fp64 CDERI | 总计 fp32 CDERI | 加速 | 绝对误差 |
+|---|---|---|---|---|
+| Vitamin C (208 AO) | 0.18s | 0.15s | 1.2x | 1.1e-5 → 4.8e-4 |
+| Tamoxifen (537 AO) | 1.58s | 0.90s | **1.76x** | 1.3e-4 → 2.4e-3 |
+| Azadirachtin (934 AO) | 13.01s | 4.62s | **2.8x** | 2.9e-4 → 1.05e-2 |
+
+CDERI 构建本身: Azadirachtin 8.54s → 1.57s (5.4x)。
+
+**排序质量代价 (10 个扰动构象, 跨度 49.8 kcal/mol)**:
+
+| | 配对能隙误差 max | Spearman |
+|---|---|---|
+| fp64 CDERI (现状) | **0.090 kcal/mol** | 1.000000 |
+| fp32 CDERI (新) | **0.944 kcal/mol** | 1.000000 |
+
+排序保住了, 但配对误差涨 10 倍。**因此设为 opt-in, 默认仍是 fp64**:
+
+- `precision.set_cderi_precision('fp32')`, 或批处理 `--cderi-precision fp32`
+- 只允许与 `--mode fp32` 组合; 与 auto/fp64 组合会被拒绝 (fp64 尾轮需要
+  fp64 CDERI)
+- 构象能量间距若只有 1-3 kcal/mol, **不要用** —— 0.94 kcal/mol 会混淆相近对
+- host-memory CDERI 路径不支持 (C 层 transpose_write 是 double 硬编码),
+  会自动回退 fp64
+
+**剩余空间**: 补偿式 GEMM (Ozaki) 仍可在不损失精度的前提下拿到类似加速,
+但那是独立数值工程项目; 现在有了 opt-in 的快通道, 优先级下降。
 
 ### 其他剩余空间
 

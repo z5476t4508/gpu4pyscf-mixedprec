@@ -97,6 +97,53 @@ class KnownValues(unittest.TestCase):
         results.append(e2)
         self.assertAlmostEqual(e1, e2, delta=1e-9)
 
+    def test_cderi_precision_default_is_fp64(self):
+        '''the fp32 cderi build must stay opt-in'''
+        self.assertEqual(precision.get_cderi_precision(), 'fp64')
+        mf = scf.RHF(mol_sph).density_fit()
+        mf.precision_mode = 'fp32'
+        mf.conv_tol = 1e-5
+        mf.kernel()
+        self.assertEqual(mf.with_df._cderi[0].dtype, np.float64)
+
+    def test_fp32_cderi_build(self):
+        '''fp32 cderi: float32 storage, screening-grade energy'''
+        mf = scf.RHF(mol_sph).density_fit()
+        mf.conv_tol = 1e-10
+        e_ref = mf.kernel()
+
+        mf2 = scf.RHF(mol_sph).density_fit()
+        mf2.precision_mode = 'fp32'
+        mf2.conv_tol = 3e-5
+        try:
+            precision.set_cderi_precision('fp32')
+            e32 = mf2.kernel()
+        finally:
+            precision.set_cderi_precision('fp64')
+        self.assertEqual(mf2.with_df._cderi[0].dtype, np.float32)
+        self.assertAlmostEqual(e32, e_ref, delta=1e-2)
+
+    def test_fp32_cderi_uses_eigendecomposition(self):
+        '''the Cholesky factor cancels too badly for a float32 contraction'''
+        from gpu4pyscf.df.df import _decompose_j2c
+        mf = scf.RHF(mol_sph).density_fit()
+        mf.with_df.build(build_cderi=False)
+        auxmol = mf.with_df.intopt.auxmol
+
+        _, tag64 = _decompose_j2c(auxmol)
+        self.assertEqual(tag64, 'cd')
+        try:
+            precision.set_cderi_precision('fp32')
+            _, tag32 = _decompose_j2c(auxmol)
+        finally:
+            precision.set_cderi_precision('fp64')
+        self.assertEqual(tag32, 'ed')
+
+    def test_invalid_cderi_precision(self):
+        with self.assertRaises(ValueError):
+            precision.set_cderi_precision('fp16')
+        self.assertEqual(precision.get_cderi_precision(), 'fp64')
+
 if __name__ == '__main__':
     print('Full tests for df mixed precision')
     unittest.main()

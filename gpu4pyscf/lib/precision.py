@@ -39,9 +39,15 @@ Example::
 import contextlib
 
 __all__ = ['set_precision', 'get_precision', 'fp32', 'fp64',
-           'PRECISION_MODE']
+           'set_cderi_precision', 'get_cderi_precision',
+           'PRECISION_MODE', 'CDERI_PRECISION']
 
 PRECISION_MODE = 'fp64'    # 'fp64' (default) or 'fp32'
+
+# Precision of the CDERI build. Kept separate from PRECISION_MODE: the 'auto'
+# SCF policy starts in fp32 but has to finish in fp64, which needs a float64
+# CDERI. Only the pure-fp32 screening lane can use a float32 one.
+CDERI_PRECISION = 'fp64'
 
 def set_precision(mode):
     '''Set the global precision mode ('fp64' or 'fp32').'''
@@ -53,6 +59,25 @@ def set_precision(mode):
 def get_precision():
     '''Return the current global precision mode.'''
     return PRECISION_MODE
+
+def set_cderi_precision(mode):
+    '''Set the precision of the CDERI build ('fp64' or 'fp32').
+
+    In 'fp32' the aux transformation (the dominant cost of the build) runs in
+    float32 and the tensor is stored in float32.  This requires the metric to
+    be decomposed by eigendecomposition rather than Cholesky: the Cholesky
+    factor produces heavy cancellation in that contraction and loses ~200x
+    more accuracy.  Screening-grade only; not accurate enough for the float64
+    tail of the 'auto' SCF policy.
+    '''
+    global CDERI_PRECISION
+    if mode not in ('fp64', 'fp32'):
+        raise ValueError(f"cderi precision must be 'fp64' or 'fp32', got {mode!r}")
+    CDERI_PRECISION = mode
+
+def get_cderi_precision():
+    '''Return the precision used for the CDERI build.'''
+    return CDERI_PRECISION
 
 @contextlib.contextmanager
 def fp32():

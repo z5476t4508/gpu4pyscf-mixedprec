@@ -52,7 +52,8 @@ _STATUS_NAMES = {PENDING: 'pending', RUNNING: 'running',
 
 # attributes that must match exactly when resuming into an existing shard file
 _CONFIG_KEYS = ('basis', 'auxbasis', 'mode', 'conv_tol', 'max_cycle',
-                'default_charge', 'default_spin', 'shard_index', 'num_shards')
+                'default_charge', 'default_spin', 'shard_index', 'num_shards',
+                'cderi_precision')
 
 
 class BatchError(RuntimeError):
@@ -384,7 +385,8 @@ def preflight():
             'PYTHONPATH at the mixed-precision checkout of this repository.') from exc
 
 
-def run_molecule(spec, basis, auxbasis, mode, conv_tol, max_cycle):
+def run_molecule(spec, basis, auxbasis, mode, conv_tol, max_cycle,
+                 cderi_precision='fp64'):
     '''Run one DF-RHF single point.  Returns (e_tot, dm_float32, meta).
 
     The global precision mode is restored afterwards: gpu4pyscf's SCF kernel
@@ -401,6 +403,7 @@ def run_molecule(spec, basis, auxbasis, mode, conv_tol, max_cycle):
             f"RHF requires a closed-shell molecule, got spin={spec['spin']}")
 
     try:
+        precision.set_cderi_precision(cderi_precision)
         mol = pyscf.M(atom=spec['atom'], basis=basis, charge=spec['charge'],
                       spin=spec['spin'], verbose=0)
         mf = scf.RHF(mol).density_fit(auxbasis=auxbasis)
@@ -414,12 +417,14 @@ def run_molecule(spec, basis, auxbasis, mode, conv_tol, max_cycle):
                 'natm': int(mol.natm)}
     finally:
         precision.set_precision('fp64')
+        precision.set_cderi_precision('fp64')
 
     return float(e_tot), dm, meta
 
 
 def run_batch(tasks, store, basis, auxbasis, mode, conv_tol, max_cycle,
-              default_charge, default_spin, retry_failed=True, log=print):
+              default_charge, default_spin, retry_failed=True,
+              cderi_precision='fp64', log=print):
     '''Run every unfinished task in the shard, committing as we go.'''
     status = store.status()
     done = 0
@@ -437,7 +442,7 @@ def run_batch(tasks, store, basis, auxbasis, mode, conv_tol, max_cycle,
         try:
             spec = parse_xyz(path, default_charge, default_spin)
             e_tot, dm, meta = run_molecule(spec, basis, auxbasis, mode,
-                                           conv_tol, max_cycle)
+                                           conv_tol, max_cycle, cderi_precision)
         except ImportError:
             # an environment problem, not a property of this molecule: abort
             # instead of burning through the shard marking everything failed
@@ -482,6 +487,10 @@ def build_parser():
                    help='SCF convergence; below ~3e-5 the fp32 lane gains no accuracy '
                         'and its iteration count becomes unstable')
     p.add_argument('--max-cycle', type=int, default=50)
+    p.add_argument('--cderi-precision', default='fp64', choices=('fp64', 'fp32'),
+                   help='fp32 builds the CDERI tensor in float32: 1.8-2.8x faster '
+                        'overall, but the pairwise energy-gap error grows from '
+                        '~0.09 to ~0.9 kcal/mol. Only for coarse screening')
     p.add_argument('--charge', type=int, default=0,
                    help='default charge when the XYZ comment does not set one')
     p.add_argument('--spin', type=int, default=0,
@@ -497,6 +506,12 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+
+    if args.cderi_precision == 'fp32' and args.mode != 'fp32':
+        print(f"error: --cderi-precision fp32 cannot be combined with --mode {args.mode}; "
+              'the float32 CDERI is not accurate enough for a float64 result',
+              file=sys.stderr)
+        return 2
 
     if args.mode == 'fp32' and args.conv_tol < 3e-5:
         print(f'warning: conv_tol={args.conv_tol:g} is below the fp32 noise floor (~4e-5). '
@@ -531,6 +546,7 @@ def main(argv=None):
         'default_spin': int(args.spin),
         'shard_index': int(args.shard_index),
         'num_shards': int(args.num_shards),
+        'cderi_precision': args.cderi_precision,
     }
     out_path = os.path.join(
         args.output_dir, f'results-{args.shard_index:05d}-of-{args.num_shards:05d}.h5')
@@ -539,7 +555,8 @@ def main(argv=None):
     with ShardStore(out_path, ids, config) as store:
         stats = run_batch(tasks, store, args.basis, args.auxbasis, args.mode,
                           args.conv_tol, args.max_cycle, args.charge, args.spin,
-                          retry_failed=not args.no_retry_failed)
+                          retry_failed=not args.no_retry_failed,
+                          cderi_precision=args.cderi_precision)
     elapsed = time.time() - t0
 
     print(f'\n{out_path}')

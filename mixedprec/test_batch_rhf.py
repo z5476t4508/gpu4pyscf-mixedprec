@@ -39,7 +39,7 @@ H   0.757000  0.000000  -0.469600
 CONFIG = {
     'basis': 'def2-svp', 'auxbasis': 'def2-svp-jkfit', 'mode': 'fp32',
     'conv_tol': 3e-5, 'max_cycle': 50, 'default_charge': 0, 'default_spin': 0,
-    'shard_index': 0, 'num_shards': 1,
+    'shard_index': 0, 'num_shards': 1, 'cderi_precision': 'fp64',
 }
 
 
@@ -285,6 +285,12 @@ class TestCLI(TempDirCase):
         os.makedirs(self.inp)
         for name in ('a', 'b', 'c', 'd'):
             write(os.path.join(self.inp, f'{name}.xyz'), WATER)
+
+    def test_fp32_cderi_rejected_outside_the_fp32_lane(self):
+        rc = main(['--input-dir', self.inp,
+                   '--output-dir', os.path.join(self.dir, 'out'),
+                   '--mode', 'auto', '--cderi-precision', 'fp32'])
+        self.assertEqual(rc, 2)
 
     def test_dry_run_lists_shard_only(self):
         rc = main(['--input-dir', self.inp,
