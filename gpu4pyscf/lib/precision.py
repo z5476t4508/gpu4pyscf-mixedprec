@@ -35,6 +35,19 @@ Example::
     # wrapping mf.kernel() in one of these has no effect.
     with precision.fp32():
         vj, vk = mf.with_df.get_jk(dm, hermi=1)
+
+Choosing conv_tol for 'fp32'
+---------------------------
+
+The pure-fp32 lane has a noise floor and cannot converge below it; asking
+for more only makes the iteration count unstable, or stops convergence
+altogether.  Measured floors:
+
+    DF J/K (HF)          ~4e-5  -> keep conv_tol >= 3e-5
+    DFT quadrature grid  ~1e-6  -> keep conv_tol >= 1e-5
+
+Use 'auto' whenever tighter convergence is required: it starts on fp32 and
+finishes in fp64, so conv_tol can be as tight as the fp64 lane's.
 '''
 
 import contextlib

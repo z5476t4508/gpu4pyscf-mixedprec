@@ -51,6 +51,7 @@ libgdft.GDFTeval_gto.restype = ctypes.c_int
 libgdft.GDFTcontract_rho.restype = ctypes.c_int
 libgdft.GDFTcontract_rho_f32.restype = ctypes.c_int
 libgdft.GDFTscale_ao.restype = ctypes.c_int
+libgdft.GDFTscale_ao_f32.restype = ctypes.c_int
 libgdft.GDFTdot_ao_dm_sparse.restype = ctypes.c_int
 libgdft.GDFTdot_ao_ao_sparse.restype = ctypes.c_int
 libgdft.GDFTdot_aow_ao_sparse.restype = ctypes.c_int
@@ -975,34 +976,43 @@ def _nr_uks_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
         vmatb = cupy.zeros((nset, nao, nao))
         vtmp_buf = cupy.empty(nao*nao)
         p0 = p1 = 0
+        # see _nr_rks_task: the grid contractions do not cancel, so float32
+        # keeps ~1e-7 here while vmat stays float64
+        fp32_grid = precision.get_precision() == 'fp32'
         for ao_mask, idx, weight, _ in ni.block_loop(_sorted_mol, grids, nao, ao_deriv,
                                                      max_memory=None,
                                                      grid_range=(grid_start, grid_end)):
             p0, p1 = p1, p1 + weight.size
             nao_sub = len(idx)
-            vtmp = cupy.ndarray((nao_sub, nao_sub), memptr=vtmp_buf.data)
+            if fp32_grid:
+                ao_mask = ao_mask.astype(cupy.float32)
+                vtmp = None
+                scale_buf = None
+            else:
+                vtmp = cupy.ndarray((nao_sub, nao_sub), memptr=vtmp_buf.data)
+                scale_buf = buf
             for i in range(nset):
                 if xctype == 'LDA':
-                    aow_alpha = _scale_ao(ao_mask, wv[i,0,0,p0:p1], out=buf)
-                    add_sparse(vmata[i], ao_mask.dot(aow_alpha.T, out=vtmp), idx)
-                    aow_beta = _scale_ao(ao_mask, wv[i,1,0,p0:p1], out=buf)
-                    add_sparse(vmatb[i], ao_mask.dot(aow_beta.T, out=vtmp), idx)
+                    aow_alpha = _scale_ao(ao_mask, _as(wv[i,0,0,p0:p1], ao_mask), out=scale_buf)
+                    add_sparse(vmata[i], _f64(ao_mask.dot(aow_alpha.T, out=vtmp)), idx)
+                    aow_beta = _scale_ao(ao_mask, _as(wv[i,1,0,p0:p1], ao_mask), out=scale_buf)
+                    add_sparse(vmatb[i], _f64(ao_mask.dot(aow_beta.T, out=vtmp)), idx)
                 elif xctype == 'GGA':
-                    aow_alpha = _scale_ao(ao_mask, wv[i,0,:,p0:p1], out=buf)
-                    add_sparse(vmata[i], ao_mask[0].dot(aow_alpha.T, out=vtmp), idx)
-                    aow_beta = _scale_ao(ao_mask, wv[i,1,:,p0:p1], out=buf)
-                    add_sparse(vmatb[i], ao_mask[0].dot(aow_beta.T, out=vtmp), idx)
+                    aow_alpha = _scale_ao(ao_mask, _as(wv[i,0,:,p0:p1], ao_mask), out=scale_buf)
+                    add_sparse(vmata[i], _f64(ao_mask[0].dot(aow_alpha.T, out=vtmp)), idx)
+                    aow_beta = _scale_ao(ao_mask, _as(wv[i,1,:,p0:p1], ao_mask), out=scale_buf)
+                    add_sparse(vmatb[i], _f64(ao_mask[0].dot(aow_beta.T, out=vtmp)), idx)
                 elif xctype == 'NLC':
                     raise NotImplementedError('NLC')
                 elif xctype == 'MGGA':
-                    va = _tau_dot(ao_mask, ao_mask, wv[i,0,4, p0:p1], out=vtmp)
-                    aow_alpha = _scale_ao(ao_mask[:4], wv[i,0,:4,p0:p1], out=buf)
+                    va = _tau_dot(ao_mask, ao_mask, _as(wv[i,0,4, p0:p1], ao_mask), out=vtmp)
+                    aow_alpha = _scale_ao(ao_mask[:4], _as(wv[i,0,:4,p0:p1], ao_mask), out=scale_buf)
                     va = contract('ig,jg->ij', ao_mask[0],aow_alpha, beta=1, out=va)
-                    add_sparse(vmata[i], va, idx)
-                    vb = _tau_dot(ao_mask, ao_mask, wv[i,1,4, p0:p1], out=vtmp)
-                    aow_beta = _scale_ao(ao_mask[:4], wv[i,1,:4,p0:p1], out=buf)
+                    add_sparse(vmata[i], _f64(va), idx)
+                    vb = _tau_dot(ao_mask, ao_mask, _as(wv[i,1,4, p0:p1], ao_mask), out=vtmp)
+                    aow_beta = _scale_ao(ao_mask[:4], _as(wv[i,1,:4,p0:p1], ao_mask), out=scale_buf)
                     vb = contract('ig,jg->ij', ao_mask[0],aow_beta, beta=1, out=vb)
-                    add_sparse(vmatb[i], vb, idx)
+                    add_sparse(vmatb[i], _f64(vb), idx)
                 elif xctype == 'HF':
                     pass
                 else:
@@ -2489,21 +2499,27 @@ def _scale_ao(ao, wv, out=None):
     if not ao.flags.c_contiguous:
         return contract('nip,np->ip', ao, wv, out=out)
 
-    # GDFTscale_ao takes an is_real flag, not a dtype: a float32 ao would be
-    # read as complex128. Keep anything but float64 on the cutensor path.
-    if ao.dtype != np.float64:
-        wv = cupy.asarray(wv, dtype=ao.dtype)
-        return contract('nip,np->ip', ao, wv, out=out)
-
-    is_real = ao.dtype == np.float64
+    # GDFTscale_ao takes an is_real flag, not a dtype: a float32 ao passed to
+    # it would be read as complex128. Dispatch on dtype instead.
     wv = cupy.asarray(wv, dtype=ao.dtype, order='C')
+    if ao.dtype == np.float32:
+        err = libgdft.GDFTscale_ao_f32(
+            ctypes.cast(out.data.ptr, ctypes.c_void_p),
+            ctypes.cast(ao.data.ptr, ctypes.c_void_p),
+            ctypes.cast(wv.data.ptr, ctypes.c_void_p),
+            ctypes.c_int(ngrids), ctypes.c_int(nao), ctypes.c_int(nvar))
+        if err != 0:
+            raise RuntimeError('GDFTscale_ao_f32 failed')
+        return out
+    if ao.dtype != np.float64:
+        return contract('nip,np->ip', ao, wv, out=out)
 
     err = libgdft.GDFTscale_ao(
         ctypes.cast(out.data.ptr, ctypes.c_void_p),
         ctypes.cast(ao.data.ptr, ctypes.c_void_p),
         ctypes.cast(wv.data.ptr, ctypes.c_void_p),
         ctypes.c_int(ngrids), ctypes.c_int(nao), ctypes.c_int(nvar),
-        ctypes.c_int(is_real))
+        ctypes.c_int(1))
     if err != 0:
         raise RuntimeError('GDFTscale_ao failed')
     return out

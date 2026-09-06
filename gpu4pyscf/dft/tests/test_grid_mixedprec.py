@@ -26,17 +26,24 @@ from gpu4pyscf.dft import numint
 from gpu4pyscf.lib import precision
 
 def setUpModule():
-    global mol
+    global mol, mol_open
     mol = pyscf.M(atom='''
 O       0.0000000000    -0.0000000000     0.1174000000
 H      -0.7570000000    -0.0000000000    -0.4696000000
 H       0.7570000000     0.0000000000    -0.4696000000''',
                   basis='def2-svp', output='/dev/null', verbose=1)
+    mol_open = pyscf.M(atom='''
+O       0.0000000000    -0.0000000000     0.1174000000
+H      -0.7570000000    -0.0000000000    -0.4696000000
+H       0.7570000000     0.0000000000    -0.4696000000''',
+                       basis='def2-svp', charge=1, spin=1,
+                       output='/dev/null', verbose=1)
 
 def tearDownModule():
-    global mol
+    global mol, mol_open
     mol.stdout.close()
-    del mol
+    mol_open.stdout.close()
+    del mol, mol_open
 
 
 class KnownValues(unittest.TestCase):
@@ -117,6 +124,33 @@ class KnownValues(unittest.TestCase):
         e_ref = mf.kernel()
 
         mf2 = dft.RKS(mol, xc='pbe').density_fit()
+        mf2.conv_tol = 1e-10
+        mf2.precision_mode = 'auto'
+        e_auto = mf2.kernel()
+        self.assertAlmostEqual(e_auto, e_ref, delta=1e-8)
+
+    def test_uks_fp32_grid_accuracy(self):
+        '''the open-shell grid path must match too (alpha/beta separately)'''
+        mf = dft.UKS(mol_open, xc='r2scan').density_fit()
+        mf.conv_tol = 1e-10
+        mf.kernel()
+        dm = mf.make_rdm1()
+        ni = mf._numint
+        n0, exc0, v0 = ni.nr_uks(mol_open, mf.grids, 'r2scan', dm)
+        with precision.fp32():
+            n1, exc1, v1 = ni.nr_uks(mol_open, mf.grids, 'r2scan', dm)
+        self.assertLess(float(abs(np.asarray(n1)-np.asarray(n0)).max()), 1e-5)
+        self.assertLess(float(abs(np.asarray(exc1)-np.asarray(exc0)).max()), 1e-4)
+        self.assertLess(float(cupy.abs(v1[0]-v0[0]).max()), 1e-4)
+        self.assertLess(float(cupy.abs(v1[1]-v0[1]).max()), 1e-4)
+        self.assertEqual(v1[0].dtype, np.float64)
+
+    def test_uks_auto_recovers_float64_energy(self):
+        mf = dft.UKS(mol_open, xc='r2scan').density_fit()
+        mf.conv_tol = 1e-10
+        e_ref = mf.kernel()
+
+        mf2 = dft.UKS(mol_open, xc='r2scan').density_fit()
         mf2.conv_tol = 1e-10
         mf2.precision_mode = 'auto'
         e_auto = mf2.kernel()

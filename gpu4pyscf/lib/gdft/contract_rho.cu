@@ -267,6 +267,27 @@ void dscale_ao_kernel(double *out, double *ket, double *wv,
 }
 
 static __global__
+void fscale_ao_kernel(float *out, float *ket, float *wv,
+                      int ngrids, int nao, int nvar)
+{
+    int grid_id = blockIdx.x * blockDim.x + threadIdx.x;
+    int ao_id = blockIdx.y * blockDim.y + threadIdx.y;
+    if (grid_id >= ngrids || ao_id >= nao) {
+        return;
+    }
+
+    size_t Ngrids = ngrids;
+    size_t Nag = nao * Ngrids;
+    size_t ixy = grid_id + ao_id * Ngrids;
+    float val = 0;
+    int n;
+    for (n = 0; n < nvar; ++n) {
+        val += ket[ixy + Nag * n] * wv[grid_id + ngrids * n];
+    }
+    out[ixy] = val;
+}
+
+static __global__
 void zscale_ao_kernel(double *out, double *ket, double *wv,
                       int ngrids, int nao, int nvar)
 {
@@ -432,6 +453,20 @@ int GDFTscale_ao(double *out, double *ket, double *wv,
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA Error of GDFTscale_ao: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
+int GDFTscale_ao_f32(float *out, float *ket, float *wv,
+                     int ngrids, int nao, int nvar)
+{
+    dim3 threads(BLKSIZEX, BLKSIZEY);
+    dim3 blocks((ngrids+BLKSIZEX-1)/BLKSIZEX, (nao+BLKSIZEY-1)/BLKSIZEY);
+    fscale_ao_kernel<<<blocks, threads>>>(out, ket, wv, ngrids, nao, nvar);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error of GDFTscale_ao_f32: %s\n", cudaGetErrorString(err));
         return 1;
     }
     return 0;
