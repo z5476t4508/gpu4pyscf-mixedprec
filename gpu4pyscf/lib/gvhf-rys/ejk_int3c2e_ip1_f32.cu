@@ -81,14 +81,12 @@ static void rys_roots_f32(int nroots, float x, float *rw,
         return;
     }
 
-    float *datax = (float *)(ROOT_RW_DATA) + DEGREE1*INTERVALS * nroots*(nroots-1);
-    // ROOT_RW_DATA is a double table; the float path reuses the same
-    // coefficients read as float.  Rebuilding a float table would double the
-    // constant memory; reading the double table and converting on the fly is
-    // bandwidth-equivalent.  Simpler and exact: interpolate in double then
-    // store as float.
+    // ROOT_RW_DATA is a double[] table; it must NOT be aliased as float --
+    // that reinterprets the bits rather than converting the values.  The
+    // recurrence stays in double: measured, running it in float buys no time
+    // (it is amortised over the GOUT_WIDTH loop below), so there is nothing
+    // to trade the precision for.  The result is narrowed into a float rw[].
     double *datax_d = ROOT_RW_DATA + DEGREE1*INTERVALS * nroots*(nroots-1);
-    (void)datax;
     int it = (int)(x * .4f);
     double u = (x - it * 2.5f) * 0.8f - 1.;
     double u2 = u * 2.;
@@ -308,13 +306,16 @@ void sum_ejk_int3c2e_ip1_kernel_f32(double *ejk, double *ejk_aux,
     int idx_k = lex_xyz_offset(lk);
 
     for (int pair_ij = shl_pair0+sp_id; pair_ij < shl_pair1+sp_id; pair_ij += nsp_per_block) {
-        // gradient accumulators stay in double: they carry the final result
-        double v_ix = 0;
-        double v_iy = 0;
-        double v_iz = 0;
-        double v_jx = 0;
-        double v_jy = 0;
-        double v_jz = 0;
+        // The cross-thread reduction below runs through a float shared-memory
+        // buffer, so a double per-thread accumulator is narrowed to float
+        // immediately anyway -- it bought one extra rounding and cost nine
+        // 1/64-rate fp64 adds in the innermost (GOUT_WIDTH) loop.
+        float v_ix = 0;
+        float v_iy = 0;
+        float v_iz = 0;
+        float v_jx = 0;
+        float v_jy = 0;
+        float v_jz = 0;
         int bas_ij;
         if (pair_ij < shl_pair1) {
             bas_ij = bas_ij_idx[pair_ij];
@@ -392,9 +393,9 @@ void sum_ejk_int3c2e_ip1_kernel_f32(double *ejk, double *ejk_aux,
                 }
             }
 
-            double v_kx = 0;
-            double v_ky = 0;
-            double v_kz = 0;
+            float v_kx = 0;
+            float v_ky = 0;
+            float v_kz = 0;
             for (int ijp = 0; ijp < iprim*jprim; ++ijp) {
                 int ip = ijp / jprim;
                 int jp = ijp - jprim * ip;
