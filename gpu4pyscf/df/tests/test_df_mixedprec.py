@@ -15,6 +15,7 @@ import unittest
 import numpy as np
 import pyscf
 from gpu4pyscf import scf
+from gpu4pyscf import dft
 from gpu4pyscf.lib import precision
 
 def setUpModule():
@@ -195,6 +196,46 @@ class KnownValues(unittest.TestCase):
             vj, vk = mf.with_df.get_jk(dm, hermi=1)
         self.assertEqual(vj.dtype, np.float64)
         self.assertEqual(vk.dtype, vj.dtype)
+
+    def test_j_only_gradient_uses_the_fp32_kernel(self):
+        '''pure functionals route through _j_energy_per_atom, which used to
+        hardcode the float64 kernel and so ignored fp32 entirely'''
+        from gpu4pyscf.df.grad import rhf as df_rhf_grad
+        mf = dft.RKS(mol_sph, xc='pbe').density_fit()
+        mf.conv_tol = 1e-10
+        mf.kernel()
+        g = mf.nuc_grad_method()
+        g.auxbasis_response = True
+        ref = g.kernel()
+
+        seen = []
+        real_lib = df_rhf_grad.libvhf_rys
+        class Probe:
+            def __getattr__(self, name):
+                seen.append(name)
+                return getattr(real_lib, name)
+        df_rhf_grad.libvhf_rys = Probe()
+        try:
+            with precision.fp32():
+                got = g.kernel()
+        finally:
+            df_rhf_grad.libvhf_rys = real_lib
+        self.assertIn('sum_ejk_int3c2e_ip1_f32', seen)
+        self.assertNotIn('sum_ejk_int3c2e_ip1', seen)
+        # far under geomeTRIC's 3e-4 Eh/Bohr convergence threshold
+        self.assertLess(float(np.abs(got - ref).max()), 1e-5)
+
+    def test_hybrid_gradient_fp32_accuracy(self):
+        '''hybrids take the J+K path instead; it must stay accurate too'''
+        mf = dft.RKS(mol_sph, xc='b3lyp').density_fit()
+        mf.conv_tol = 1e-10
+        mf.kernel()
+        g = mf.nuc_grad_method()
+        g.auxbasis_response = True
+        ref = g.kernel()
+        with precision.fp32():
+            got = g.kernel()
+        self.assertLess(float(np.abs(got - ref).max()), 1e-5)
 
 if __name__ == '__main__':
     print('Full tests for df mixed precision')

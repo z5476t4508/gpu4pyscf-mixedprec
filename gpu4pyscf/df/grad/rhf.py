@@ -295,7 +295,18 @@ def _j_energy_per_atom(int3c2e_opt, dm, hermi=0, auxbasis_response=True, verbose
     ksh_offsets_gpu = cp.asarray(ksh_offsets_cpu+mol.nbas, dtype=np.int32)
 
     int3c2e_envs = int3c2e_opt.int3c2e_envs
-    kern = libvhf_rys.sum_ejk_int3c2e_ip1
+    # Only the integral kernel runs in float32; the dm contraction and the
+    # j2c metric solve above stay in float64 (see the note in
+    # _jk_energy_per_atom on the metric solve amplifying float32 error).
+    fp32 = precision.get_precision() == 'fp32'
+    if fp32:
+        kern = libvhf_rys.sum_ejk_int3c2e_ip1_f32
+        dm_kern = cp.asarray(dm, dtype=cp.float32, order='C')
+        auxvec_kern = cp.asarray(auxvec, dtype=cp.float32)
+    else:
+        kern = libvhf_rys.sum_ejk_int3c2e_ip1
+        dm_kern = dm
+        auxvec_kern = auxvec
     ej = cp.zeros((mol.natm, 3))
     if auxbasis_response:
         ej_aux = cp.zeros_like(ej)
@@ -305,8 +316,8 @@ def _j_energy_per_atom(int3c2e_opt, dm, hermi=0, auxbasis_response=True, verbose
 
     err = kern(
         ctypes.cast(ej.data.ptr, ctypes.c_void_p), ej_aux_ptr,
-        ctypes.cast(dm.data.ptr, ctypes.c_void_p),
-        ctypes.cast(auxvec.data.ptr, ctypes.c_void_p),
+        ctypes.cast(dm_kern.data.ptr, ctypes.c_void_p),
+        ctypes.cast(auxvec_kern.data.ptr, ctypes.c_void_p),
         ctypes.c_int(1),
         ctypes.byref(int3c2e_envs),
         ctypes.c_int(shm_size_max),
