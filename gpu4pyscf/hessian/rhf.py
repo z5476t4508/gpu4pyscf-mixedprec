@@ -33,6 +33,7 @@ from gpu4pyscf.__config__ import props as gpu_specs
 from gpu4pyscf.__config__ import num_devices
 from gpu4pyscf.lib import logger
 from gpu4pyscf.lib import multi_gpu
+from gpu4pyscf.lib import precision
 from gpu4pyscf.lib import utils
 from gpu4pyscf import scf
 from gpu4pyscf.scf.jk import (
@@ -807,7 +808,14 @@ def kernel(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
     if hessobj.verbose >= logger.INFO:
         hessobj.dump_flags()
 
-    de = hessobj.hess_elec(mo_energy, mo_coeff, mo_occ, atmlst=atmlst)
+    mode = hessobj._resolve_precision()
+    saved = precision.get_precision()
+    if mode is not None:
+        precision.set_precision(mode)
+    try:
+        de = hessobj.hess_elec(mo_energy, mo_coeff, mo_occ, atmlst=atmlst)
+    finally:
+        precision.set_precision(saved)
     hessobj.de = de.get() + hessobj.hess_nuc(hessobj.mol, atmlst=atmlst)
     mf = hessobj.base
     if mf.do_disp():
@@ -878,7 +886,11 @@ class HessianBase(lib.StreamObject):
     # attributes
     max_cycle   = rhf_hess_cpu.HessianBase.max_cycle
     level_shift = rhf_hess_cpu.HessianBase.level_shift
-    _keys       = rhf_hess_cpu.HessianBase._keys
+    _keys       = rhf_hess_cpu.HessianBase._keys | {'precision_mode'}
+
+    # None inherits the mean-field object's precision_mode; 'fp64'/'fp32'
+    # force one lane regardless of it.
+    precision_mode = None
 
     # methods
     hess_elec       = rhf_hess_cpu.HessianBase.hess_elec
@@ -896,6 +908,28 @@ class HessianBase(lib.StreamObject):
         return solve_mo1(self.base, mo_energy, mo_coeff, mo_occ, h1mo,
                          fx, atmlst, max_memory, verbose,
                          max_cycle=self.max_cycle, level_shift=self.level_shift)
+
+    def _resolve_precision(self):
+        '''The precision lane this Hessian runs in.
+
+        Only the CPHF J/K build reads it today, and that is where a Hessian
+        spends its time: 74% of a DF-RHF Hessian, all of it tensor contraction
+        over 3*natm right-hand sides.  Running it in float32 was measured at
+        20x on that phase and moved the harmonic frequencies of Tamoxifen
+        (537 AO, def2-SVP) by 0.001 cm^-1, so 'auto' selects float32 here for
+        the same reason it does on a gradient: there is no accuracy left to
+        recover by spending float64 on it.  Set precision_mode on the Hessian
+        object itself to override.
+        '''
+        mode = self.precision_mode
+        if mode is None:
+            mode = getattr(self.base, 'precision_mode', None)
+        if mode == 'auto':
+            mode = 'fp32'
+        if mode is not None and mode not in ('fp64', 'fp32'):
+            raise ValueError(
+                f"precision mode must be 'fp64', 'fp32' or 'auto', got {mode!r}")
+        return mode
 
     def dump_flags(self, verbose=None):
         log = logger.new_logger(self, verbose)

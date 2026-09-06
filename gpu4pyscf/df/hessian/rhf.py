@@ -40,6 +40,7 @@ from gpu4pyscf.grad import rhf as rhf_grad
 from gpu4pyscf.hessian import rhf as rhf_hess
 from gpu4pyscf.hessian.rhf import _hcore_energy, _aggregate_to_atoms
 from gpu4pyscf.lib import multi_gpu
+from gpu4pyscf.lib import precision
 
 num_devices = multi_gpu.num_devices
 
@@ -1325,12 +1326,19 @@ def _get_jk(dfobj, dms, mo_coeff, mo_occ, hermi=1, with_j=True, with_k=True, ome
         dm_sparse *= 2
         dm_sparse[:,cderi_diag] *= .5
 
+    # The CPHF J/K build is 74% of a DF-RHF Hessian and is pure tensor
+    # contraction over 3*natm right-hand sides, so it is the one place in the
+    # Hessian where float32 buys anything. Only the with_k branch is covered:
+    # that is the one CPHF takes.
+    fp32 = with_k and precision.get_precision() == 'fp32'
+    dtype = cp.float32 if fp32 else cp.float64
+
     def proc():
         vj = vk = None
         if with_k:
-            _mo1 = cp.asarray(mo1)
-            _occ_coeff = cp.asarray(occ_coeff)
-            vk = cp.zeros((n_dm, nspin, nao, nocc))
+            _mo1 = cp.asarray(mo1, dtype=dtype)
+            _occ_coeff = cp.asarray(occ_coeff, dtype=dtype)
+            vk = cp.zeros((n_dm, nspin, nao, nocc), dtype=dtype)
             if with_j:
                 vj = cp.zeros_like(vk)
         elif with_j:
@@ -1340,10 +1348,12 @@ def _get_jk(dfobj, dms, mo_coeff, mo_occ, hermi=1, with_j=True, with_k=True, ome
         blksize = dfobj.get_blksize(mem_fraction=0.2)
         if with_k:
             mem_avail = get_avail_mem(exclude_memory_pool=True)
-            dm_batch_size = int(mem_avail * 0.75 / (nspin*blksize*(nao+nocc)*nocc * 8))
+            itemsize = cp.dtype(dtype).itemsize
+            dm_batch_size = int(mem_avail * 0.75 /
+                                (nspin*blksize*(nao+nocc)*nocc * itemsize))
             dm_batch_size = min(dm_batch_size, n_dm)
-            buf2 = cp.empty((dm_batch_size+1,nspin,nao,nocc,blksize))
-            buf3 = cp.empty((dm_batch_size+1,nspin,nocc,nocc,blksize))
+            buf2 = cp.empty((dm_batch_size+1,nspin,nao,nocc,blksize), dtype=dtype)
+            buf3 = cp.empty((dm_batch_size+1,nspin,nocc,nocc,blksize), dtype=dtype)
             buf = buf2[-1]
             buf1 = buf3[-1]
             log.debug1('blksize=%d, dm_batch_size=%d', blksize, dm_batch_size)
@@ -1351,16 +1361,24 @@ def _get_jk(dfobj, dms, mo_coeff, mo_occ, hermi=1, with_j=True, with_k=True, ome
         for cderi, cderi_tril in dfobj.loop(blksize=blksize, unpack=with_k):
             if with_k:
                 nL = len(cderi)
-                rhok = ndarray((nspin,nao,nocc,nL), buffer=buf)
-                rhok_oo = ndarray((nspin,nocc,nocc,nL), buffer=buf1)
+                if fp32:
+                    # loop() yields an (nL,nao,nao) transposed view of an
+                    # (nao,nao,nL) C-contiguous buffer. Casting the view is
+                    # ~7x slower than casting along its own layout, so undo
+                    # the transpose first; cutensor takes the strided result.
+                    cderi = cderi.transpose(1,2,0).astype(cp.float32).transpose(2,0,1)
+                rhok = ndarray((nspin,nao,nocc,nL), dtype=dtype, buffer=buf)
+                rhok_oo = ndarray((nspin,nocc,nocc,nL), dtype=dtype, buffer=buf1)
                 contract('Lpq,sqj->spjL', cderi, _occ_coeff, out=rhok)
                 contract('spjL,spi->sijL', rhok, _occ_coeff, out=rhok_oo)
                 for i0, i1 in lib.prange(0, n_dm, dm_batch_size):
-                    rhok1 = ndarray((nspin,i1-i0,nao,nocc,nL), buffer=buf2)
+                    rhok1 = ndarray((nspin,i1-i0,nao,nocc,nL), dtype=dtype,
+                                    buffer=buf2)
                     contract('Lpq,snqi->snpiL', cderi, _mo1[:,i0:i1], out=rhok1)
                     contract('snpiL,sjiL->nspj', rhok1, rhok_oo, beta=1, out=vk[i0:i1])
 
-                    rhok1_oo = ndarray((nspin,i1-i0,nocc,nocc,nL), buffer=buf3)
+                    rhok1_oo = ndarray((nspin,i1-i0,nocc,nocc,nL), dtype=dtype,
+                                       buffer=buf3)
                     contract('snpiL,spj->snjiL', rhok1, _occ_coeff, out=rhok1_oo)
                     contract('spiL,snjiL->nspj', rhok, rhok1_oo, beta=1, out=vk[i0:i1])
                     if with_j:
@@ -1376,11 +1394,15 @@ def _get_jk(dfobj, dms, mo_coeff, mo_occ, hermi=1, with_j=True, with_k=True, ome
     vj = vk = None
     if with_k:
         vk = multi_gpu.array_reduce([x[1] for x in results], inplace=True)
+        if fp32:
+            vk = cp.asarray(vk, dtype=cp.float64)
         vk = contract('nspi,spq->nsqi', vk, mo_coeff)
         if nspin == 1: # * 2 to encounter the double occupancy in RHF
             vk *= 2
         if with_j:
             vj = multi_gpu.array_reduce([x[0] for x in results], inplace=True)
+            if fp32:
+                vj = cp.asarray(vj, dtype=cp.float64)
             vj = contract('nspi,spq->nsqi', vj, mo_coeff)
             # vj * 2 due to the transpose_sum(dm) when constructing dm
             vj *= 2
