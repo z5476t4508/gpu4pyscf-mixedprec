@@ -361,6 +361,33 @@ Tamoxifen, 1274 AO, r2SCAN/def2-TZVPP + def2-universal-jkfit, `auxbasis_response
 
 能量差 8.2e-12 Eh, 梯度差 9.6e-6 Eh/Bohr。此前 auto 单步只有 1.53x。
 
+### 端到端几何优化 (受体系尺寸门控)
+
+| 分子 / 基组 | AO | fp64 | auto | 加速 |
+|---|---|---|---|---|
+| Vitamin C, def2-SVP (收敛) | 208 | 67.2s | 78.4s | **0.86x** |
+| Tamoxifen, def2-SVP (收敛) | 537 | 347.1s / 41 步 | 224.1s / 43 步 | **1.55x** |
+| Tamoxifen, def2-TZVPP (各 7 步) | 1274 | 209.5s | 111.3s | **1.88x** |
+
+**收敛构型对照 (Tamoxifen def2-SVP)** —— 两边最终构型都用 conv_tol=1e-11 的
+严格 fp64 重算能量:
+
+    fp64  -1136.682481947
+    auto  -1136.682481949     差 2.2e-9 Eh = 1.4e-6 kcal/mol
+
+auto 多走了 2 步 (43 vs 41) 仍快 1.55x。构型坐标最大差 7.05e-3 Bohr ——
+比位移阈值 1.8e-3 大, 但极小点附近 PES 平坦, 能量一致到 2e-9 Eh 才是有意义的
+判据。**结论: fp32 梯度不改变优化落点的能量。**
+
+Tamoxifen def2-TZVPP 那组两条通道步数完全相同 (7 步), 每步能量差 1e-6~3e-6 Eh,
+坐标最大偏离 9.9e-4 Bohr; 但它是 maxsteps 截断的, 不是收敛对比。
+
+**Vitamin C 反而慢**: 208 AO 喂不饱 GPU, 而 auto 的 fp32→fp64 切换多花的
+迭代赚不回来。和单点表里 Vitamin C 1.0x 的规律一致。加速比随尺寸单调上升:
+208 AO 0.86x → 537 AO 1.55x → 1274 AO 1.88x。
+**不要拿单步/梯度加速比当端到端优化的数字报** —— 要看体系尺寸。
+
+
 ## 基准文件
 
 - `mixedprec/fp32_jk.py` — get_jk FP32 化 + install() monkey-patch (含 cast 布局修复)
