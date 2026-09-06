@@ -16,6 +16,7 @@ import unittest
 import numpy as np
 import pyscf
 
+from gpu4pyscf import dft
 from gpu4pyscf import scf
 from gpu4pyscf.lib import precision
 
@@ -101,6 +102,27 @@ class KnownValues(unittest.TestCase):
 
         umf.precision_mode = 'auto'
         self.assertLess(np.abs(umf.Hessian().kernel() - ref).max(), 1e-6)
+
+    def test_rks_fp32_cphf_response(self):
+        '''_nr_rks_fxc_mo_task carries the CPHF's XC response and branches on
+        the functional type -- LDA, GGA and MGGA each take a different path,
+        and a hybrid additionally exercises the float32 K build'''
+        for xc in ('LDA,VWN', 'PBE', 'r2scan', 'B3LYP'):
+            with self.subTest(xc=xc):
+                rks = dft.RKS(mol, xc=xc).density_fit()
+                rks.conv_tol = 1e-12
+                rks.kernel()
+                ref = rks.Hessian().kernel()
+
+                rks.precision_mode = 'auto'
+                hess = rks.Hessian().kernel()
+                self.assertLess(np.abs(hess - ref).max(), 1e-6)
+
+                n = 3 * mol.natm
+                eig = np.linalg.eigvalsh(hess.transpose(0, 2, 1, 3).reshape(n, n))
+                eig_ref = np.linalg.eigvalsh(
+                    ref.transpose(0, 2, 1, 3).reshape(n, n))
+                self.assertLess(np.abs(eig - eig_ref).max(), 1e-6)
 
 
 if __name__ == '__main__':

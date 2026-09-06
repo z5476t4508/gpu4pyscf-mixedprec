@@ -34,6 +34,8 @@ from gpu4pyscf.lib.cupy_helper import (
 from gpu4pyscf.lib import logger
 from gpu4pyscf.__config__ import num_devices, min_grid_blksize
 from gpu4pyscf.dft.numint import NLC_REMOVE_ZERO_RHO_GRID_THRESHOLD, _contract_rho1_fxc
+from gpu4pyscf.dft.numint import _as as _as_dtype, _f64
+from gpu4pyscf.lib import precision
 import ctypes
 from pyscf import __config__
 MIN_BLK_SIZE = getattr(__config__, 'min_grid_blksize', 4096)
@@ -3523,6 +3525,14 @@ def _nr_rks_fxc_mo_task(ni, mol, grids, xc_code, fxc, mo_coeff, mo1, mocc,
         fxc_w_buf = cupy.empty(ncomp*ncomp*MIN_BLK_SIZE)
         buf = cupy.empty(MIN_BLK_SIZE * nao)
         vtmp_buf = cupy.empty(nao*nao)
+        # The Fock-side contraction ao @ (ao*w)^T dominates this kernel -- 79s
+        # of the 143s a r2SCAN/def2-SVP CPHF spends here, in _tau_dot alone --
+        # and like the ground-state one it carries no cancellation, so float32
+        # keeps it inside the grid's own quadrature error. The density side
+        # (eval_rho4) stays float64: rho1 is a *response* density and can
+        # cancel, unlike the ground-state density that justifies the cast in
+        # _eval_rho2.
+        fp32_grid = precision.get_precision() == 'fp32'
         for ao, mask, weights, coords in ni.block_loop(_sorted_mol, grids, nao, ao_deriv,
                                                        max_memory=None, blksize=None,
                                                        grid_range=(grid_start, grid_end)):
@@ -3542,24 +3552,34 @@ def _nr_rks_fxc_mo_task(ni, mol, grids, xc_code, fxc, mo_coeff, mo1, mocc,
             fxc_w = cupy.multiply(fxc[:,:,p0:p1], weights, out=fxc_w)
             wv = contract('axg,xyg->ayg', rho1, fxc_w, out=rho1)
 
+            if fp32_grid:
+                ao = ao.astype(cupy.float32)
+                # the preallocated buffers are sized for float64 views
+                vtmp = None
+                scale_buf = None
+            else:
+                scale_buf = buf
+
             for i in range(nset):
                 if xctype == 'LDA':
-                    aow = numint._scale_ao(ao, wv[i][0], out=buf)
-                    add_sparse(vmat[i], ao.dot(aow.T, out=vtmp), mask)
+                    aow = numint._scale_ao(ao, _as_dtype(wv[i][0], ao), out=scale_buf)
+                    add_sparse(vmat[i], _f64(ao.dot(aow.T, out=vtmp)), mask)
                     # vmat_tmp = ao.dot(numint._scale_ao(ao, wv[i][0]).T)
                 elif xctype == 'GGA':
                     wv[i,0] *= .5
-                    aow = numint._scale_ao(ao, wv[i], out=buf)
-                    add_sparse(vmat[i], ao[0].dot(aow.T, out=vtmp), mask)
+                    aow = numint._scale_ao(ao, _as_dtype(wv[i], ao), out=scale_buf)
+                    add_sparse(vmat[i], _f64(ao[0].dot(aow.T, out=vtmp)), mask)
                 elif xctype == 'NLC':
                     raise NotImplementedError('NLC')
                 else:
                     wv[i,0] *= .5
                     wv[i,4] *= .5
-                    vtmp = numint._tau_dot(ao, ao, wv[i,4], buf=buf, out=vtmp)
-                    aow = numint._scale_ao(ao[:4], wv[i,:4], out=buf)
+                    vtmp = numint._tau_dot(ao, ao, _as_dtype(wv[i,4], ao),
+                                           buf=scale_buf, out=vtmp)
+                    aow = numint._scale_ao(ao[:4], _as_dtype(wv[i,:4], ao),
+                                           out=scale_buf)
                     vtmp = contract('ig, jg->ij', ao[0], aow, beta=1, out=vtmp) # ao[0].dot(aow.T, out=vtmp)
-                    add_sparse(vmat[i], vtmp, mask)
+                    add_sparse(vmat[i], _f64(vtmp), mask)
 
             t1 = log.timer_debug2('integration', *t1)
             ao = rho1 = None
