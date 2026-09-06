@@ -205,8 +205,10 @@ def _eval_rho2(ao, cpos, xctype, with_lapl=False, buf=None, rho=None):
     # well under the quadrature error of the grid itself -- while running
     # ~25x faster on a consumer GPU. rho itself stays float64 for libxc.
     if precision.get_precision() == 'fp32':
-        ao = ao.astype(cupy.float32)
-        cpos = cpos.astype(cupy.float32)
+        if ao.dtype != cupy.float32:
+            ao = ao.astype(cupy.float32)
+        if cpos.dtype != cupy.float32:
+            cpos = cpos.astype(cupy.float32)
         buf = None      # the caller's buffer is sized for float64 views
 
     nmo = cpos.shape[1]

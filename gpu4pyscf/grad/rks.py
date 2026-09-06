@@ -27,6 +27,7 @@ from gpu4pyscf.grad import rhf as rhf_grad
 from gpu4pyscf.dft import numint, xc_deriv
 from gpu4pyscf.dft import radi
 from gpu4pyscf.dft import gen_grid
+from gpu4pyscf.lib import precision
 from gpu4pyscf.lib.cupy_helper import (
     contract, get_avail_mem, add_sparse, tag_array, sandwich_dot,
     reduce_to_device, take_last2d, ndarray, batched_vec_norm2)
@@ -159,6 +160,11 @@ def _get_exc_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
         ngrids_local = grid_end - grid_start
         log.debug(f"{ngrids_local} grids on Device {device_id}")
 
+        # The gradient's grid contractions are the same shape as the energy's
+        # and cancel just as little, so float32 is safe here too; exc1_ao and
+        # the density matrix stay float64. See dft.numint._nr_rks_task.
+        fp32_grid = precision.get_precision() == 'fp32'
+        _gbuf = (lambda b: None) if fp32_grid else (lambda b: b)
         exc1_ao = cupy.zeros((nao,3))
         vtmp_buf = cupy.empty((3*nao*nao))
         mo_buf = cupy.empty_like(mo_coeff)
@@ -169,12 +175,14 @@ def _get_exc_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
             for ao_mask, idx, weight, _ in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, None,
                                                          grid_range=(grid_start, grid_end)):
                 mo_coeff_mask = cupy.take(mo_coeff, idx, axis=0, out=mo_buf[:len(idx)])
+                if fp32_grid:
+                    ao_mask = ao_mask.astype(cupy.float32)
                 rho = numint.eval_rho2(_sorted_mol, ao_mask[0], mo_coeff_mask,
-                                       mo_occ, None, xctype, buf=aow_buf)
+                                       mo_occ, None, xctype, buf=_gbuf(aow_buf))
                 vxc = ni.eval_xc_eff(xc_code, rho, 1, xctype=xctype, spin=0)[1][0]
                 wv = cupy.multiply(weight, vxc, out=vxc)
-                aow = numint._scale_ao(ao_mask[0], wv, out=aow_buf)
-                vtmp = _d1_dot_(ao_mask[1:4], aow.T, out=vtmp_buf)
+                aow = numint._scale_ao(ao_mask[0], wv, out=_gbuf(aow_buf))
+                vtmp = _d1_dot_(ao_mask[1:4], aow.T, out=_gbuf(vtmp_buf))
                 dm_mask = take_last2d(dm, idx, out=dm_mask_buf)
                 exc1_ao[idx] += cupy.einsum('nij,ij->ni', vtmp, dm_mask).T
         elif xctype == 'GGA':
@@ -184,12 +192,14 @@ def _get_exc_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
             for ao_mask, idx, weight, _ in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, None,
                                                          grid_range=(grid_start, grid_end)):
                 mo_coeff_mask = cupy.take(mo_coeff, idx, axis=0, out=mo_buf[:len(idx)])
+                if fp32_grid:
+                    ao_mask = ao_mask.astype(cupy.float32)
                 rho = numint.eval_rho2(_sorted_mol, ao_mask[:4], mo_coeff_mask,
-                                       mo_occ, None, xctype, buf=aow_buf)
+                                       mo_occ, None, xctype, buf=_gbuf(aow_buf))
                 vxc = ni.eval_xc_eff(xc_code, rho, 1, xctype=xctype, spin=0, work=aow_buf)[1]
                 wv = cupy.multiply(weight, vxc, out=vxc)
                 wv[0] *= .5
-                vtmp = _gga_grad_sum_(ao_mask, wv, buf=aow_buf, out=vtmp_buf)
+                vtmp = _gga_grad_sum_(ao_mask, wv, buf=_gbuf(aow_buf), out=_gbuf(vtmp_buf))
                 dm_mask = take_last2d(dm, idx, out=dm_mask_buf)
                 exc1_ao[idx] += cupy.einsum('nij,ij->ni', vtmp, dm_mask).T
 
@@ -202,14 +212,16 @@ def _get_exc_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
             for ao_mask, idx, weight, _ in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, None,
                                                          grid_range=(grid_start, grid_end)):
                 mo_coeff_mask = cupy.take(mo_coeff, idx, axis=0, out=mo_buf[:len(idx)])
+                if fp32_grid:
+                    ao_mask = ao_mask.astype(cupy.float32)
                 rho = numint.eval_rho2(_sorted_mol, ao_mask[:4], mo_coeff_mask,
-                                       mo_occ, None, xctype, with_lapl=False, buf=aow_buf)
+                                       mo_occ, None, xctype, with_lapl=False, buf=_gbuf(aow_buf))
                 vxc = ni.eval_xc_eff(xc_code, rho, 1, xctype=xctype, spin=0, work=aow_buf)[1]
                 wv = cupy.multiply(weight, vxc, out=vxc)
                 wv[0] *= .5
                 wv[4] *= .5  # for the factor 1/2 in tau
-                vtmp = _gga_grad_sum_(ao_mask, wv, buf=aow_buf, out=vtmp_buf)
-                vtmp = _tau_grad_dot_(ao_mask, wv[4], accumulate=True, buf=aow_buf, out=vtmp)
+                vtmp = _gga_grad_sum_(ao_mask, wv, buf=_gbuf(aow_buf), out=_gbuf(vtmp_buf))
+                vtmp = _tau_grad_dot_(ao_mask, wv[4], accumulate=True, buf=_gbuf(aow_buf), out=vtmp)
                 dm_mask = take_last2d(dm, idx, out=dm_mask_buf)
                 exc1_ao[idx] += cupy.einsum('nij,ij->ni', vtmp, dm_mask).T
 

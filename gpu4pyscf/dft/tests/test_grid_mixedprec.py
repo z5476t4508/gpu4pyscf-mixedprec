@@ -156,6 +156,27 @@ class KnownValues(unittest.TestCase):
         e_auto = mf2.kernel()
         self.assertAlmostEqual(e_auto, e_ref, delta=1e-8)
 
+    def test_fp32_gradient_accuracy(self):
+        '''the fp32 grid gradient must stay far under a geometry optimiser's
+        convergence threshold (geomeTRIC's default is 3e-4 Eh/Bohr)'''
+        mf = dft.RKS(mol, xc='r2scan').density_fit()
+        mf.conv_tol = 1e-10
+        mf.kernel()
+        g = mf.nuc_grad_method()
+        g.auxbasis_response = True
+        ref = g.kernel()
+        with precision.fp32():
+            got = g.kernel()
+        self.assertLess(float(np.abs(got-ref).max()), 1e-5)
+
+    def test_gradient_default_stays_float64(self):
+        '''an SCF run under auto must leave the gradient in float64'''
+        mf = dft.RKS(mol, xc='r2scan').density_fit()
+        mf.conv_tol = 1e-10
+        mf.precision_mode = 'auto'
+        mf.kernel()
+        self.assertEqual(precision.get_precision(), 'fp64')
+
 
 if __name__ == '__main__':
     print('Tests for mixed precision on the DFT grid')
