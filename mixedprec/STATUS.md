@@ -333,11 +333,12 @@ Tamoxifen, 1274 AO, r2SCAN/def2-TZVPP + def2-universal-jkfit, `auxbasis_response
 |---|---|---|---|
 | fp64 | 8.01s | — | — |
 | fp32, 仅 XC 网格 | 4.04s | 1.98x | 9.1e-07 |
-| fp32, XC + J 内核 | 2.42s | **3.31x** | 1.0e-05 |
+| fp32, XC + J 内核 | 2.42s | 3.31x | 1.0e-05 |
+| fp32, + 内核累加器修复 | **1.18s** | **6.80x** | 1.1e-05 |
 
-误差比 geomeTRIC 默认收敛阈值 3e-4 Eh/Bohr 低 30 倍。
+误差比 geomeTRIC 默认收敛阈值 3e-4 Eh/Bohr 低 26 倍。
 
-两处改动:
+三处改动:
 
 1. `_j_energy_per_atom` (df/grad/rhf.py) 之前硬写 `sum_ejk_int3c2e_ip1`,
    只有 `_jk_energy_per_atom` 选了 f32 内核。**纯泛函 (r2SCAN/PBE) 走的正是
@@ -351,15 +352,36 @@ Tamoxifen, 1274 AO, r2SCAN/def2-TZVPP + def2-universal-jkfit, `auxbasis_response
    mf 的模式; **梯度没有迭代可收敛, 所以 'auto' 在这里就是 fp32** ——
    1e-5 误差远低于它喂给的收敛阈值。`g.precision_mode` 可覆盖。
    TD 梯度自己重写了 `kernel`, 不受影响 (保守留在 fp64)。
+3. **`ejk_int3c2e_ip1_f32.cu` 的 9 个梯度累加器还是 double** —— 但它们喂的
+   跨线程归约缓冲区 `reduce` 本身是 `float*`, 额外精度下一条语句就被截断,
+   代价却是 `GOUT_WIDTH=54` 最内层循环里每轮 9 次 1/64 速率的 fp64 加法。
+   改成 float 后内核 2.42s → 1.18s, 误差 1.00e-5 → 1.14e-5 (基本不变)。
+
+   **发现它的线索**: 内核 fp64→fp32 只拿到 2.03x (3.181s → 1.569s), 而 5090
+   的 fp32:fp64 硬件比是 64:1。差这么远就说明内核不是被 fp64 算力卡住的。
+   **以后看到 fp32 化收益远低于硬件比, 就往下追。**
+
+   fp64 版内核是 `double *reduce` 配 `double v_ix`, 自洽 —— 这是 f32 移植
+   时只改了一半。同时删掉 `datax = (float*)(ROOT_RW_DATA)` 这颗哑弹:
+   `ROOT_RW_DATA` 是 `double[]`, 这是位重解释不是数值转换, 读出来是垃圾;
+   它被 `(void)datax;` 挂着没人用。
+   另测: Rys 根的 Clenshaw 递推改 float **完全没收益** (1.177→1.176s,
+   每对壳层只算一次被内层循环摊薄了), 不换速度就不降精度, 已退回 double。
 
 单步端到端 (SCF + 梯度, 同分子):
 
 | | SCF | 梯度 | 单步 |
 |---|---|---|---|
-| fp64 | 25.66s | 8.04s | 33.70s |
-| auto | 14.06s | 2.43s | **16.49s (2.04x)** |
+| fp64 | 25.67s | 8.04s | 33.72s |
+| auto | 14.05s | **1.19s** | **15.24s (2.21x)** |
 
-能量差 8.2e-12 Eh, 梯度差 9.6e-6 Eh/Bohr。此前 auto 单步只有 1.53x。
+能量差 8.2e-12 Eh, 梯度差 1.15e-5 Eh/Bohr。此前 auto 单步只有 1.53x。
+
+**成本重心已经回到 SCF**: 梯度现在只占 auto 单步的 7.8%, SCF 占 92%。
+再降梯度精度最多再快 8% —— 这条线可以收工了。下一个靶子在 SCF 侧,
+而那里卡住的不是精度而是策略: geomeTRIC 的能量判据是 1e-6 Eh 而纯 fp32
+SCF 噪声底 4e-5 (高 40 倍, 所以 fp64 尾巴必须留), 但优化早期构型离极小点
+还远, SCF 却一直按 conv_tol=1e-9 收敛 —— 这个浪费和精度无关。
 
 ### 端到端几何优化 (受体系尺寸门控)
 
