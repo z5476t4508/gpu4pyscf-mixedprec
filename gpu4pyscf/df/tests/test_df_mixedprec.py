@@ -144,6 +144,58 @@ class KnownValues(unittest.TestCase):
             precision.set_cderi_precision('fp16')
         self.assertEqual(precision.get_cderi_precision(), 'fp64')
 
+    def test_precision_mode_is_a_declared_attribute(self):
+        '''an undeclared attribute triggers check_sanity warnings and can be
+        dropped by copy/serialisation paths, silently reverting to fp64'''
+        mf = scf.RHF(mol_sph).density_fit()
+        # PySCF unions _keys across the MRO (lib/misc.py check_sanity)
+        keys = set().union(*[getattr(c, '_keys', set())
+                             for c in type(mf).__mro__])
+        self.assertIn('precision_mode', keys)
+        self.assertIsNone(mf.precision_mode)
+
+        mf.precision_mode = 'auto'
+        mf.verbose = 4
+        mf.check_sanity()          # must not report an unknown attribute
+
+    def test_invalid_precision_mode_is_rejected(self):
+        '''an unrecognised mode used to fall through to fp64 silently'''
+        mf = scf.RHF(mol_sph).density_fit()
+        mf.precision_mode = 'float32'
+        with self.assertRaises(ValueError):
+            mf.kernel()
+        self.assertEqual(precision.get_precision(), 'fp64')
+
+    def test_precision_is_restored_after_a_failed_scf(self):
+        '''a raising SCF must not leave the process in fp32'''
+        mf = scf.RHF(mol_sph).density_fit()
+        mf.precision_mode = 'fp32'
+
+        def boom(*args, **kwargs):
+            raise RuntimeError('boom')
+        mf.get_veff = boom
+        with self.assertRaises(RuntimeError):
+            mf.kernel()
+        self.assertEqual(precision.get_precision(), 'fp64')
+
+    def test_precision_is_restored_after_a_normal_scf(self):
+        mf = scf.RHF(mol_sph).density_fit()
+        mf.precision_mode = 'auto'
+        mf.conv_tol = 1e-10
+        mf.kernel()
+        self.assertEqual(precision.get_precision(), 'fp64')
+
+    def test_get_jk_dtype_is_independent_of_the_mode(self):
+        '''vj used to come back float32 while vk was float64'''
+        mf = scf.RHF(mol_sph).density_fit()
+        mf.conv_tol = 1e-10
+        mf.kernel()
+        dm = mf.make_rdm1()
+        with precision.fp32():
+            vj, vk = mf.with_df.get_jk(dm, hermi=1)
+        self.assertEqual(vj.dtype, np.float64)
+        self.assertEqual(vk.dtype, vj.dtype)
+
 if __name__ == '__main__':
     print('Full tests for df mixed precision')
     unittest.main()

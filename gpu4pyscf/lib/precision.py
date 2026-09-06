@@ -25,15 +25,16 @@ accuracy for the converged result.
 
 Example::
 
-    from gpu4pyscf.lib import precision
-    with precision.fp32():
-        mf = scf.RHF(mol).density_fit()
-        mf.kernel()
-
-    # or the automatic mixed-precision policy:
+    # the mixed-precision SCF policy, set on the mean-field object:
     mf = scf.RHF(mol).density_fit()
     mf.precision_mode = 'auto'
     mf.kernel()
+
+    # the context managers act on standalone contractions, not on an SCF run:
+    # scf.hf._kernel sets the mode from mf.precision_mode on entry, so
+    # wrapping mf.kernel() in one of these has no effect.
+    with precision.fp32():
+        vj, vk = mf.with_df.get_jk(dm, hermi=1)
 '''
 
 import contextlib

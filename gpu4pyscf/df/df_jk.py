@@ -588,6 +588,10 @@ def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True,
     vj = vk = None
     if with_j:
         vj_sparse = multi_gpu.array_reduce([x[0] for x in results], inplace=True)
+        if fp32:
+            # keep the returned dtype independent of the precision mode, and
+            # consistent with vk below
+            vj_sparse = vj_sparse.astype(cp.float64)
         vj = cp.zeros_like(dms_3d)
         vj[:,cols,rows] = vj[:,rows,cols] = vj_sparse
         vj = vj.reshape(dms.shape)

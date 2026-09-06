@@ -227,11 +227,29 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
     #             below _PRECISION_SWITCH_TOL, switch to fp64 for the tail
     #             iterations and the final energy (restores full accuracy).
     _mode = getattr(mf, 'precision_mode', None)
+    if _mode is not None and _mode not in ('fp64', 'fp32', 'auto'):
+        raise ValueError(
+            f"precision_mode must be None, 'fp64', 'fp32' or 'auto', got {_mode!r}")
+    _precision_saved = precision.get_precision()
     if _mode in ('auto', 'fp32'):
         precision.set_precision('fp32')
     else:
         precision.set_precision('fp64')
     _mixed_auto = _mode == 'auto'
+    try:
+        return _kernel_body(mf, conv_tol, conv_tol_grad, dump_chk, dm0, callback,
+                            conv_check, _mixed_auto, log, t0, t1, **kwargs)
+    finally:
+        # the policy above mutates process-global state; leaving it set would
+        # silently contaminate the next calculation if this one raised
+        precision.set_precision(_precision_saved)
+
+
+def _kernel_body(mf, conv_tol, conv_tol_grad, dump_chk, dm0, callback,
+                 conv_check, _mixed_auto, log, t0, t1, **kwargs):
+    conv_tol = mf.conv_tol
+    mol = mf.mol
+    conv_tol_grad = conv_tol_grad if conv_tol_grad is not None else conv_tol**.5
 
     if dm0 is None:
         dm0 = mf.get_init_guess(mol, mf.init_guess)
@@ -736,8 +754,14 @@ class SCF(pyscf_lib.StreamObject):
         'direct_scf', 'direct_scf_tol', 'conv_check', 'callback',
         'mol', 'chkfile', 'mo_energy', 'mo_coeff', 'mo_occ',
         'e_tot', 'converged', 'cycles', 'scf_summary',
-        'disp', 'disp_with_3body',
+        'disp', 'disp_with_3body', 'precision_mode',
     }
+
+    # Mixed-precision policy for the SCF iterations. None/'fp64' runs
+    # everything in float64; 'fp32' runs every iteration with float32
+    # contractions; 'auto' starts in float32 and finishes in float64. See
+    # gpu4pyscf.lib.precision.
+    precision_mode = None
 
     # methods
     def __init__(self, mol):
