@@ -514,6 +514,63 @@ precision 引用都没有。**
 一致的矩阵-向量乘可能破坏子空间正交性 —— SCF 那套「早期 fp32 + fp64 尾巴」
 不一定能照搬。需要先单独量 fp32 `_get_jk` 对 Hessian 特征值/频率的影响。
 
+### CPHF 的 fp32 化 (2026-09-06, commit 8f997d2 + 后续收窄)
+
+`df/hessian/rhf.py::_get_jk` 走 fp32。Tamoxifen 537 AO / def2-SVP:
+
+| 阶段 | fp64 | fp32 CPHF |
+|---|---|---|
+| partial_hess_elec | 35.1s | 35.0s |
+| make_h1 | 13.0s | 12.9s |
+| **solve_mo1** | **137.3s** | **6.8s (20.2x)** |
+| 合计 | 185.6s | **54.9s (3.38x)** |
+
+Hessian 最大偏差 3.2e-7 Eh/Bohr², 频率差 **0.001 cm⁻¹**, CPHF 迭代次数不变
+(都是 6 次)。**Krylov 的担心没有成真**: fp32 算子仍然是个*自洽*的算子, 只是被
+轻微扰动了, 而扰动远小于求解器 5.7e-5 的容差。
+
+**踩了同一个坑第二次**: 第一版写的是 `fp32 = with_k and ...`, 注释还写着
+「CPHF 走的就是 with_k」。错。**纯泛函 (PBE/r2SCAN) 的 CPHF 没有精确交换,
+走的是 J-only 分支** —— 和梯度里 `_j_energy_per_atom` 当初漏掉的是同一个
+分岔。已修 (两个分支都覆盖; J-only 那条要注意 `fill_symmetric` 的 kernel
+是 double 硬编码的, 喂 float32 会静默出垃圾, 所以 reduce 之后要先转回 fp64)。
+
+### fp32 该包多宽: 只包 solve_mo1 (实测定的)
+
+三种泛函 × 两种作用范围, Tamoxifen 537 AO / def2-SVP:
+
+| 方法 | fp64 | 只包 solve_mo1 | 包整个 hess_elec |
+|---|---|---|---|
+| RHF | 185.5s | **54.8s (3.38x)**, 0.001 cm⁻¹ | — |
+| PBE | 131.6s | 130.6s (1.01x), **0.000** cm⁻¹ | 129.9s (1.01x), **0.131** cm⁻¹ |
+| r2SCAN | 300.0s | 299.2s (1.00x), **0.000** cm⁻¹ | 298.6s (1.00x), **0.181** cm⁻¹ |
+
+宽的那个**一样慢, 白丢 0.13-0.18 cm⁻¹**。所以 bracket 从 `kernel()` 挪到
+两个 `solve_mo1` (RHF 的和 UHF/UKS 共用的), 共用 `HessianBase.cphf_precision()`。
+正好是自己那条原则的反面案例: **不为零收益降精度**。
+
+**为什么纯泛函一分钱都赚不到 (机理已查清)**:
+
+- `hessian/rks.py` 有**自己的一套网格循环** (约 10 处 `block_loop`:
+  `_get_vxc_diag` / `_get_vxc_deriv1` / `_get_vxc_deriv2` / `_get_enlc_deriv2`
+  / 两套 grid_response), 直接调 `numint._scale_ao` / `_contract_rho`,
+  **不走** `_nr_rks_task` —— 而 fp32 的 cast 只写在 `_nr_rks_task` 里
+  (numint.py:547-555)。这两个 helper 本身**已经支持 fp32**, 只是没人喂给它们。
+- 唯一会自己 cast 的是 `_eval_rho2` (numint.py:207-211), 它在 Hessian 里
+  确实变成了 fp32 —— **那 0.13-0.18 cm⁻¹ 就是它一个人贡献的**, 而它不是瓶颈。
+- 所以现象是: 一小块掉了精度, 大块没提速。
+
+**r2SCAN-3c 的答案**: 走 `xc='r2scan3c'` (drivers/dft_3c_driver.py, r2scan +
+def2-mTZVPP + D4 + gCP, gCP 在 `gpu4pyscf/dispersion/gcp.py` 里是有的)。
+它是纯 meta-GGA, 所以吃 CPHF fp32 的收益是 **1.00x**。
+**梯度那 6.80x 完全没转化到 Hessian**, 因为梯度的两个收益来源
+(走 `_nr_rks_task` 的 fp32 XC 积分 + fp32 `ejk_int3c2e_ip1` 一阶导内核)
+在 Hessian 里都不成立。真正的工作量在那 10 处二阶导网格循环, 不在 CPHF。
+
+**下一步 (Hessian 线)**: 给 `hessian/rks.py` 的 `block_loop` 补 `ao` 的 cast,
+和 `_nr_rks_task` 里做的一样。这是 DFT Hessian 唯一有量的靶子。
+RHF/杂化那条线已经收工 (3.38x / 1.69x)。
+
 
 ## 基准文件
 
@@ -526,7 +583,9 @@ precision 引用都没有。**
 - `mixedprec/step5_convtol_probe.py` — 带仪表的几何优化 (每个 SCF 循环的
   精度通道/耗时/dE, 每步的 gmax 和实际 conv_tol); `--schedule auto` 开调度
 - `mixedprec/step5a_convtol_error.py` — conv_tol → 能量/梯度误差的映射
-- `mixedprec/step6_hessian_profile.py` — Hessian 三阶段耗时拆分
+- `mixedprec/step6_hessian_profile.py` — Hessian 三阶段耗时拆分 (`--xc` 跑 DFT)
+- `mixedprec/step6b_hessian_bracket.py` — fp32 作用范围对照 (fp64 / solve_mo1 / hess_elec)
+- `mixedprec/step6c_r2scan3c.py` — r2SCAN-3c (def2-mTZVPP + D4 + gCP) Hessian 对照
 - `mixedprec/compare_geoms.py` — 两个收敛构型用严格 fp64 重算对比落点
 - 结果: `step2_result.txt`, `step3_result.txt`, `instrument_result.txt`
 - 小基组对比: `/tmp/basis_scale.log` (6 步优化, def2-SVP / 6-31G*)

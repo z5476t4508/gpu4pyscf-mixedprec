@@ -1326,11 +1326,13 @@ def _get_jk(dfobj, dms, mo_coeff, mo_occ, hermi=1, with_j=True, with_k=True, ome
         dm_sparse *= 2
         dm_sparse[:,cderi_diag] *= .5
 
-    # The CPHF J/K build is 74% of a DF-RHF Hessian and is pure tensor
-    # contraction over 3*natm right-hand sides, so it is the one place in the
-    # Hessian where float32 buys anything. Only the with_k branch is covered:
-    # that is the one CPHF takes.
-    fp32 = with_k and precision.get_precision() == 'fp32'
+    # The CPHF J/K build is the bulk of a DF Hessian and is pure tensor
+    # contraction over 3*natm right-hand sides, so it is where float32 pays.
+    # Both branches must be covered: a hybrid's CPHF takes the with_k path,
+    # but a pure functional (PBE, r2SCAN) has no exact exchange and takes the
+    # J-only path -- the same split that made pure functionals miss the
+    # float32 gradient kernel entirely.
+    fp32 = precision.get_precision() == 'fp32'
     dtype = cp.float32 if fp32 else cp.float64
 
     def proc():
@@ -1342,7 +1344,7 @@ def _get_jk(dfobj, dms, mo_coeff, mo_occ, hermi=1, with_j=True, with_k=True, ome
             if with_j:
                 vj = cp.zeros_like(vk)
         elif with_j:
-            _dm_sparse = cp.asarray(dm_sparse)
+            _dm_sparse = cp.asarray(dm_sparse, dtype=dtype)
             vj = cp.zeros_like(_dm_sparse)
 
         blksize = dfobj.get_blksize(mem_fraction=0.2)
@@ -1385,6 +1387,8 @@ def _get_jk(dfobj, dms, mo_coeff, mo_occ, hermi=1, with_j=True, with_k=True, ome
                         rhoj1 = cp.einsum('sniiL->nL', rhok1_oo)
                         contract('spiL,nL->nspi', rhok, rhoj1, beta=1, out=vj[i0:i1])
             elif with_j:
+                if fp32:
+                    cderi_tril = cderi_tril.astype(cp.float32)
                 auxvec = contract('np,Lp->nL', _dm_sparse, cderi_tril)
                 contract('nL,Lp->np', auxvec, cderi_tril, beta=1, out=vj)
         return vj, vk
@@ -1410,6 +1414,10 @@ def _get_jk(dfobj, dms, mo_coeff, mo_occ, hermi=1, with_j=True, with_k=True, ome
                 vj *= 2
     elif with_j:
         vj_sparse = multi_gpu.array_reduce([x[0] for x in results], inplace=True)
+        if fp32:
+            # fill_symmetric's kernel is hardcoded to double; handing it a
+            # float32 input silently produces garbage rather than failing
+            vj_sparse = cp.asarray(vj_sparse, dtype=cp.float64)
         vj = fill_symmetric(vj_sparse.T, pair_addresses, nao)
         vj = contract('pqn,sqi->nspi', vj, occ_coeff)
         vj = contract('nspi,spq->nsqi', vj, mo_coeff)

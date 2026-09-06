@@ -425,9 +425,11 @@ class Hessian(rhf_hess_gpu.HessianBase):
 
     def solve_mo1(self, mo_energy, mo_coeff, mo_occ, h1mo,
                   fx=None, atmlst=None, max_memory=4000, verbose=None):
-        return solve_mo1(self.base, mo_energy, mo_coeff, mo_occ, h1mo,
-                         fx, atmlst, max_memory, verbose,
-                         max_cycle=self.max_cycle, level_shift=self.level_shift)
+        with self.cphf_precision():
+            return solve_mo1(self.base, mo_energy, mo_coeff, mo_occ, h1mo,
+                             fx, atmlst, max_memory, verbose,
+                             max_cycle=self.max_cycle,
+                             level_shift=self.level_shift)
 
     gen_hop = NotImplemented
 

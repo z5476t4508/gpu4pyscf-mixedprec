@@ -18,6 +18,7 @@ Non-relativistic RHF analytical Hessian
 
 import math
 import ctypes
+import contextlib
 import numpy
 import cupy
 import cupy as cp
@@ -808,14 +809,9 @@ def kernel(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
     if hessobj.verbose >= logger.INFO:
         hessobj.dump_flags()
 
-    mode = hessobj._resolve_precision()
-    saved = precision.get_precision()
-    if mode is not None:
-        precision.set_precision(mode)
-    try:
-        de = hessobj.hess_elec(mo_energy, mo_coeff, mo_occ, atmlst=atmlst)
-    finally:
-        precision.set_precision(saved)
+    # The precision lane is applied around the CPHF solve, not here -- see
+    # HessianBase.cphf_precision.
+    de = hessobj.hess_elec(mo_energy, mo_coeff, mo_occ, atmlst=atmlst)
     hessobj.de = de.get() + hessobj.hess_nuc(hessobj.mol, atmlst=atmlst)
     mf = hessobj.base
     if mf.do_disp():
@@ -905,21 +901,42 @@ class HessianBase(lib.StreamObject):
 
     def solve_mo1(self, mo_energy, mo_coeff, mo_occ, h1mo,
                   fx=None, atmlst=None, max_memory=4000, verbose=None):
-        return solve_mo1(self.base, mo_energy, mo_coeff, mo_occ, h1mo,
-                         fx, atmlst, max_memory, verbose,
-                         max_cycle=self.max_cycle, level_shift=self.level_shift)
+        with self.cphf_precision():
+            return solve_mo1(self.base, mo_energy, mo_coeff, mo_occ, h1mo,
+                             fx, atmlst, max_memory, verbose,
+                             max_cycle=self.max_cycle,
+                             level_shift=self.level_shift)
+
+    def cphf_precision(self):
+        '''Run the enclosed block in this Hessian's precision lane.
+
+        The lane covers the CPHF solve and nothing else.  That is where a
+        Hartree-Fock or hybrid Hessian spends its time -- float32 took the
+        DF-RHF CPHF from 137.3s to 6.8s (20x) on Tamoxifen/def2-SVP for
+        0.001 cm^-1 of frequency error.
+
+        It deliberately does not cover partial_hess_elec or make_h1.  For a
+        pure functional those are almost the whole cost, and their XC second
+        derivatives run in grid loops of their own (hessian/rks.py) that never
+        cast the AO values, so float32 cannot reach them: bracketing them
+        measured 1.00x on r2SCAN/def2-SVP while moving the frequencies
+        0.181 cm^-1, purely because eval_rho2 casts internally.  Precision
+        that buys no measured time is not worth spending.  Widen this only
+        together with a float32 port of those loops.
+        '''
+        mode = self._resolve_precision()
+        if mode is None:
+            return contextlib.nullcontext()
+        return precision.fp32() if mode == 'fp32' else precision.fp64()
 
     def _resolve_precision(self):
         '''The precision lane this Hessian runs in.
 
-        Only the CPHF J/K build reads it today, and that is where a Hessian
-        spends its time: 74% of a DF-RHF Hessian, all of it tensor contraction
-        over 3*natm right-hand sides.  Running it in float32 was measured at
-        20x on that phase and moved the harmonic frequencies of Tamoxifen
-        (537 AO, def2-SVP) by 0.001 cm^-1, so 'auto' selects float32 here for
-        the same reason it does on a gradient: there is no accuracy left to
-        recover by spending float64 on it.  Set precision_mode on the Hessian
-        object itself to override.
+        A Hessian has no accuracy left to recover by spending float64 on the
+        CPHF solve, so 'auto' selects float32 here for the same reason it does
+        on a gradient.  What the lane actually covers is decided by
+        cphf_precision, which is where the measurements live.  Set
+        precision_mode on the Hessian object itself to override.
         '''
         mode = self.precision_mode
         if mode is None:

@@ -48,6 +48,8 @@ def main():
     p.add_argument('--xyz', default=XYZ)
     p.add_argument('--basis', default='def2-svp')
     p.add_argument('--auxbasis', default='def2-universal-jkfit')
+    p.add_argument('--xc', default=None,
+                   help='run RKS with this functional instead of RHF')
     p.add_argument('--mode', default='fp64', help="mean-field precision_mode")
     p.add_argument('--cphf-fp32', action='store_true',
                    help='run the Hessian under the global fp32 mode')
@@ -58,9 +60,14 @@ def main():
 
     mol = pyscf.M(atom=args.xyz, basis=args.basis, verbose=0)
     print(f'{mol.natm} atoms, {mol.nao} AOs, basis={args.basis}, '
-          f'mode={args.mode}', flush=True)
+          f'method={args.xc or "RHF"}, mode={args.mode}'
+          f'{", cphf-fp32" if args.cphf_fp32 else ""}', flush=True)
 
-    mf = scf.RHF(mol).density_fit(auxbasis=args.auxbasis)
+    if args.xc:
+        from gpu4pyscf import dft
+        mf = dft.RKS(mol, xc=args.xc).density_fit(auxbasis=args.auxbasis)
+    else:
+        mf = scf.RHF(mol).density_fit(auxbasis=args.auxbasis)
     mf.conv_tol = 1e-10
     mf.precision_mode = args.mode
     mf.verbose = 0
