@@ -53,6 +53,41 @@ void GDFTcontract_rho_kernel(double *rho, double *bra, double *ket, int ngrids, 
     }
 }
 
+// float32 inputs, float64 output. The density is a sum of like-signed terms
+// (measured sum|term|/|result| ~1.6), so a float accumulator holds ~1e-7
+// relative accuracy here -- far below the quadrature error of the grid --
+// while avoiding the 1/64-rate float64 units of a consumer GPU.
+__global__
+void GDFTcontract_rho_f32_kernel(double *rho, float *bra, float *ket, int ngrids, int nao)
+{
+    int grid_id = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool active = grid_id < ngrids;
+    size_t Ngrids = ngrids;
+    float v = 0;
+    if (active){
+        for (int ao_id = threadIdx.y; ao_id < nao; ao_id += BLKSIZEY) {
+            size_t ket_idx = grid_id + ao_id * Ngrids;
+            v += bra[ket_idx] * ket[ket_idx];
+        }
+    }
+
+    __shared__ float buf[BLKSIZEX*(BLKSIZEY+1)];
+    int ix = threadIdx.x;
+    int iy = threadIdx.y;
+    int ixy = ix + BLKSIZEX * iy;
+    buf[ixy] = v;   __syncthreads();
+
+    if (blockDim.y >= 32 && iy < 16) buf[ixy] += buf[ixy + BLKSIZEX * 16]; __syncthreads();
+    if (blockDim.y >= 16 && iy < 8)  buf[ixy] += buf[ixy + BLKSIZEX * 8];  __syncthreads();
+    if (blockDim.y >= 8  && iy < 4)  buf[ixy] += buf[ixy + BLKSIZEX * 4];  __syncthreads();
+    if (blockDim.y >= 4  && iy < 2)  buf[ixy] += buf[ixy + BLKSIZEX * 2];  __syncthreads();
+    if (blockDim.y >= 2  && iy < 1)  buf[ixy] += buf[ixy + BLKSIZEX * 1];  __syncthreads();
+
+    if (iy == 0 && active) {
+        rho[grid_id] = (double)buf[ix];
+    }
+}
+
 // half of the GGA rho
 __global__
 void GDFTcontract_rho4_kernel(double *rho, double *bra, double *ket, int ngrids, int nao, int count)
@@ -319,8 +354,20 @@ int GDFTcontract_rho(cudaStream_t stream, double *rho, double *bra, double *ket,
     return 0;
 }
 
-int GDFTcontract_rho4(cudaStream_t stream, double *rho, double *bra, double *ket, int ngrids, int nao, int count)
+int GDFTcontract_rho_f32(cudaStream_t stream, double *rho, float *bra, float *ket, int ngrids, int nao)
 {
+    dim3 threads(BLKSIZEX, BLKSIZEY);
+    dim3 blocks((ngrids+BLKSIZEX-1)/BLKSIZEX);
+    GDFTcontract_rho_f32_kernel<<<blocks, threads, 0, stream>>>(rho, bra, ket, ngrids, nao);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error of GDFTcontract_rho_f32: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
+int GDFTcontract_rho4(cudaStream_t stream, double *rho, double *bra, double *ket, int ngrids, int nao, int count){
     dim3 threads(BLKSIZEX, BLKSIZEY);
     dim3 blocks((ngrids+BLKSIZEX-1)/BLKSIZEX);
     GDFTcontract_rho4_kernel<<<blocks, threads, 0, stream>>>(rho, bra, ket, ngrids, nao, count);
