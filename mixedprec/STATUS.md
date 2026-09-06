@@ -320,8 +320,31 @@ fp32 ~2260 分子/小时 (10 万 ≈ 1.8 天), auto ~1090 分子/小时 (≈ 3.8
 2. ~~阶段二 `ejk_int3c2e_ip1.cu` FP32 化~~ — 已完成 (见「阶段二相关数据」),
    梯度 3.31x, 几何优化单步 2.04x。剩余: Hessian 仍只有 1.15x
    (只吃到了共享的网格 helper), 需要先量出 CPHF 求解里 XC 占多少。
-3. 源码编译两问题 (阶段二前置): glibc rsqrt noexcept 冲突 (gcc-14 绕过) +
-   缺 gfortran
+3. ~~源码编译两问题~~ **(2026-09-06 更正, 之前的记录是错的)**:
+   - **gfortran 装着的** —— `/usr/bin/gfortran` = GNU Fortran 15.2.0。之前
+     「缺 gfortran」是误判 (大概是查了 `gfortran-14` 没找到就下结论),
+     `build/fake_gfortran` 那个 shim 和构建缓存里的
+     `CMAKE_Fortran_COMPILER=/bin/sh` 都是这次误判的产物, 都不需要。
+   - 真正的障碍只有一个: glibc 头文件的 `__THROW`/noexcept 和 nvcc 冲突。
+     解法是 CUDA flags, 不是换编译器。已验证的干净配置命令:
+
+         cmake -S gpu4pyscf/lib -B <build> \
+           -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-14 \
+           -DCUDA_ARCHITECTURES="120-real" \
+           -DCMAKE_CUDA_FLAGS="-U_GNU_SOURCE -U_ISOC23_SOURCE -U_ISOC2X_SOURCE \
+             -U_ISOC2Y_SOURCE -DM_PI=3.14159265358979323846 -include stdint.h"
+
+     这样配置全过, Fortran 自动找到 `/usr/bin/gfortran`, 无需任何 shim。
+   - **`pbc` 目标编不过, 而且这是个二选一, 不是可以顺手修的 bug**:
+     带 `-U_GNU_SOURCE` 时 CUDA 探测才能通过, 但关掉 `_GNU_SOURCE` 后 glibc
+     不再暴露 `uselocale` / `__locale_t` / `fwide` / `pthread_mutex_timedlock`,
+     而 `pbc` 用到的 libstdc++ 头文件 (`<cwchar>`, `bits/c++locale.h`) 要这些。
+     去掉 `-U_GNU_SOURCE` 重配 → 配置阶段直接 13 个错误, 什么都编不了。
+     实测过, 别再试。混合精度这条线不需要 `pbc`, 其余目标全部正常。
+     真要修得换 gcc/CUDA 版本组合。
+   - 现有的 `build/temp.gpu4pyscf` 是能用的 (增量编 `gvhf_rys` 约 6s), 但它的
+     缓存里带着上面那条错误的 Fortran 设置。**不要随手重配它**;
+     要干净重来就新建目录用上面的命令。
 
 ## 阶段二相关数据 (几何优化场景, 已测)
 
