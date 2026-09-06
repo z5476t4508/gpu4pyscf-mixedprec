@@ -23,6 +23,7 @@ from pyscf.grad import rhf as rhf_grad_cpu
 from gpu4pyscf.grad.dispersion import get_dispersion
 from gpu4pyscf.gto.ecp import get_ecp_ip
 from gpu4pyscf.lib import utils
+from gpu4pyscf.lib import precision
 from gpu4pyscf.lib.cupy_helper import (
     tag_array, contract, condense, transpose_sum, get_avail_mem, ndarray)
 from gpu4pyscf.__config__ import props as gpu_specs
@@ -479,8 +480,12 @@ class GradientsBase(lib.StreamObject):
     Basic nuclear gradient functions for non-relativistic methods
     '''
 
-    _keys = {'mol', 'base', 'unit', 'atmlst', 'de'}
+    _keys = {'mol', 'base', 'unit', 'atmlst', 'de', 'precision_mode'}
     __init__    = rhf_grad_cpu.GradientsBase.__init__
+
+    # None inherits the mean-field object's precision_mode; 'fp64'/'fp32'
+    # force one lane regardless of it.
+    precision_mode = None
 
     dump_flags  = rhf_grad_cpu.GradientsBase.dump_flags
 
@@ -521,15 +526,44 @@ class GradientsBase(lib.StreamObject):
         if self.verbose >= logger.INFO:
             self.dump_flags()
 
-        de = self.grad_elec(mo_energy, mo_coeff, mo_occ)
-        self.de = de + self.grad_nuc()
-        if self.mol.symmetry:
-            self.de = self.symmetrize(self.de)
-        if self.base.do_disp():
-            self.de += self.get_dispersion()
+        mode = self._resolve_precision()
+        saved = precision.get_precision()
+        if mode is not None:
+            precision.set_precision(mode)
+        try:
+            de = self.grad_elec(mo_energy, mo_coeff, mo_occ)
+            self.de = de + self.grad_nuc()
+            if self.mol.symmetry:
+                self.de = self.symmetrize(self.de)
+            if self.base.do_disp():
+                self.de += self.get_dispersion()
+        finally:
+            precision.set_precision(saved)
         log.timer('SCF gradients', *t0)
         self._finalize()
         return self.de
+
+    def _resolve_precision(self):
+        '''The precision lane this gradient runs in.
+
+        'auto' on the mean-field object means "fp32 early iterations, fp64
+        for the converged energy".  A gradient has no iteration to converge,
+        so there is no fp64 tail to fall back to and 'auto' simply selects
+        fp32 here.  That is the intended reading for a geometry
+        optimisation: the measured fp32 gradient error is ~1e-5 Eh/Bohr, an
+        order of magnitude below geomeTRIC's 3e-4 convergence threshold, so
+        it does not move where the optimiser stops.  Set precision_mode on
+        the gradient object itself to override.
+        '''
+        mode = self.precision_mode
+        if mode is None:
+            mode = getattr(self.base, 'precision_mode', None)
+        if mode == 'auto':
+            mode = 'fp32'
+        if mode is not None and mode not in ('fp64', 'fp32'):
+            raise ValueError(
+                f"precision mode must be 'fp64', 'fp32' or 'auto', got {mode!r}")
+        return mode
 
     def jk_energy_per_atom(self, dm=None, j_factor=1, k_factor=1, omega=0,
                            hermi=0, verbose=None):

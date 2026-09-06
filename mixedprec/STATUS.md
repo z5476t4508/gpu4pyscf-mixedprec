@@ -317,13 +317,49 @@ fp32 ~2260 分子/小时 (10 万 ≈ 1.8 天), auto ~1090 分子/小时 (≈ 3.8
    - CPU 进程池兜底通道 (2线程×12进程 ≈ +380 mol/h), 首版刻意未做
    - 同分子构象序列的 DM 链式热启动 (~10% 提速)
    - 大规模实跑前建议先用 `--dry-run` 核对分片清单
-2. 阶段二 (仅当回到几何优化场景才值得): `ejk_int3c2e_ip1.cu` FP32 化,
-   梯度 75-79%, 周级内核工程, 整体 1.14x→~1.6x。批量单点场景不跑梯度,
-   该项对当前需求无用。
+2. ~~阶段二 `ejk_int3c2e_ip1.cu` FP32 化~~ — 已完成 (见「阶段二相关数据」),
+   梯度 3.31x, 几何优化单步 2.04x。剩余: Hessian 仍只有 1.15x
+   (只吃到了共享的网格 helper), 需要先量出 CPHF 求解里 XC 占多少。
 3. 源码编译两问题 (阶段二前置): glibc rsqrt noexcept 冲突 (gcc-14 绕过) +
    缺 gfortran
 
 ## 阶段二相关数据 (几何优化场景, 已测)
+
+### 梯度 FP32 化 (2026-09-06 完成)
+
+Tamoxifen, 1274 AO, r2SCAN/def2-TZVPP + def2-universal-jkfit, `auxbasis_response=True`:
+
+| 通道 | 梯度耗时 | 加速 | 最大误差 (Eh/Bohr) |
+|---|---|---|---|
+| fp64 | 8.01s | — | — |
+| fp32, 仅 XC 网格 | 4.04s | 1.98x | 9.1e-07 |
+| fp32, XC + J 内核 | 2.42s | **3.31x** | 1.0e-05 |
+
+误差比 geomeTRIC 默认收敛阈值 3e-4 Eh/Bohr 低 30 倍。
+
+两处改动:
+
+1. `_j_energy_per_atom` (df/grad/rhf.py) 之前硬写 `sum_ejk_int3c2e_ip1`,
+   只有 `_jk_energy_per_atom` 选了 f32 内核。**纯泛函 (r2SCAN/PBE) 走的正是
+   J-only 路径**, 所以梯度完全没吃到 fp32 —— 非 XC 部分占 fp32 梯度的 81%。
+   现在两条路径一致: 只把交给积分内核的密度 cast 成 float32,
+   dm 预收缩和 j2c metric solve 仍留 float64 (metric solve 会把 float32 的
+   1e-7 相对误差放大到 1e-3)。
+2. `GradientsBase` 新增 `precision_mode` (grad/rhf.py)。之前 `scf.hf._kernel`
+   退出时恢复全局模式, 所以 `mf.precision_mode='auto'` 的梯度仍跑 fp64,
+   fp32 梯度只有手动 `with precision.fp32()` 才够得着。现在梯度默认继承
+   mf 的模式; **梯度没有迭代可收敛, 所以 'auto' 在这里就是 fp32** ——
+   1e-5 误差远低于它喂给的收敛阈值。`g.precision_mode` 可覆盖。
+   TD 梯度自己重写了 `kernel`, 不受影响 (保守留在 fp64)。
+
+单步端到端 (SCF + 梯度, 同分子):
+
+| | SCF | 梯度 | 单步 |
+|---|---|---|---|
+| fp64 | 25.66s | 8.04s | 33.70s |
+| auto | 14.06s | 2.43s | **16.49s (2.04x)** |
+
+能量差 8.2e-12 Eh, 梯度差 9.6e-6 Eh/Bohr。此前 auto 单步只有 1.53x。
 
 ## 基准文件
 

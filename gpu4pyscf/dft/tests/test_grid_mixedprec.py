@@ -169,12 +169,40 @@ class KnownValues(unittest.TestCase):
             got = g.kernel()
         self.assertLess(float(np.abs(got-ref).max()), 1e-5)
 
-    def test_gradient_default_stays_float64(self):
-        '''an SCF run under auto must leave the gradient in float64'''
+    def test_gradient_inherits_the_scf_precision_mode(self):
+        '''an SCF's 'auto' carries into the gradient as fp32: the gradient has
+        no iteration to converge, so there is no fp64 tail to fall back to.
+        The global mode must still be restored to fp64 afterwards.'''
         mf = dft.RKS(mol, xc='r2scan').density_fit()
         mf.conv_tol = 1e-10
         mf.precision_mode = 'auto'
         mf.kernel()
+        self.assertEqual(precision.get_precision(), 'fp64')
+        g = mf.nuc_grad_method()
+        g.auxbasis_response = True
+        self.assertEqual(g._resolve_precision(), 'fp32')
+        de = g.kernel()
+        self.assertEqual(precision.get_precision(), 'fp64')
+
+        mf2 = dft.RKS(mol, xc='r2scan').density_fit()
+        mf2.conv_tol = 1e-10
+        mf2.kernel()
+        g2 = mf2.nuc_grad_method()
+        g2.auxbasis_response = True
+        self.assertIsNone(g2._resolve_precision())
+        self.assertLess(float(np.abs(de - g2.kernel()).max()), 1e-5)
+
+    def test_gradient_precision_mode_overrides_the_scf(self):
+        mf = dft.RKS(mol, xc='r2scan').density_fit()
+        mf.conv_tol = 1e-10
+        mf.precision_mode = 'auto'
+        mf.kernel()
+        g = mf.nuc_grad_method()
+        g.precision_mode = 'fp64'
+        self.assertEqual(g._resolve_precision(), 'fp64')
+        g.precision_mode = 'nonsense'
+        with self.assertRaises(ValueError):
+            g.kernel()
         self.assertEqual(precision.get_precision(), 'fp64')
 
 
