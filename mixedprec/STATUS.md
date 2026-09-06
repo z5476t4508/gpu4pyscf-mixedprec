@@ -571,6 +571,47 @@ def2-mTZVPP + D4 + gCP, gCP 在 `gpu4pyscf/dispersion/gcp.py` 里是有的)。
 和 `_nr_rks_task` 里做的一样。这是 DFT Hessian 唯一有量的靶子。
 RHF/杂化那条线已经收工 (3.38x / 1.69x)。
 
+### DFT Hessian: CPHF 的 XC 响应核 (2026-09-06, commit acdab39)
+
+| 方法 | 之前 | 之后 | 频率偏差 |
+|---|---|---|---|
+| r2SCAN | 1.00x | **1.43x** (299.4 → 209.2s) | 0.000 cm⁻¹ |
+| PBE | 1.01x | **1.21x** (131.4 → 108.4s) | 0.000 cm⁻¹ |
+| B3LYP | 1.68x | **1.96x** (285.4 → 145.6s) | 0.000 cm⁻¹ |
+
+改的是 `hessian/rks.py::_nr_rks_fxc_mo_task` 的 Fock 侧。单看那个收缩:
+`_tau_dot` **79.1s → 10.4s (7.63x)**, 带动 solve_mo1 142.7s → 51.3s。
+
+**连续三次选错靶子, 根因是同一个 —— 仪器只给聚合量, 我用减法和命名去补缺口。**
+
+| # | 判断 | 依据 | 结果 |
+|---|---|---|---|
+| 1 | 「XC 没有 fp32 路径」 | 记忆, 没查代码 | 错, 路径是自己早先写的 |
+| 2 | 「Fock 侧是 solve_mo1 瓶颈」 | 总时间减各函数 = 「未归属 120s」 | 那 120s 是嵌套重复计数的假数 |
+| 3 | 改 `numint._nr_rks_fxc_task` | 按函数名推断调用方 | Hessian 走的是 rks.py 里的 MO 基变体 |
+
+减法在有嵌套时是错的; 命名推断在有同名变体时是错的。
+`step6e_inner_profile.py` 现在按 **阶段 × 函数** 归属, 每次调用前后**同步设备**,
+并且 **fp64/fp32 背靠背各跑一遍** —— 于是「改动没生效」会显示成
+「1.00x 且调用次数完全相同」, 而不是伪装成「收益小」。**这是那次发现的关键。**
+第 3 次那个改动已 revert (三种泛函全 1.00x, 零收益不留降精度; 对 TDDFT
+或许仍有价值, 但没测过就不上)。
+
+**`eval_rho4` (33.8s) 是故意留 fp64 的**: 那里的 rho1 是**响应**密度, 可能有抵消。
+`_eval_rho2` 那个 cast 的依据是基态密度实测 `sum|term|/|result| ~1.6`,
+那不是关于响应密度的证据。要动它得先量这个比值。
+
+**剩余靶子 (r2SCAN, 现在 209s)**:
+
+| 阶段 | 耗时 | 热点 | 障碍 |
+|---|---|---|---|
+| make_h1 | 133.4s | `_d1_dot_` 109.9s (`_get_vxc_deriv1_task`) | 要放宽 bracket 到 make_h1 |
+| partial_hess_elec | 46.9s | | |
+| solve_mo1 | 51.3s | `eval_rho4` 33.8s | 先量响应密度的抵消比 |
+
+注意放宽 bracket 会把 `_eval_rho2` 一起拖进去 —— 那正是之前 0.13-0.18 cm⁻¹
+的来源, 所以放宽必须和 `_get_vxc_deriv1_task` 的移植**同时做并重新验频率**。
+
 
 ## 基准文件
 
@@ -586,6 +627,9 @@ RHF/杂化那条线已经收工 (3.38x / 1.69x)。
 - `mixedprec/step6_hessian_profile.py` — Hessian 三阶段耗时拆分 (`--xc` 跑 DFT)
 - `mixedprec/step6b_hessian_bracket.py` — fp32 作用范围对照 (fp64 / solve_mo1 / hess_elec)
 - `mixedprec/step6c_r2scan3c.py` — r2SCAN-3c (def2-mTZVPP + D4 + gCP) Hessian 对照
+- `mixedprec/step6d_rks_grid_profile.py` — RKS Hessian 的函数级耗时 (有嵌套重复计数, 已被 6e 取代)
+- `mixedprec/step6e_inner_profile.py` — **按「阶段 × 函数」归属 + 设备同步 + fp64/fp32 对跑**;
+  改动没生效会显示成「1.00x 且调用次数相同」。测 Hessian 内部一律用这个
 - `mixedprec/compare_geoms.py` — 两个收敛构型用严格 fp64 重算对比落点
 - 结果: `step2_result.txt`, `step3_result.txt`, `instrument_result.txt`
 - 小基组对比: `/tmp/basis_scale.log` (6 步优化, def2-SVP / 6-31G*)
