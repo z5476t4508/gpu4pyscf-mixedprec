@@ -461,6 +461,9 @@ def as_scanner(mf_grad):
 class SCF_GradScanner(lib.GradScanner):
     def __init__(self, g):
         lib.GradScanner.__init__(self, g)
+        # state of the adaptive conv_tol policy, see gpu4pyscf.geomopt.conv_schedule
+        self._conv_tol_user = None
+        self._last_gmax = None
 
     def __call__(self, mol_or_geom, **kwargs):
         if isinstance(mol_or_geom, gto.MoleBase):
@@ -470,22 +473,52 @@ class SCF_GradScanner(lib.GradScanner):
 
         self.reset(mol)
         mf_scanner = self.base
-        e_tot = mf_scanner(mol)
+        schedule = self._resolve_conv_tol_schedule()
+        if schedule is None:
+            e_tot = mf_scanner(mol)
+        else:
+            # the first geometry defines the baseline: whatever conv_tol the
+            # caller set is the tightest the schedule will ever ask for
+            if self._conv_tol_user is None:
+                self._conv_tol_user = mf_scanner.conv_tol
+            conv_tol = schedule(self._last_gmax, self._conv_tol_user)
+            logger.info(self, 'Adaptive SCF conv_tol %g (gmax %s)', conv_tol,
+                        'n/a' if self._last_gmax is None else f'{self._last_gmax:g}')
+            saved, mf_scanner.conv_tol = mf_scanner.conv_tol, conv_tol
+            try:
+                e_tot = mf_scanner(mol)
+            finally:
+                mf_scanner.conv_tol = saved
 
         de = self.kernel(**kwargs)
+        if schedule is not None:
+            self._last_gmax = float(abs(np.asarray(de)).max())
         return e_tot, de
+
+    def _resolve_conv_tol_schedule(self):
+        from gpu4pyscf.geomopt import conv_schedule
+        spec = self.conv_tol_schedule
+        if spec is None:
+            spec = getattr(self.base, 'conv_tol_schedule', None)
+        return conv_schedule.make(spec)
 
 class GradientsBase(lib.StreamObject):
     '''
     Basic nuclear gradient functions for non-relativistic methods
     '''
 
-    _keys = {'mol', 'base', 'unit', 'atmlst', 'de', 'precision_mode'}
+    _keys = {'mol', 'base', 'unit', 'atmlst', 'de', 'precision_mode',
+             'conv_tol_schedule'}
     __init__    = rhf_grad_cpu.GradientsBase.__init__
 
     # None inherits the mean-field object's precision_mode; 'fp64'/'fp32'
     # force one lane regardless of it.
     precision_mode = None
+
+    # Adaptive SCF convergence threshold for geometry optimization; None
+    # inherits the mean-field object's setting.  Only a gradient scanner acts
+    # on it -- see gpu4pyscf.geomopt.conv_schedule.
+    conv_tol_schedule = None
 
     dump_flags  = rhf_grad_cpu.GradientsBase.dump_flags
 

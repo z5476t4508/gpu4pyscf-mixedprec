@@ -754,7 +754,7 @@ class SCF(pyscf_lib.StreamObject):
         'direct_scf', 'direct_scf_tol', 'conv_check', 'callback',
         'mol', 'chkfile', 'mo_energy', 'mo_coeff', 'mo_occ',
         'e_tot', 'converged', 'cycles', 'scf_summary',
-        'disp', 'disp_with_3body', 'precision_mode',
+        'disp', 'disp_with_3body', 'precision_mode', 'conv_tol_schedule',
     }
 
     # Mixed-precision policy for the SCF iterations. None/'fp64' runs
@@ -762,6 +762,13 @@ class SCF(pyscf_lib.StreamObject):
     # contractions; 'auto' starts in float32 and finishes in float64. See
     # gpu4pyscf.lib.precision.
     precision_mode = None
+
+    # Adaptive SCF convergence threshold for geometry optimization: 'auto'
+    # loosens conv_tol at geometries far from the minimum and tightens it as
+    # the forces fall. Read only by the gradient scanner an optimizer drives,
+    # so a plain kernel() call is unaffected. See
+    # gpu4pyscf.geomopt.conv_schedule.
+    conv_tol_schedule = None
 
     # methods
     def __init__(self, mol):
