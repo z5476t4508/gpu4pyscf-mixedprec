@@ -432,6 +432,63 @@ Tamoxifen def2-TZVPP 那组两条通道步数完全相同 (7 步), 每步能量�
 208 AO 0.86x → 537 AO 1.55x → 1274 AO 1.88x。
 **不要拿单步/梯度加速比当端到端优化的数字报** —— 要看体系尺寸。
 
+### 自适应 conv_tol 调度 (2026-09-06 完成, commit 42c6215)
+
+梯度收工后重心回到 SCF, 而那里卡住的不是精度是**策略**: 优化早期构型离极小点
+还远, SCF 却一直按 conv_tol=1e-9 收敛。先量清楚每个循环的成本 (Tamoxifen
+def2-SVP 537 AO, auto 通道):
+
+- **fp32 循环 0.045s, fp64 循环 0.263s —— 差 5.8 倍**
+- 典型一步 (热启动后): 4 个 fp32 (0.18s) + **7 个 fp64 (1.84s)** + CDERI 1.17s
+- 那 7 个 fp64 里后 4-5 个纯粹在把 |dE| 从 1e-7 磨到 1e-9
+
+**先测出「conv_tol → 梯度误差」的映射** (对 conv_tol=1e-12 的 fp64 参照):
+
+| conv_tol | 1e-4 | 1e-5 | 1e-6 | 1e-7 | 1e-8 | 1e-9 |
+|---|---|---|---|---|---|---|
+| fp64 dg_max | 6.6e-4 | 1.2e-4 | 3.8e-5 | 6.7e-6 | 2.1e-6 | 1.0e-6 |
+| auto dg_max | 6.6e-4 | 7.2e-5 | 3.7e-5 | 9.6e-6 | 8.7e-6 | **8.5e-6** |
+| auto 循环数 | 6 (0 fp64) | 8 (2) | 9 (3) | 11 (5) | 12 (6) | 13 (7) |
+
+上界是 `dg_max <= 0.07*sqrt(conv_tol)`, 反解就得到「要多松」。
+**auto 通道的梯度误差从 conv_tol=1e-7 起就在 8.5e-6 触底** (那是 fp32 梯度
+自身的噪声), 再收紧纯属白花两个 fp64 循环 —— 和构型离不离极小点无关。
+
+实现: `gpu4pyscf/geomopt/conv_schedule.py`, opt-in `mf.conv_tol_schedule='auto'`。
+只有梯度 scanner 读它 (只有几何优化才有「当前受力」这个信号), 普通
+`mf.kernel()` 不受影响; 每步用完就把 `mf.conv_tol` 还原, 并**以调用者原本的
+conv_tol 为地板** —— 绝不比用户要求的收得更松。默认目标误差 = 当前最大受力的 3%。
+
+Tamoxifen def2-SVP 完整收敛, 两条都是 auto 精度:
+
+| | 步数 | 总耗时 | SCF | fp64 循环 | 梯度 |
+|---|---|---|---|---|---|
+| 固定 conv_tol=1e-9 | 42 | 207.7s | 125.3s | 263 | 77.8s |
+| conv_tol 调度 | 41 | **163.8s** | **84.0s** | **111** | 75.9s |
+
+端到端 **1.27x**, SCF 单独 **1.49x**, 步数还少一步。两个收敛构型用严格 fp64
+(conv_tol=1e-11) 重算: 差 **1.0e-7 Eh**, 在 geomeTRIC 自己的 1e-6 Eh 判据内
+(坐标最大差 1.5e-2 Bohr, 又一次说明平坦方向上坐标不是有意义的判据)。
+对纯 fp64 基线 (347.1s) 是 **2.12x**。
+
+**两个更激进的参数都实测更慢, 别再试**:
+
+| 变体 | 步数 | 总耗时 | SCF |
+|---|---|---|---|
+| 默认 (ceiling 1e-5, floor=用户 conv_tol) | **41** | **163.8s** | 84.0s |
+| ceiling 1e-4 (早期纯 fp32, 无 fp64 尾巴) | 44 | 171.8s | 86.6s |
+| floor 1e-8 | 45 | 177.6s | 90.1s |
+
+每步确实更便宜 (ceiling 1e-4 那条总循环数和默认一样是 257, 却多走了 3 步),
+但**优化器用额外的几何步把省下的都收了回去** —— 松弛引入的 PES 噪声让
+geomeTRIC 更难干净地满足判据。我原估计放宽天花板还能赚 7%, 实测是负的。
+(单次运行, 但两个方向一致且机理说得通。)
+
+**下一个重心**: 调度之后每步 ≈ CDERI 1.2s + SCF 迭代 0.65s + 梯度 1.85s。
+**梯度重新变成最大单项 (46%)** —— 注意这和「梯度只占 7.8%」不矛盾:
+那个数是 r2SCAN/def2-TZVPP (SCF 14s) 的, 换成 DF-RHF/def2-SVP 就是 46%。
+**梯度占比强烈依赖方法和基组, 别跨配置引用。**
+
 
 ## 基准文件
 
@@ -441,5 +498,10 @@ Tamoxifen def2-TZVPP 那组两条通道步数完全相同 (7 步), 每步能量�
 - `mixedprec/test_batch_rhf.py` — 36 个测试 (解析/分片/存储无需 GPU; GPU 端到端另计)
 - `mixedprec/step2_proto.py` — SCF 基准 (FP64/混合 × conv 1e-10/1e-7 + CPU 参照)
 - `mixedprec/step3_opt.py` — 几何优化基准 (10 步 FP64 vs 混合, 每步 SCF/梯度计时)
+- `mixedprec/step5_convtol_probe.py` — 带仪表的几何优化 (每个 SCF 循环的
+  精度通道/耗时/dE, 每步的 gmax 和实际 conv_tol); `--schedule auto` 开调度
+- `mixedprec/step5a_convtol_error.py` — conv_tol → 能量/梯度误差的映射
+- `mixedprec/step6_hessian_profile.py` — Hessian 三阶段耗时拆分
+- `mixedprec/compare_geoms.py` — 两个收敛构型用严格 fp64 重算对比落点
 - 结果: `step2_result.txt`, `step3_result.txt`, `instrument_result.txt`
 - 小基组对比: `/tmp/basis_scale.log` (6 步优化, def2-SVP / 6-31G*)
