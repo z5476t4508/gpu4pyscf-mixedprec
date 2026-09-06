@@ -489,6 +489,31 @@ geomeTRIC 更难干净地满足判据。我原估计放宽天花板还能赚 7%,
 那个数是 r2SCAN/def2-TZVPP (SCF 14s) 的, 换成 DF-RHF/def2-SVP 就是 46%。
 **梯度占比强烈依赖方法和基组, 别跨配置引用。**
 
+### Hessian 现状 (2026-09-06 实测)
+
+DF-RHF, Tamoxifen 537 AO / def2-SVP (`mixedprec/step6_hessian_profile.py`):
+
+| 阶段 | 耗时 | 占比 |
+|---|---|---|
+| partial_hess_elec (二阶导积分) | 35.1s | 19% |
+| make_h1 | 13.0s | 7% |
+| **solve_mo1 (CPHF 求解)** | **137.3s** | **74%** |
+| 合计 | 185.6s | (同分子 SCF 只要 5.7s) |
+
+**`precision_mode='auto'` 对 Hessian 完全无效**: auto 185.45s vs fp64 185.59s,
+特征值逐位相同。之前记的「Hessian 1.15x」是 DFT 的数, 那 1.15x 全部来自和梯度
+共享的 XC 网格 helper; DF-RHF 没有 XC 网格, 就是 1.00x。**hessian 模块里一处
+precision 引用都没有。**
+
+靶子唯一: CPHF 求解。6 次 `fx` 应用, 每次约 23s, 全是
+`df/hessian/rhf.py::_get_jk` 里对 3*natm = 171 个右端项做的 fp64 张量缩并
+(热循环在 1351-1368 行, 主项是 `contract('Lpq,snqi->snpiL', cderi, mo1)`)。
+注意 `dfobj.loop()` 的 cast 布局陷阱 (见上文) 在这里同样适用。
+
+未解的风险: CPHF 用的是 Krylov 子空间解法, 不是简单不动点迭代。给它精度不
+一致的矩阵-向量乘可能破坏子空间正交性 —— SCF 那套「早期 fp32 + fp64 尾巴」
+不一定能照搬。需要先单独量 fp32 `_get_jk` 对 Hessian 特征值/频率的影响。
+
 
 ## 基准文件
 
