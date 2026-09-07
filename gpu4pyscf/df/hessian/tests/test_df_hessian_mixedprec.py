@@ -128,7 +128,33 @@ class KnownValues(unittest.TestCase):
         3x margin over the worst measured value and still catches a real
         regression: bracketing partial_hess_elec too, which was rejected,
         moved Tamoxifen by 0.131-0.181 cm^-1.
+
+        KNOWN LIMIT OF THIS TEST -- read before trusting it. Water frequencies
+        are themselves only a proxy for a real molecule's. The first port of
+        _get_vxc_deriv2_task passed every assertion here while moving Tamoxifen
+        by 5.579 cm^-1 rms 0.475 -- 55x over this bound. Three atoms give 3
+        vibrations and a grid a fraction the size, so a float32 reduction over
+        grid blocks barely accumulates. A change to the grid lane is not
+        verified until it has cleared mixedprec/step6l on Tamoxifen; green here
+        means "not grossly broken", not "accurate".
         '''
+        for xc in ('LDA,VWN', 'PBE', 'r2scan', 'B3LYP'):
+            with self.subTest(xc=xc):
+                rks = dft.RKS(mol, xc=xc).density_fit()
+                rks.conv_tol = 1e-12
+                rks.kernel()
+                ref = rks.Hessian().kernel()
+
+                rks.precision_mode = 'auto'
+                hess = rks.Hessian().kernel()
+
+                vib = slice(6, None)
+                nu = frequencies(hess)[vib]
+                nu_ref = frequencies(ref)[vib]
+                self.assertLess(np.abs(nu - nu_ref).max(), 0.1)
+                # a loose element bound, to catch gross breakage rather than
+                # benign precision loss
+                self.assertLess(np.abs(hess - ref).max(), 1e-4)
         for xc in ('LDA,VWN', 'PBE', 'r2scan', 'B3LYP'):
             with self.subTest(xc=xc):
                 rks = dft.RKS(mol, xc=xc).density_fit()
