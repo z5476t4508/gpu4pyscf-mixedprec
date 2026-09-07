@@ -660,6 +660,58 @@ RHF/杂化那条线已经收工 (3.38x / 1.69x)。
 **下一步应该先做解耦实验: 只放宽到 make_h1、先不移植, 单独量频率损害** ——
 之前那 0.13-0.18 cm⁻¹ 是三个阶段一起盖时测的, 从没分清是哪个阶段的责任。
 
+### make_h1 的 XC 网格循环 (2026-09-06, commits 909d748 + 63e1cc8)
+
+**解耦实验先跑, 结果是 0.000 / 0.001 cm⁻¹** (`step6g_widen_bracket.py`): 只放宽
+bracket 到 make_h1、里面什么都不移植, 频率纹丝不动。所以之前那 0.13-0.18 cm⁻¹
+**全部是 `partial_hess_elec` 的责任**, 放宽到 make_h1 是免费的。
+这一步花了 6 分钟, 省掉的是「凭猜测放弃 133.5s」。
+
+然后移植 `_get_vxc_deriv1_task` (hessian/rks.py): 三个分支 (LDA/GGA/MGGA) 加尾部,
+用一个 `gdtype` 开关统一切换所有 scratch buffer 和两个累加器。**`rho` 保持
+float64** (libxc 要), 尾部在 fp32 下单独分配 float64 的 `v_mo` 而不是复用
+`vmat` 的内存。
+
+| 方法 | fp64 | 现在 | 加速 | max\|dnu\| |
+|---|---|---|---|---|
+| **r2SCAN / r2SCAN-3c** | 300.0s | **74.1s** | **4.05x** | 0.001 cm⁻¹ |
+| B3LYP | 285.6s | 84.4s | 3.38x | 0.001 cm⁻¹ |
+| DF-RHF | 185.5s | 54.8s | 3.38x | 0.001 cm⁻¹ |
+| PBE | 131.6s | 49.8s | 2.64x | 0.001 cm⁻¹ |
+
+**两个过程教训**:
+
+1. **bracket 差点又写成死代码**: 最初加在 `HessianBase.make_h1` 上, 但每个子类都用
+   模块级函数 `make_h1 = make_h1` 覆盖了它。这次是**跑之前 grep 出来的**, 不像
+   `numint._nr_rks_fxc_task` 那次花 20 分钟测出 1.00x 才发现。bracket 改到
+   `hess_elec` 的调用点 (rhf.py / uhf.py)。`solve_mo1` 没有这种覆盖, 方法上包着没问题。
+2. **测试红了, 但不能调松阈值**: 水分子上 max|dH| 从 1e-8 涨到 1e-5, 超了我自己写的
+   1e-6。把 1e-6 改成 1e-4 让它变绿是**把阈值拟合到结果上**。实际问题是那个断言
+   **从一开始就断错了对象** —— 小分子的 Hessian 元素误差是代理量, 而且是误导性的:
+   真实体系 (Tamoxifen) 的频率只动 0.001 cm⁻¹。改成断频率、阈值 0.1 cm⁻¹:
+   对实测最坏值有 3 倍余量, **并且仍然挡得下被否掉的宽 bracket 方案 (0.13-0.18 cm⁻¹)**。
+   一个松到永远不会失败的阈值等于删掉这个测试。
+
+### 剩余靶子 (r2SCAN, 现在 74.1s)
+
+`partial_hess_elec` (47s) 是唯一大项, 但它是两半拼的, 而**那 0.13-0.18 cm⁻¹
+从没分清是哪一半的**:
+
+| 半边 | 内容 | 已知 |
+|---|---|---|
+| `_jk_energy_per_atom` + `_hcore_energy` | JK/hcore 二阶导积分 | **下面没有任何一处查 precision** → 盖 bracket 应该是空操作 |
+| `_get_exc_deriv2` | 格点上的 XC 二阶导 | 下面的 `_eval_rho2` 会自己 cast |
+
+读代码的预测是「损害全在 XC 半边」。`step6h_split_partial_hess.py` 分开盖两半来
+验证这个预测, 顺便量出两半各自的 fp64 耗时 —— 占 5s 的半边再安全也不值得
+写 500 行内核。
+
+纯泛函的 JK 半边落到 CUDA 内核 `ejk_int3c2e_ip2`, 它正好是梯度那个
+`ejk_int3c2e_ip1` 的二阶对应物, 而 `ejk_int3c2e_ip1_f32.cu` 已经存在 (605 行,
+梯度 6.80x 的最大来源)。ip2 只有 551 行、结构同源。ip1_f32 的经验直接适用:
+**Rys 求积和 gxyz 递推放 fp32, 但 `ejk` 累加器留 float64** —— 它们跨上千个 block
+做 atomicAdd, 这正是 commit 0913d2c 修的那个 bug。
+
 
 ## 基准文件
 
@@ -678,6 +730,11 @@ RHF/杂化那条线已经收工 (3.38x / 1.69x)。
 - `mixedprec/step6d_rks_grid_profile.py` — RKS Hessian 的函数级耗时 (有嵌套重复计数, 已被 6e 取代)
 - `mixedprec/step6e_inner_profile.py` — **按「阶段 × 函数」归属 + 设备同步 + fp64/fp32 对跑**;
   改动没生效会显示成「1.00x 且调用次数相同」。测 Hessian 内部一律用这个
+- `mixedprec/step6f_response_rho_fp32.py` — 从真实 CPHF 抓 (ao, mo0, mo1) 实测响应密度的抵消比
+- `mixedprec/step6g_widen_bracket.py` — 只放宽 bracket 不移植, 把「放宽的代价」和
+  「移植的收益」分开量
+- `mixedprec/step6h_split_partial_hess.py` — 把 `partial_hess_elec` 拆成 JK/XC 两半分别
+  盖 bracket, 定位频率损害的归属并量出两半耗时
 - `mixedprec/compare_geoms.py` — 两个收敛构型用严格 fp64 重算对比落点
 - 结果: `step2_result.txt`, `step3_result.txt`, `instrument_result.txt`
 - 小基组对比: `/tmp/basis_scale.log` (6 步优化, def2-SVP / 6-31G*)
