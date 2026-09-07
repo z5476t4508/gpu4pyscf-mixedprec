@@ -1267,14 +1267,25 @@ def _get_vxc_deriv1_task(hessobj, grids, mo_coeff, mo_occ, max_memory, device_id
     with cupy.cuda.Device(device_id):
         mo_occ = cupy.asarray(mo_occ)
         mo_coeff = cupy.asarray(mo_coeff)
-        coeff = cupy.asarray(opt.coeff)
         mocc = mo_coeff[:,mo_occ>0]
         dm0 = mf.make_rdm1(mo_coeff, mo_occ)
         nocc = mocc.shape[1]
 
+        # _d1_dot_ in the loop below is 109.9s of the 133.5s a r2SCAN/def2-SVP
+        # make_h1 costs -- two thirds of the whole Hessian. Everything the grid
+        # loop touches goes float32 together: the AO values, the orbitals they
+        # contract with, every scratch buffer, and the two accumulators. rho
+        # stays float64 because libxc reads it, and the MO-basis result is
+        # promoted back on the way out, so callers see no change.
+        fp32_grid = precision.get_precision() == 'fp32'
+        gdtype = cupy.float32 if fp32_grid else cupy.float64
+        coeff = cupy.asarray(opt.coeff, dtype=gdtype)
+        mocc_g = cupy.asarray(mocc, dtype=gdtype)
+        dm0_g = cupy.asarray(dm0, dtype=gdtype)
+
         log = logger.new_logger(mol, mol.verbose)
-        v_ip = cupy.zeros((3,nao,nao))
-        vmat = cupy.zeros((natm,3,nao,nocc))
+        v_ip = cupy.zeros((3,nao,nao), dtype=gdtype)
+        vmat = cupy.zeros((natm,3,nao,nocc), dtype=gdtype)
         max_memory = max(2000, max_memory-vmat.size*8/1e6)
         t1 = t0 = log.init_timer()
         if xctype == 'LDA':
@@ -1287,26 +1298,29 @@ def _get_vxc_deriv1_task(hessobj, grids, mo_coeff, mo_occ, max_memory, device_id
         if xctype == 'LDA':
             ao_deriv = 1
             nd = (ao_deriv+1)*(ao_deriv+2)*(ao_deriv+3)//6
-            aow_buf = cupy.empty(max(3*nao,1*nocc)* MIN_BLK_SIZE)
-            wv_buf = cupy.empty(3* MIN_BLK_SIZE)
-            ao1_buf = cupy.empty(nd*nao*MIN_BLK_SIZE)
-            mo_buf = cupy.empty(nd*nocc*MIN_BLK_SIZE)
-            mow_buf = cupy.empty(3*nocc*MIN_BLK_SIZE)
-            ao_dm0_buf = cupy.empty(nao * MIN_BLK_SIZE)
+            aow_buf = cupy.empty(max(3*nao,1*nocc)* MIN_BLK_SIZE, dtype=gdtype)
+            wv_buf = cupy.empty(3* MIN_BLK_SIZE, dtype=gdtype)
+            ao1_buf = cupy.empty(nd*nao*MIN_BLK_SIZE, dtype=gdtype)
+            mo_buf = cupy.empty(nd*nocc*MIN_BLK_SIZE, dtype=gdtype)
+            mow_buf = cupy.empty(3*nocc*MIN_BLK_SIZE, dtype=gdtype)
+            ao_dm0_buf = cupy.empty(nao * MIN_BLK_SIZE, dtype=gdtype)
             for ao, mask, weight, _ in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, None,
                                                      grid_range=(grid_start, grid_end)):
                 blk_size = len(weight)
                 # nao_sub = len(mask)
+                if fp32_grid:
+                    ao = ao.astype(cupy.float32)
                 rho = cupy.ndarray((blk_size), memptr=rho_buf.data)
-                aow  = cupy.ndarray((3, nao, blk_size), memptr=aow_buf.data)
-                wv = cupy.ndarray((3, blk_size), memptr=wv_buf.data)
-                ao1 = cupy.ndarray((nd, nao, blk_size), memptr=ao1_buf.data)
-                mo = cupy.ndarray((nd, nocc, blk_size), memptr=mo_buf.data)
-                mow = cupy.ndarray((3, nocc, blk_size), memptr=mow_buf.data)
-                ao_dm0 = cupy.ndarray((nao, blk_size), memptr=ao_dm0_buf.data)
+                aow  = cupy.ndarray((3, nao, blk_size), dtype=gdtype, memptr=aow_buf.data)
+                wv = cupy.ndarray((3, blk_size), dtype=gdtype, memptr=wv_buf.data)
+                ao1 = cupy.ndarray((nd, nao, blk_size), dtype=gdtype, memptr=ao1_buf.data)
+                mo = cupy.ndarray((nd, nocc, blk_size), dtype=gdtype, memptr=mo_buf.data)
+                mow = cupy.ndarray((3, nocc, blk_size), dtype=gdtype, memptr=mow_buf.data)
+                ao_dm0 = cupy.ndarray((nao, blk_size), dtype=gdtype, memptr=ao_dm0_buf.data)
 
                 ao1 = contract('nip,ij->njp', ao, coeff[mask], out=ao1)
-                rho = numint.eval_rho2(_sorted_mol, ao1[0], mo_coeff, mo_occ, mask, xctype, buf=aow_buf, out=rho)
+                rho = numint.eval_rho2(_sorted_mol, ao1[0], mo_coeff, mo_occ, mask, xctype,
+                                       buf=None if fp32_grid else aow_buf, out=rho)
 
                 t1 = log.timer_debug2('eval rho', *t1)
                 vxc, fxc = ni.eval_xc_eff(mf.xc, rho, 2, xctype=xctype, spin=0)[1:3]
@@ -1314,15 +1328,15 @@ def _get_vxc_deriv1_task(hessobj, grids, mo_coeff, mo_occ, max_memory, device_id
                 wv1 = cupy.multiply(weight, vxc[0], out=vxc[0])
                 wf = cupy.multiply(weight, fxc[0,0], out=fxc[0,0])
 
-                numint._scale_ao(ao1[0], wv1, out=aow[0])
+                numint._scale_ao(ao1[0], _as_dtype(wv1, ao1), out=aow[0])
                 v_ip = rks_grad._d1_dot_(ao1[1:4], aow[0].T, beta=1.0, out=v_ip)
-                mo = contract('xig,ip->xpg', ao1, mocc, out=mo)
-                ao_dm0 =  contract('ik,il->kl', dm0, ao1[0], out=ao_dm0)
+                mo = contract('xig,ip->xpg', ao1, mocc_g, out=mo)
+                ao_dm0 =  contract('ik,il->kl', dm0_g, ao1[0], out=ao_dm0)
                 for ia in range(natm):
                     p0, p1 = aoslices[ia][2:]
                 # First order density = rho1 * 2.  *2 is not applied because + c.c. in the end
                     rho1 = contract('xig,ig->xg', ao1[1:,p0:p1,:], ao_dm0[p0:p1,:], out=wv)
-                    wv = cupy.multiply(wf, rho1,  out=wv)
+                    wv = cupy.multiply(_as_dtype(wf, rho1), rho1,  out=wv)
                     for i in range(3):
                         numint._scale_ao(ao1[0], wv[i],  out=aow[i])
                         numint._scale_ao(mo[0], wv[i], out=mow[i])
@@ -1332,43 +1346,48 @@ def _get_vxc_deriv1_task(hessobj, grids, mo_coeff, mo_occ, max_memory, device_id
         elif xctype == 'GGA':
             ao_deriv = 2
             nd = (ao_deriv+1)*(ao_deriv+2)*(ao_deriv+3)//6
-            aow_buf = cupy.empty(max(3*nao,2*nocc)* MIN_BLK_SIZE)
-            wv_buf = cupy.empty(3* MIN_BLK_SIZE)
-            ao1_buf = cupy.empty(nd*nao*MIN_BLK_SIZE)
-            mo_buf = cupy.empty(nd*nocc*MIN_BLK_SIZE)
-            mow_buf = cupy.empty(3*nocc*MIN_BLK_SIZE)
-            ao_dm0_buf = cupy.empty(4*nao * MIN_BLK_SIZE)
-            dR_rho1_buf = cupy.empty(3* ncomp * MIN_BLK_SIZE)
+            aow_buf = cupy.empty(max(3*nao,2*nocc)* MIN_BLK_SIZE, dtype=gdtype)
+            wv_buf = cupy.empty(3* MIN_BLK_SIZE, dtype=gdtype)
+            ao1_buf = cupy.empty(nd*nao*MIN_BLK_SIZE, dtype=gdtype)
+            mo_buf = cupy.empty(nd*nocc*MIN_BLK_SIZE, dtype=gdtype)
+            mow_buf = cupy.empty(3*nocc*MIN_BLK_SIZE, dtype=gdtype)
+            ao_dm0_buf = cupy.empty(4*nao * MIN_BLK_SIZE, dtype=gdtype)
+            dR_rho1_buf = cupy.empty(3* ncomp * MIN_BLK_SIZE, dtype=gdtype)
 
             for ao, mask, weight, _ in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, None,
                                                      grid_range=(grid_start, grid_end)):
                 blk_size = len(weight)
                 # nao_sub = len(mask)
+                if fp32_grid:
+                    ao = ao.astype(cupy.float32)
                 rho = cupy.ndarray((ncomp, blk_size), memptr=rho_buf.data)
-                aow  = cupy.ndarray((3, nao, blk_size), memptr=aow_buf.data)
-                wv = cupy.ndarray((3, blk_size), memptr=wv_buf.data)
-                ao1 = cupy.ndarray((nd, nao, blk_size), memptr=ao1_buf.data)
-                mo = cupy.ndarray((nd, nocc, blk_size), memptr=mo_buf.data)
-                mow = cupy.ndarray((3, nocc, blk_size), memptr=mow_buf.data)
-                ao_dm0 = cupy.ndarray((4, nao, blk_size), memptr=ao_dm0_buf.data)
-                dR_rho1 =  cupy.ndarray((3, ncomp, blk_size), memptr=dR_rho1_buf.data)
+                aow  = cupy.ndarray((3, nao, blk_size), dtype=gdtype, memptr=aow_buf.data)
+                wv = cupy.ndarray((3, blk_size), dtype=gdtype, memptr=wv_buf.data)
+                ao1 = cupy.ndarray((nd, nao, blk_size), dtype=gdtype, memptr=ao1_buf.data)
+                mo = cupy.ndarray((nd, nocc, blk_size), dtype=gdtype, memptr=mo_buf.data)
+                mow = cupy.ndarray((3, nocc, blk_size), dtype=gdtype, memptr=mow_buf.data)
+                ao_dm0 = cupy.ndarray((4, nao, blk_size), dtype=gdtype, memptr=ao_dm0_buf.data)
+                dR_rho1 =  cupy.ndarray((3, ncomp, blk_size), dtype=gdtype, memptr=dR_rho1_buf.data)
 
 
                 ao1 = contract('nip,ij->njp', ao, coeff[mask], out=ao1)
-                rho = numint.eval_rho2(_sorted_mol, ao1[:4], mo_coeff, mo_occ, mask, xctype, buf=aow_buf, out=rho)
+                rho = numint.eval_rho2(_sorted_mol, ao1[:4], mo_coeff, mo_occ, mask, xctype,
+                                       buf=None if fp32_grid else aow_buf, out=rho)
                 t1 = log.timer_debug2('eval rho', *t1)
                 vxc, fxc = ni.eval_xc_eff(mf.xc, rho, 2, xctype=xctype, spin=0)[1:3]
                 t1 = log.timer_debug2('eval vxc', *t1)
                 wv = cupy.multiply(weight, vxc, out=vxc)
                 wv[0] *= .5
                 wf = cupy.multiply(weight, fxc, out=fxc)
-                v_ip = rks_grad._gga_grad_sum_(ao1, wv,  accumulate=True, buf=aow, out=v_ip)
-                mo = contract('xig,ip->xpg', ao1, mocc, out=mo)
-                ao_dm0 =  contract('ik,pil->pkl', dm0, ao1[:4], out=ao_dm0)
+                v_ip = rks_grad._gga_grad_sum_(ao1, _as_dtype(wv, ao1),
+                                               accumulate=True, buf=aow, out=v_ip)
+                mo = contract('xig,ip->xpg', ao1, mocc_g, out=mo)
+                ao_dm0 =  contract('ik,pil->pkl', dm0_g, ao1[:4], out=ao_dm0)
                 for ia in range(natm):
                     dR_rho1 = _make_dR_rho1(ao1, ao_dm0, ia, aoslices, xctype,
                                             buf=wv[0], out=dR_rho1)
-                    wv2 = contract('xyg,sxg->syg', wf, dR_rho1, out=dR_rho1)
+                    wv2 = contract('xyg,sxg->syg', _as_dtype(wf, dR_rho1), dR_rho1,
+                                   out=dR_rho1)
                     wv2[:,0] *= .5
                     for i in range(3):
                         numint._scale_ao(ao1[:4], wv2[i,:4],  out=aow[i])
@@ -1382,29 +1401,32 @@ def _get_vxc_deriv1_task(hessobj, grids, mo_coeff, mo_occ, max_memory, device_id
                 log.warn('MGGA Hessian is sensitive to dft grids.')
             ao_deriv = 2
             nd = (ao_deriv+1)*(ao_deriv+2)*(ao_deriv+3)//6
-            aow_buf = cupy.empty(max(3*nao,2*nocc)* MIN_BLK_SIZE)
-            wv_buf = cupy.empty(3* MIN_BLK_SIZE)
-            ao1_buf = cupy.empty(nd*nao*MIN_BLK_SIZE)
-            mo_buf = cupy.empty(nd*nocc*MIN_BLK_SIZE)
-            mow_buf = cupy.empty(3*nocc*MIN_BLK_SIZE)
-            ao_dm0_buf = cupy.empty(4*nao * MIN_BLK_SIZE)
-            dR_rho1_buf = cupy.empty(3* ncomp * MIN_BLK_SIZE)
+            aow_buf = cupy.empty(max(3*nao,2*nocc)* MIN_BLK_SIZE, dtype=gdtype)
+            wv_buf = cupy.empty(3* MIN_BLK_SIZE, dtype=gdtype)
+            ao1_buf = cupy.empty(nd*nao*MIN_BLK_SIZE, dtype=gdtype)
+            mo_buf = cupy.empty(nd*nocc*MIN_BLK_SIZE, dtype=gdtype)
+            mow_buf = cupy.empty(3*nocc*MIN_BLK_SIZE, dtype=gdtype)
+            ao_dm0_buf = cupy.empty(4*nao * MIN_BLK_SIZE, dtype=gdtype)
+            dR_rho1_buf = cupy.empty(3* ncomp * MIN_BLK_SIZE, dtype=gdtype)
             for ao, mask, weight, _ in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, None,
                                                      grid_range=(grid_start, grid_end)):
                 blk_size = len(weight)
                 # nao_sub = len(mask)
+                if fp32_grid:
+                    ao = ao.astype(cupy.float32)
                 rho = cupy.ndarray((ncomp, blk_size), memptr=rho_buf.data)
-                aow  = cupy.ndarray((3, nao, blk_size), memptr=aow_buf.data)
-                wv = cupy.ndarray((3, blk_size), memptr=wv_buf.data)
-                ao1 = cupy.ndarray((nd, nao, blk_size), memptr=ao1_buf.data)
-                mo = cupy.ndarray((nd, nocc, blk_size), memptr=mo_buf.data)
-                mow = cupy.ndarray((3, nocc, blk_size), memptr=mow_buf.data)
-                ao_dm0 = cupy.ndarray((4, nao, blk_size), memptr=ao_dm0_buf.data)
-                dR_rho1 =  cupy.ndarray((3, ncomp, blk_size), memptr=dR_rho1_buf.data)
+                aow  = cupy.ndarray((3, nao, blk_size), dtype=gdtype, memptr=aow_buf.data)
+                wv = cupy.ndarray((3, blk_size), dtype=gdtype, memptr=wv_buf.data)
+                ao1 = cupy.ndarray((nd, nao, blk_size), dtype=gdtype, memptr=ao1_buf.data)
+                mo = cupy.ndarray((nd, nocc, blk_size), dtype=gdtype, memptr=mo_buf.data)
+                mow = cupy.ndarray((3, nocc, blk_size), dtype=gdtype, memptr=mow_buf.data)
+                ao_dm0 = cupy.ndarray((4, nao, blk_size), dtype=gdtype, memptr=ao_dm0_buf.data)
+                dR_rho1 =  cupy.ndarray((3, ncomp, blk_size), dtype=gdtype, memptr=dR_rho1_buf.data)
 
 
                 ao1 = contract('nip,ij->njp', ao, coeff[mask], out=ao1)
-                rho = numint.eval_rho2(_sorted_mol, ao1[:10], mo_coeff, mo_occ, mask, xctype, buf=aow_buf, out=rho)
+                rho = numint.eval_rho2(_sorted_mol, ao1[:10], mo_coeff, mo_occ, mask, xctype,
+                                       buf=None if fp32_grid else aow_buf, out=rho)
                 t1 = log.timer_debug2('eval rho', *t1)
                 vxc, fxc = ni.eval_xc_eff(mf.xc, rho, 2, xctype=xctype, spin=0)[1:3]
                 t1 = log.timer_debug2('eval vxc', *t0)
@@ -1412,14 +1434,16 @@ def _get_vxc_deriv1_task(hessobj, grids, mo_coeff, mo_occ, max_memory, device_id
                 wf = cupy.multiply(weight, fxc, out=fxc)
                 wv[0] *= .5
                 wv[4] *= .5  # for the factor 1/2 in tau
-                v_ip = rks_grad._gga_grad_sum_(ao1, wv,  accumulate=True, buf=aow, out=v_ip)
-                v_ip = rks_grad._tau_grad_dot_(ao1, wv[4], accumulate=True, buf=aow[0], out=v_ip)
-                mo = contract('xig,ip->xpg', ao1, mocc, out=mo)
-                ao_dm0 = contract('ik,pil->pkl', dm0, ao1[:4], out=ao_dm0)
+                wv_g = _as_dtype(wv, ao1)
+                v_ip = rks_grad._gga_grad_sum_(ao1, wv_g,  accumulate=True, buf=aow, out=v_ip)
+                v_ip = rks_grad._tau_grad_dot_(ao1, wv_g[4], accumulate=True, buf=aow[0], out=v_ip)
+                mo = contract('xig,ip->xpg', ao1, mocc_g, out=mo)
+                ao_dm0 = contract('ik,pil->pkl', dm0_g, ao1[:4], out=ao_dm0)
                 for ia in range(natm):
                     dR_rho1 = _make_dR_rho1(ao1, ao_dm0, ia, aoslices, xctype,
                                             buf=wv[0], out=dR_rho1)
-                    wv2 = contract('xyg,sxg->syg', wf, dR_rho1, out=dR_rho1)
+                    wv2 = contract('xyg,sxg->syg', _as_dtype(wf, dR_rho1), dR_rho1,
+                                   out=dR_rho1)
                     wv2[:,0] *= .5
                     wv2[:,4] *= .25
                     for i in range(3):
@@ -1443,8 +1467,13 @@ def _get_vxc_deriv1_task(hessobj, grids, mo_coeff, mo_occ, max_memory, device_id
 
         t0 = log.timer_debug1(f'vxc_deriv1 on Device {device_id}', *t0)
 
-        # Inplace transform the AO to MO.
-        v_mo = cupy.ndarray((natm,3,nmo,nocc), dtype=vmat.dtype, memptr=vmat.data)
+        # Inplace transform the AO to MO. In float32 vmat cannot be reused as
+        # the output buffer -- callers add this to float64 quantities -- so the
+        # result is promoted here instead.
+        if fp32_grid:
+            v_mo = cupy.empty((natm,3,nmo,nocc))
+        else:
+            v_mo = cupy.ndarray((natm,3,nmo,nocc), dtype=vmat.dtype, memptr=vmat.data)
         vmat_tmp = cupy.empty([3,nao,nao])
         for ia in range(natm):
             p0, p1 = aoslices[ia][2:]

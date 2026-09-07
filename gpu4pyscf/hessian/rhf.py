@@ -77,7 +77,10 @@ def hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
                                     max_memory, log)
     t1 = log.timer_debug1('partial hess elec', *t1)
     if h1mo is None:
-        h1mo = hessobj.make_h1(mo_coeff, mo_occ, None, atmlst, log)
+        # make_h1 is overridden by a module-level function in every concrete
+        # subclass, so the lane is applied here rather than on the method
+        with hessobj.cphf_precision():
+            h1mo = hessobj.make_h1(mo_coeff, mo_occ, None, atmlst, log)
         if h1mo.size * 8 * 5 > get_avail_mem():
             # Reduce GPU memory footprint
             h1mo = h1mo.get()
@@ -910,19 +913,18 @@ class HessianBase(lib.StreamObject):
     def cphf_precision(self):
         '''Run the enclosed block in this Hessian's precision lane.
 
-        The lane covers the CPHF solve and nothing else.  That is where a
-        Hartree-Fock or hybrid Hessian spends its time -- float32 took the
-        DF-RHF CPHF from 137.3s to 6.8s (20x) on Tamoxifen/def2-SVP for
-        0.001 cm^-1 of frequency error.
+        The lane covers the CPHF solve and make_h1, and deliberately not
+        partial_hess_elec.  Measured on Tamoxifen/def2-SVP against a float64
+        reference: bracketing all three phases moved the frequencies
+        0.131 cm^-1 (PBE) / 0.181 cm^-1 (r2SCAN), and widening to make_h1
+        alone moves them 0.000 / 0.001 -- so the damage belongs to
+        partial_hess_elec, whose XC second derivatives are the most sensitive
+        piece and gain nothing from float32 anyway.
 
-        It deliberately does not cover partial_hess_elec or make_h1.  For a
-        pure functional those are almost the whole cost, and their XC second
-        derivatives run in grid loops of their own (hessian/rks.py) that never
-        cast the AO values, so float32 cannot reach them: bracketing them
-        measured 1.00x on r2SCAN/def2-SVP while moving the frequencies
-        0.181 cm^-1, purely because eval_rho2 casts internally.  Precision
-        that buys no measured time is not worth spending.  Widen this only
-        together with a float32 port of those loops.
+        What the lane buys: the DF CPHF J/K build (137.3s -> 6.8s on DF-RHF),
+        the CPHF's XC response kernel (_tau_dot 79.1s -> 10.4s), its response
+        density (eval_rho4 33.8s -> 2.2s), and _get_vxc_deriv1's accumulations
+        in make_h1.
         '''
         mode = self._resolve_precision()
         if mode is None:

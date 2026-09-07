@@ -63,7 +63,10 @@ def hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
                                     max_memory, log)
     t1 = log.timer_debug1('hess elec', *t1)
     if h1mo is None:
-        h1mo = hessobj.make_h1(mo_coeff, mo_occ, None, atmlst, log)
+        # see the note in hessian/rhf.py: make_h1 is overridden per subclass,
+        # so the precision lane is applied at the call site
+        with hessobj.cphf_precision():
+            h1mo = hessobj.make_h1(mo_coeff, mo_occ, None, atmlst, log)
         if h1mo[0].size * 8 * 10 > get_avail_mem():
             # Reduce GPU memory footprint
             h1mo = (h1mo[0].get(), h1mo[1].get())
