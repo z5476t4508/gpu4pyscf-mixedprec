@@ -39,7 +39,7 @@ import pyscf
 from gpu4pyscf import dft
 from gpu4pyscf.hessian import rks as rks_hess
 from gpu4pyscf.lib import precision
-from mixedprec.vibanalysis import frequencies
+from mixedprec.vibanalysis import frequencies, thermochemistry
 
 TESTS = '/home/tong/soft/gpu4pyscf/gpu4pyscf/tests/'
 
@@ -63,8 +63,13 @@ CANDIDATES = {
 }
 
 
-def run(mf, oracle):
-    '''one Hessian; `oracle` brackets _get_exc_deriv2 in float32 unported'''
+def run(mf, oracle=False, lane=False):
+    '''one Hessian.
+
+    lane   : the shipped precision lane (mf.precision_mode='auto')
+    oracle : additionally bracket _get_exc_deriv2 in float32 unported -- the
+             known-bad change, 0.142 cm^-1 on Tamoxifen
+    '''
     orig = rks_hess._get_exc_deriv2
 
     def bracketed(*a, **kw):
@@ -73,6 +78,7 @@ def run(mf, oracle):
 
     if oracle:
         rks_hess._get_exc_deriv2 = bracketed
+    mf.precision_mode = 'auto' if (lane or oracle) else None
     try:
         cupy.cuda.runtime.deviceSynchronize()
         t0 = time.time()
@@ -81,6 +87,7 @@ def run(mf, oracle):
         return np.asarray(getattr(h, 'get', lambda: h)()), time.time() - t0
     finally:
         rks_hess._get_exc_deriv2 = orig
+        mf.precision_mode = None
 
 
 def main():
@@ -103,19 +110,36 @@ def main():
         mf.verbose = 0
         mf.kernel()
 
-        ref, t64 = run(mf, oracle=False)
-        hess, t32 = run(mf, oracle=True)
+        ref, t64 = run(mf)
+        lane, t_lane = run(mf, lane=True)
+        bad, t_bad = run(mf, oracle=True)
 
         nu_ref = frequencies(mol, ref)
-        nu = frequencies(mol, hess)
-        dnu = np.abs(nu - nu_ref).max()
+        zpe_ref, s_ref = thermochemistry(mol, ref)
         soft = np.abs(nu_ref).min()
-        verdict = 'DETECTS' if dnu > args.bound else 'blind'
+
         print(f'{name:10s} {mol.natm:3d} atoms {mol.nao:4d} AO  '
               f'min|nu|={soft:7.1f} n_imag={int((nu_ref < 0).sum()):3d}  '
-              f'{t64:6.1f}s/{t32:6.1f}s  '
-              f'max|dnu|={dnu:7.3f}  rms={np.sqrt(((nu-nu_ref)**2).mean()):6.3f}  '
-              f'-> {verdict}', flush=True)
+              f'{t64:6.1f}s', flush=True)
+
+        stats = {}
+        for tag, h, dt in (('lane', lane, t_lane), ('oracle', bad, t_bad)):
+            e = np.abs(frequencies(mol, h) - nu_ref)
+            zpe, s = thermochemistry(mol, h)
+            stats[tag] = (e.max(), np.sqrt((e ** 2).mean()),
+                          abs(zpe - zpe_ref) * 627.5095,          # kcal/mol
+                          abs(s - s_ref) * 627.5095 * 1000)       # cal/mol/K
+            print(f'           {tag:6s} max={stats[tag][0]:8.4f} rms={stats[tag][1]:8.4f}'
+                  f'  dZPE={stats[tag][2]:9.2e} kcal/mol'
+                  f'  dSvib={stats[tag][3]:9.2e} cal/mol/K'
+                  f'   ({dt:.1f}s)', flush=True)
+
+        # A sentinel is useful when the shipped lane and the known-bad change
+        # are far apart on it -- not when the bad change clears some absolute
+        # bound borrowed from another molecule. The bound goes inside the gap.
+        seps = [b / max(a, 1e-15) for a, b in zip(stats['lane'], stats['oracle'])]
+        print('           separation  max={:.0f}x rms={:.0f}x dZPE={:.0f}x dSvib={:.0f}x'
+              .format(*seps), flush=True)
         print(f'           ({why})', flush=True)
 
 

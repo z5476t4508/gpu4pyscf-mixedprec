@@ -1,94 +1,62 @@
-"""Shared vibrational analysis for the mixed-precision benchmarks.
+"""Acceptance metrics for the mixed-precision Hessian benchmarks.
 
-Why this exists: the benchmarks up to step7a took the vibrational modes to be
-`eigvalsh(H_mass)[6:]` -- the eigenvalues after the six smallest. That is only
-right at a stationary geometry. The repo's Tamoxifen geometry has ELEVEN
-imaginary modes at r2SCAN/def2-SVP:
+This is a thin wrapper over pyscf.hessian.thermo. It exists for the metric
+choices, not the maths -- PySCF already does the harmonic analysis correctly,
+and an earlier version of this file reimplemented it before I checked (the two
+agree to 3.5e-6 cm^-1 on Tamoxifen; the hand-rolled one is gone).
 
-    -500.8 -489.3 -477.8 -326.7 -295.3 -202.0 -176.9 -144.8 -122.9 -113.0
-     -67.7   15.2   65.6 ...
+What it is for:
 
-so sorting puts genuine imaginary vibrations in the first six slots and pushes
-the translations and rotations *into* the set being compared. Those have
-frequencies near zero, and since an error propagates as dw ~ dH/(2*mu*w), a
-near-zero mode amplifies any Hessian error without carrying any physics. Every
-max|dnu| quoted before this file was therefore partly translation/rotation
-noise.
+1. Projection, not slicing. Every max|dnu| before this file took the
+   vibrational modes to be eigvalsh(H_mass)[6:] -- valid only at a stationary
+   geometry, and none of the repo's benchmark geometries is one at the level of
+   theory being measured. Tamoxifen/def2-SVP under r2SCAN has nine imaginary
+   modes, so sorting pushed the three most negative vibrations out of the
+   compared set and pulled translations and rotations in. Since frequency error
+   goes as dw ~ dH/(2*mu*w), a near-zero mode amplifies a Hessian error while
+   carrying no physics:
 
-(The conclusions drawn from those numbers still hold -- the rejected
-_get_vxc_deriv2_task port raised max|dH| from 6.4e-7 to 2.75e-4, a 400x jump,
-with rms 0.475 cm^-1 over 165 modes, neither of which depends on where the
-first six modes land. But the headline "5.579 cm^-1" was not a clean physical
-frequency error and should not have been quoted as one.)
+       projected (correct)   min|nu| =  53.65 cm^-1
+       naive [6:]            min|nu| =  15.24 cm^-1   <- a contaminated rotation
 
-`frequencies` projects the six translation/rotation vectors out of the
-mass-weighted Hessian (the standard Eckart treatment) instead of assuming they
-sort to the front, and returns only the 3N-6 vibrational frequencies. At a
-non-stationary geometry the rotations are not exact zero modes, so the
-projection is approximate there too -- which is a reason to run the acceptance
-suite on optimized geometries, not a reason to skip the projection.
+   That inflated the oracle figure on Tamoxifen from 0.142 to 0.181 (1.27x).
+
+2. rms and thermochemistry over max. max|dnu| is taken over modes, so it grows
+   with mode count and systematically penalises larger molecules. Measured
+   under the same oracle: Vitamin C (54 modes) vs Tamoxifen (165 modes) differ
+   4.8x on max (0.038 / 0.181) but only 1.8x on rms (0.009 / 0.016) -- most of
+   the max gap is sampling, not a larger per-mode error. ZPE and S_vib are what
+   a user actually consumes, and S_vib weights the soft modes that carry the
+   error, so they are the metrics that transfer between molecules.
 """
 import numpy as np
-
-HARTREE2WAVENUMBER = 219474.6313632
-AMU2AU = 1822.888486209
+from pyscf.hessian import thermo
 
 
-def _trans_rot_basis(coords, masses):
-    '''orthonormal mass-weighted translation and rotation vectors, (6, 3N)'''
-    natm = len(masses)
-    sqrt_m = np.sqrt(masses)
-    com = (coords * masses[:, None]).sum(axis=0) / masses.sum()
-    r = coords - com
-
-    vecs = np.zeros((6, natm, 3))
-    for i in range(3):
-        vecs[i, :, i] = sqrt_m                      # translations
-    # rotations: sqrt(m) * (e_i x r)
-    for i, (a, b) in enumerate(((1, 2), (2, 0), (0, 1))):
-        vecs[3 + i, :, a] = sqrt_m * -r[:, b]
-        vecs[3 + i, :, b] = sqrt_m * r[:, a]
-
-    vecs = vecs.reshape(6, natm * 3)
-    # Gram-Schmidt; a linear molecule leaves one rotation vector null, so drop
-    # anything that is numerically dependent rather than assuming rank 6.
-    basis = []
-    for v in vecs:
-        for b in basis:
-            v = v - b * (b @ v)
-        n = np.linalg.norm(v)
-        if n > 1e-8:
-            basis.append(v / n)
-    return np.array(basis)
-
-
-def frequencies(mol, hess, project=True):
-    '''Vibrational frequencies in cm^-1, sign kept for imaginary modes.
-
-    hess : (natm, natm, 3, 3) array (CuPy or NumPy)
-    project : project out translations/rotations. Leave True; see module
-        docstring for what taking eigvalsh(...)[6:] instead costs.
+def frequencies(mol, hess):
+    '''Vibrational frequencies in cm^-1, 3N-6 of them (3N-5 if linear),
+    translations and rotations projected out. Imaginary modes come back as
+    negative reals so they can be subtracted between two calculations.
     '''
     hess = np.asarray(getattr(hess, 'get', lambda: hess)())
-    natm = mol.natm
-    n = 3 * natm
-    masses = mol.atom_mass_list(isotope_avg=True)
-    inv_sqrt_m = np.repeat(masses, 3) ** -.5
-    h = hess.transpose(0, 2, 1, 3).reshape(n, n)
-    h = h * inv_sqrt_m[:, None] * inv_sqrt_m[None, :]
+    res = thermo.harmonic_analysis(mol, hess, imaginary_freq=False)
+    return np.asarray(res['freq_wavenumber']).real
 
-    if not project:
-        ev = np.linalg.eigvalsh(h)
-    else:
-        basis = _trans_rot_basis(mol.atom_coords(), masses)
-        # Diagonalize inside the orthogonal complement of the trans/rot space,
-        # rather than projecting and then dropping the smallest eigenvalues.
-        # The latter repeats the bug this module exists to fix: with imaginary
-        # modes present, the projected-out ~0 eigenvalues sort *after* the
-        # negative ones, so a leading slice discards real vibrations instead.
-        q, _ = np.linalg.qr(np.hstack([basis.T, np.eye(n)]))
-        comp = q[:, len(basis):n]
-        ev = np.linalg.eigvalsh(comp.T @ h @ comp)
 
-    ev = ev / AMU2AU
-    return np.sign(ev) * np.sqrt(np.abs(ev)) * HARTREE2WAVENUMBER
+def thermochemistry(mol, hess, temperature=298.15):
+    '''ZPE (Eh) and vibrational entropy (Eh/K) from a Hessian.
+
+    Imaginary modes are dropped rather than folded in: they make both
+    quantities undefined, and every benchmark geometry here has some. That
+    stays consistent when comparing two calculations on the *same* geometry,
+    but it does mean the absolute values are meaningless off a minimum -- only
+    the difference between two lanes is.
+    '''
+    freq = frequencies(mol, hess)
+    nu_au = freq[freq > 0] / thermo.nist.HARTREE2WAVENUMBER
+    kt = thermo.nist.BOLTZMANN / thermo.nist.HARTREE2J * temperature
+    x = nu_au / kt
+    zpe = .5 * nu_au.sum()
+    # S_vib/k = sum[ x/(e^x - 1) - ln(1 - e^-x) ]
+    s_vib = (x / np.expm1(x) - np.log1p(-np.exp(-x))).sum() * kt / temperature
+    return zpe, s_vib

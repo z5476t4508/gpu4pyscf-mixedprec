@@ -11,14 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import unittest
 
 import numpy as np
 import pyscf
+import pytest
+from pyscf.hessian import thermo
 
 from gpu4pyscf import dft
 from gpu4pyscf import scf
 from gpu4pyscf.lib import precision
+
+VITAMIN_C = os.path.join(os.path.dirname(__file__),
+                         '..', '..', '..', 'tests', '020_Vitamin_C.xyz')
 
 
 def setUpModule():
@@ -155,23 +161,78 @@ class KnownValues(unittest.TestCase):
                 # a loose element bound, to catch gross breakage rather than
                 # benign precision loss
                 self.assertLess(np.abs(hess - ref).max(), 1e-4)
-        for xc in ('LDA,VWN', 'PBE', 'r2scan', 'B3LYP'):
-            with self.subTest(xc=xc):
-                rks = dft.RKS(mol, xc=xc).density_fit()
-                rks.conv_tol = 1e-12
-                rks.kernel()
-                ref = rks.Hessian().kernel()
 
-                rks.precision_mode = 'auto'
-                hess = rks.Hessian().kernel()
+    @pytest.mark.slow
+    def test_vitamin_c_sentinel(self):
+        '''The molecule the water tests above cannot replace.
 
-                vib = slice(6, None)
-                nu = frequencies(hess)[vib]
-                nu_ref = frequencies(ref)[vib]
-                self.assertLess(np.abs(nu - nu_ref).max(), 0.1)
-                # a loose element bound, to catch gross breakage rather than
-                # benign precision loss
-                self.assertLess(np.abs(hess - ref).max(), 1e-4)
+        Measured separation between the shipped lane and a known-bad change
+        (bracketing _get_exc_deriv2 in float32 unported), by
+        mixedprec/step7a_sentinel_adequacy.py:
+
+                        lane        known-bad   separation
+            max|dnu|    0.0011      0.0374      35x
+            rms         0.0003      0.0091      31x
+            dZPE        3.6e-06     1.2e-04     34x    kcal/mol
+            dSvib       1.7e-05     9.3e-04     54x    cal/mol/K
+
+        On water the same two runs give 0.0004 and 0.0005 -- a separation of
+        1x. Water does not distinguish a good change from a bad one at all, so
+        no threshold on it can work; that is why this test exists rather than
+        another assertion on the 3-atom case.
+
+        Each bound below is the geometric mean of the two measured columns, so
+        it sits ~6x above the lane and ~6x below the known-bad change instead
+        of being picked to pass. S_vib separates best because it weights the
+        soft modes where a Hessian error is amplified (dw ~ dH/2*mu*w), and it
+        is also what a user consumes; max|dnu| is kept but is the weakest of
+        the four, since a max over modes grows with mode count.
+
+        Frequencies come from pyscf's harmonic_analysis, which projects out
+        translations and rotations. Do not replace it with eigvalsh(...)[6:]:
+        this geometry has 11 imaginary modes, so sorting pulls contaminated
+        rotations into the compared set (on Tamoxifen that inflated the same
+        measurement by 1.27x).
+        '''
+        mol_c = pyscf.M(atom=VITAMIN_C, basis='def2-svp', output='/dev/null',
+                        verbose=1)
+        try:
+            mf_c = dft.RKS(mol_c, xc='r2scan').density_fit()
+            mf_c.conv_tol = 1e-10
+            ref = mf_c.Hessian().kernel()
+
+            mf_c.precision_mode = 'auto'
+            hess = mf_c.Hessian().kernel()
+            mf_c.precision_mode = None
+
+            nu_ref = _freq(mol_c, ref)
+            nu = _freq(mol_c, hess)
+            self.assertLess(np.abs(nu - nu_ref).max(), 0.0064)
+            self.assertLess(np.sqrt(((nu - nu_ref) ** 2).mean()), 0.0017)
+
+            zpe_ref, s_ref = _thermo(nu_ref)
+            zpe, s = _thermo(nu)
+            self.assertLess(abs(zpe - zpe_ref) * 627.5095, 2.1e-5)
+            self.assertLess(abs(s - s_ref) * 627.5095 * 1000, 1.3e-4)
+        finally:
+            mol_c.stdout.close()
+
+
+def _freq(mol, hess):
+    '''vibrational frequencies, cm^-1, translations/rotations projected out'''
+    hess = np.asarray(getattr(hess, 'get', lambda: hess)())
+    res = thermo.harmonic_analysis(mol, hess, imaginary_freq=False)
+    return np.asarray(res['freq_wavenumber']).real
+
+
+def _thermo(freq, temperature=298.15):
+    '''ZPE (Eh) and S_vib (Eh/K); imaginary modes dropped, so only the
+    difference between two lanes on the same geometry is meaningful'''
+    nu_au = freq[freq > 0] / thermo.nist.HARTREE2WAVENUMBER
+    kt = thermo.nist.BOLTZMANN / thermo.nist.HARTREE2J * temperature
+    x = nu_au / kt
+    s_vib = (x / np.expm1(x) - np.log1p(-np.exp(-x))).sum() * kt / temperature
+    return .5 * nu_au.sum(), s_vib
 
 
 if __name__ == '__main__':
