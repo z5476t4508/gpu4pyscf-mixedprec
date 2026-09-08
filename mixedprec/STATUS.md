@@ -1,24 +1,33 @@
 # 混合精度 HF 项目状态 (RTX 5090)
 
-目标 (2026-08-25 更新): **几十万个 xyz 分子的 DF-RHF 单点能量 + AO 基密度矩阵**
-批处理吞吐。体系 ~57 原子, 基组 def2-SVP/6-31G*。原始目标 (几何优化混合精度)
-已完成阶段一并保留在下面。
+**这份文档怎么读** (1200 行, 按时间堆积的, 不用从头看):
 
-**⏸ 暂存点 (2026-08-25): 项目暂停于此, 下一步已论证未实施 ——
-搭建批量单点管线 (GPU 纯 FP32 筛选通道 + 可选 CPU 进程池兜底 + h5 分片
-落盘 + 断点续跑)。恢复时从「待办/下一步」一节直接开工, 无需重新评估。**
+| 你想干什么 | 去哪一节 |
+|---|---|
+| 接着干活 | **「待办 / 下一步」** —— 当前落点、还没量过的候选、已经关掉的门 |
+| 动手改精度之前 | 「待办」第 3 条 (五次移植的规律) 和第 4 条 (验收怎么做) |
+| 编译 / 跑测试 | 「待办」第 5 条 |
+| 找某个脚本 | 文末「基准文件」 |
+| 查某个结论怎么来的 | 按日期找对应小节, 每节都带实测数据 |
 
-**▶ 2026-09-04 恢复: 批量单点管线 (GPU 通道) 已实现并实测通过 ——
-`mixedprec/batch_rhf.py` + `mixedprec/test_batch_rhf.py` (36 测试全过)。
-详见下面「批量管线」一节。CPU 兜底通道仍未做。**
+三个阶段: **阶段一** SCF/批量吞吐 (2026-08-22 ~ 09-04, 已收工) →
+**阶段二** 梯度 + 几何优化 (09-05 ~ 09-06, 已收工) →
+**阶段三** Hessian (09-06 ~ 09-08, 基本到顶)。
 
-## 环境 (已就绪, 2026-08-22)
+## 环境 (已就绪, 2026-08-22; 运行方式 09-04 更正)
 
 - venv: `/home/tong/soft/gpu4pyscf/.venv` (python 3.14, `--system-site-packages` 复用系统 pyscf 2.14.0)
 - 已装: gpu4pyscf-cuda13x 1.8.1, cupy-cuda13x 14.2.0, cutensor-cu13 2.7.0, nvidia-nccl-cu13, cmake
 - cutensor 修复: wheel 的 lib 不在默认搜索路径, 已放 `site-packages/_g4p_preload.py` + `g4p_preload.pth` 自动 ctypes 预加载 (否则会看到 "using cupy as the tensor contraction engine" 警告, 即 cutensor 未生效)
-- **坑**: 在 repo 目录里运行 python 会导入源码树 (无 .so) 而不是 wheel —— 所有脚本从 `/tmp` 等其他目录运行:
-  `cd /tmp && /home/tong/soft/gpu4pyscf/.venv/bin/python <script>`
+- **运行方式 (2026-09-04 更正, 推翻了原先的记录)**: 源码树已编译好 `.so`,
+  而 venv 里的 wheel 是发布版 1.8.1 —— **wheel 里没有混合精度代码**
+  (`gpu4pyscf.lib.precision` 不存在), 用它跑会**静默降级成 FP64**, 看不出报错,
+  只是加速比全是 1.0x。所以必须用源码树:
+
+      PYTHONPATH=/home/tong/soft/gpu4pyscf .venv/bin/python <script>
+
+  原先那条「必须先 `cd /tmp` 才能用 wheel」**已作废**, 照它做会得到错误的结论。
+
 
 ## 阶段一结论 (2026-08-25, 全部实测, 数据可信)
 
@@ -313,38 +322,97 @@ fp32 ~2260 分子/小时 (10 万 ≈ 1.8 天), auto ~1090 分子/小时 (≈ 3.8
 
 ## 待办 / 下一步 (恢复项目时从这里开工)
 
-1. ~~**批量单点管线**~~ — GPU 通道已完成 (见上)。剩余可选项:
-   - CPU 进程池兜底通道 (2线程×12进程 ≈ +380 mol/h), 首版刻意未做
-   - 同分子构象序列的 DM 链式热启动 (~10% 提速)
-   - 大规模实跑前建议先用 `--dry-run` 核对分片清单
-2. ~~阶段二 `ejk_int3c2e_ip1.cu` FP32 化~~ — 已完成 (见「阶段二相关数据」),
-   梯度 3.31x, 几何优化单步 2.04x。剩余: Hessian 仍只有 1.15x
-   (只吃到了共享的网格 helper), 需要先量出 CPHF 求解里 XC 占多少。
-3. ~~源码编译两问题~~ **(2026-09-06 更正, 之前的记录是错的)**:
-   - **gfortran 装着的** —— `/usr/bin/gfortran` = GNU Fortran 15.2.0。之前
-     「缺 gfortran」是误判 (大概是查了 `gfortran-14` 没找到就下结论),
-     `build/fake_gfortran` 那个 shim 和构建缓存里的
-     `CMAKE_Fortran_COMPILER=/bin/sh` 都是这次误判的产物, 都不需要。
-   - 真正的障碍只有一个: glibc 头文件的 `__THROW`/noexcept 和 nvcc 冲突。
-     解法是 CUDA flags, 不是换编译器。已验证的干净配置命令:
+**当前落点 (2026-09-08)**: 混合精度这条路在 Hessian 上基本到顶了。四个泛函的
+Hessian 都在 2.6-4.1x, 剩下的时间要么已经移植过, 要么**实测不可移植**
+(判据见下面第 3 条)。梯度和 SCF 的阶段一/二早已收工。
 
-         cmake -S gpu4pyscf/lib -B <build> \
-           -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-14 \
-           -DCUDA_ARCHITECTURES="120-real" \
-           -DCMAKE_CUDA_FLAGS="-U_GNU_SOURCE -U_ISOC23_SOURCE -U_ISOC2X_SOURCE \
-             -U_ISOC2Y_SOURCE -DM_PI=3.14159265358979323846 -include stdint.h"
+| | fp64 | 通道 | 加速 | 通道误差 |
+|---|---|---|---|---|
+| r2SCAN / r2SCAN-3c | 300.0s | 73.85s | **4.05x** | 0.001 cm^-1 |
+| B3LYP | 285.6s | 84.4s | **3.38x** | 0.006 cm^-1 |
+| DF-RHF | 185.5s | 54.8s | **3.38x** | 0.001 cm^-1 |
+| PBE | 131.6s | 49.8s | **2.64x** | 0.001 cm^-1 |
 
-     这样配置全过, Fortran 自动找到 `/usr/bin/gfortran`, 无需任何 shim。
-   - **`pbc` 目标编不过, 而且这是个二选一, 不是可以顺手修的 bug**:
-     带 `-U_GNU_SOURCE` 时 CUDA 探测才能通过, 但关掉 `_GNU_SOURCE` 后 glibc
-     不再暴露 `uselocale` / `__locale_t` / `fwide` / `pthread_mutex_timedlock`,
-     而 `pbc` 用到的 libstdc++ 头文件 (`<cwchar>`, `bits/c++locale.h`) 要这些。
-     去掉 `-U_GNU_SOURCE` 重配 → 配置阶段直接 13 个错误, 什么都编不了。
-     实测过, 别再试。混合精度这条线不需要 `pbc`, 其余目标全部正常。
-     真要修得换 gcc/CUDA 版本组合。
-   - 现有的 `build/temp.gpu4pyscf` 是能用的 (增量编 `gvhf_rys` 约 6s), 但它的
-     缓存里带着上面那条错误的 Fortran 设置。**不要随手重配它**;
-     要干净重来就新建目录用上面的命令。
+(Tamoxifen 537 AO / def2-SVP。误差是投影后频率对 fp64 的 max|dnu|。)
+
+### 1. 还没量过的候选 (按「先量再动」的顺序)
+
+1. **`_contract_rho1_fxc` 每次调用新分配数组** (`dft/numint.py:1686`, 没有
+   `out=`)。在 `for ia in range(natm)` 里被调, 57 原子 × 每个格点块各一次,
+   而且 `wv = _contract_rho1_fxc(...)` **把预分配的 `wv_buf` 视图直接丢了**。
+   纯分配开销, **零精度风险**, 是三个候选里唯一没有精度权衡的。
+2. **多 GPU**。`_get_vxc_deriv2_task(..., device_id=0)` 已有分发骨架,
+   但这台机器单卡, **无法验证**。
+3. **多分子并发**。用户早先定为「外挂」, 仍待办。
+
+### 2. 已经关掉的门 (别再走一遍)
+
+- **XC `_get_vxc_deriv2` fp32 移植** — 写完了, 5.15x, 但超界 55x。已回退,
+  二分表见下文。
+- **JK `ejk_int3c2e_ip2` fp32 移植** — 写完了, 能用算得对, 2.7x, 但超界
+  150-500x **且误差不可预测**。已回退 (commit `d9f5ca6` 有完整实现,
+  `git revert 1d7a7ed` 可捡回)。见第 7 节。
+- **JK 半边的 `contract` 走 fp32** — 六个 spec 安全、三个致命, 合起来只省
+  5.55s (1.07x) 且把误差顶到哨兵阈值上。没做。规则见第 5 节。
+- **纯泛函的 J-only 分支走 fp32** — 实测 r2SCAN 1.03x 换 235x 误差, 否掉。
+
+### 3. 动手前先问这一个问题 (五次移植的规律)
+
+**fp32 误差落在哪?**
+
+| 移植 | 误差落点 | 结果 |
+|---|---|---|
+| CPHF `solve_mo1` | 经过一个线性求解 | **接受** 10.5x, 0.001 cm^-1 |
+| `make_h1` | 一阶导, 再经 CPHF 响应 | **接受** 6.9x, 0.001 cm^-1 |
+| 梯度 `ejk_int3c2e_ip1` | 输出就是梯度 (一阶) | **接受** 6.8x |
+| XC `_get_vxc_deriv2` | **输出就是二阶导** | **拒绝** |
+| JK `ejk_int3c2e_ip2` | **输出就是二阶导** | **拒绝** |
+
+分界不在「哪个相位」—— `make_h1` 和 `_get_vxc_deriv2` 用的是同一套 XC 机制、
+同一批格点, 却落在两边。**落在二阶导上的误差没有任何下游步骤帮它衰减**,
+频率还会按 `dw ~ dH/(2*mu*w)` 再放大一次。这个问题在写代码前问一句,
+上面两次「拒绝」各能省一天。
+
+### 4. 验收怎么做 (别退回老路)
+
+- 用 `test_vitamin_c_sentinel` (哨兵), **不要**只用水分子 —— 水对「好改动」和
+  「坏改动」的响应完全一样 (间隔 1x), 信息量为零。
+- **至少测两个分子**, 且大小/柔软度要拉开。ip2 那次两个分子把两个变体
+  **排反了**, 只测维生素 C 会上线错的那版。
+- 判据是**间隔** (已知会坏 / 已接受通道), 不是绝对界。
+- **0.0064 是哨兵的检测阈值, 不是物理界** —— 这点我绊倒过四次。
+
+### 5. 环境 / 编译 (2026-09-06 已核实)
+
+- **gfortran 装着的** (`/usr/bin/gfortran` = GNU Fortran 15.2.0)。之前记的
+  「缺 gfortran」是误判, `build/fake_gfortran` 那个 shim 和构建缓存里的
+  `CMAKE_Fortran_COMPILER=/bin/sh` 都是误判的产物, 都不需要。
+- `cmake` 只在 venv 里: `.venv/lib/python3.14/site-packages/cmake/data/bin/cmake`,
+  PATH 里没有。已验证的干净配置:
+
+      cmake -S gpu4pyscf/lib -B <build> \
+        -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-14 \
+        -DCUDA_ARCHITECTURES="120-real" \
+        -DCMAKE_CUDA_FLAGS="-U_GNU_SOURCE -U_ISOC23_SOURCE -U_ISOC2X_SOURCE \
+          -U_ISOC2Y_SOURCE -DM_PI=3.14159265358979323846 -include stdint.h"
+
+  单目标增量编译约 6s: `cmake --build build/temp.gpu4pyscf --target gvhf_rys -j 8`。
+- **`pbc` 目标编不过, 是二选一不是 bug**: `-U_GNU_SOURCE` 是 CUDA 探测通过的
+  必要条件, 但它同时让 glibc 不再暴露 `uselocale`/`fwide`/`pthread_mutex_timedlock`,
+  而 `pbc` 用的 libstdc++ 头文件需要。去掉它重配 → 配置阶段 13 个错误,
+  什么都编不了。实测过, 别再试。混合精度不需要 pbc。
+- 现有 `build/temp.gpu4pyscf` 能用, 但缓存里带着上面那条错误的 Fortran 设置。
+  **不要随手重配它**; 要干净重来就新建目录。
+- 跑测试: `PYTHONPATH=/tmp/pystub:/home/tong/soft/gpu4pyscf .venv/bin/python
+  -m unittest <模块>` (venv 里没有 pytest/ruff/flake8, `/tmp/pystub/pytest.py`
+  是个桩)。
+
+### 6. 批量单点管线 (阶段一遗留, 可选)
+
+GPU 通道已完成。剩余可选项: CPU 进程池兜底通道 (2线程×12进程 ≈ +380 mol/h,
+首版刻意未做); 同分子构象序列的 DM 链式热启动 (~10% 提速); 大规模实跑前
+建议先用 `--dry-run` 核对分片清单。
+
 
 ## 阶段二相关数据 (几何优化场景, 已测)
 
@@ -999,7 +1067,7 @@ device→host→device 往返 (`empty_mapped` + `.get`) 实测 0.00s —— 我�
 用过 0 或 1 次可以 fp32。** 这条比「哪几个 spec 安全」更有用, 因为它能预测
 没量过的调用点。
 
-### 6. 两个杠杆的实际大小
+### 6. 两个杠杆的实际大小 (**这是移植之前的估计, 实测见第 7 节**)
 
 | 手段 | 省 | B3LYP Hessian | 工作量 | 风险 |
 |---|---|---|---|---|
@@ -1008,6 +1076,11 @@ device→host→device 往返 (`empty_mapped` + `.get`) 实测 0.00s —— 我�
 | 两个都做 | ~16.5s | 84.4s → 67.9s (**1.24x**) | | |
 
 两个都做能把 B3LYP 从 3.38x 推到约 4.2x, 和 r2SCAN 的 4.05x 齐平。
+
+**估计 vs 实测**: 速度这一栏估得挺准 (实测 68.3s, 预测 67.9s), **精度这一栏
+根本没估** —— 当时只有「JK 半边 fp32 表示误差约 0.0076 cm^-1」那个旧探针数,
+而它测的是数组的表示误差, 不是把积分算在 fp32 里。实测出来是 0.9-3.4 cm^-1,
+差了两个数量级。**这张表的教训: 「省多少时间」可以估, 「花多少精度」必须测。**
 
 **注意阈值语义**, 这是我第四次在这上面绊倒: 0.0064 是**哨兵的检测阈值**
 (按 r2SCAN 通道 0.0011 和「已知会坏」0.0374 的几何均值定的), **不是物理界**。
@@ -1085,6 +1158,20 @@ double 累加器当成「准的那个」上线, 而它在 Tamoxifen 上差 4 倍
 
 
 ## 基准文件
+
+早期探索脚本 (阶段一, 已被后面的取代, 留档不再用):
+
+- `mixedprec/step0_baseline.py` — 最初的 fp64 基线 (DF-RHF SCF + 梯度各一次)。
+  **它是按「跑 wheel」写的**, 而 wheel 里没有混合精度代码, 现在要跑得改成源码树
+- `mixedprec/step1_profile.py` — cProfile 拆 SCF/梯度, 输出 pstats。
+  **这就是那个把我带到三个错误目标上的方法** (只有总耗时, 没有相位归属),
+  已被 `step6e` 的「相位 × 函数」归属取代, 别再用它找热点
+- `mixedprec/step1_instrument.py` — 同上的手工插桩版 (contract / ip1 核 /
+  3c2e evaluator, 带流同步), 是 step6e 的前身
+- `mixedprec/step4_kernel.py` — 阶段一三通道对照 (fp64 / auto / 纯 fp32),
+  Tamoxifen def2-SVP + def2-TZVP
+
+在用的:
 
 - `mixedprec/fp32_jk.py` — get_jk FP32 化 + install() monkey-patch (含 cast 布局修复)
   (阶段一原型; 现已并入 `gpu4pyscf/df/df_jk.py`, 新代码不要再用这个 patch)
