@@ -204,9 +204,10 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1,
 
         # (20|0)(0|0)(0|00) + (10|1)(0|0)(0|00)
         int3c2e_envs = int3c2e_opt.int3c2e_envs
-        kern_ip2 = libvhf_rys.ejk_int3c2e_ip2
+        kern_ip2, fp32 = _ip2_kernel(omega, lr_factor)
         ejk = cp.zeros((natm, natm, 3, 3))
-        buf = cp.empty((nao_pair*batch_size))
+        buf = cp.empty((nao_pair*batch_size),
+                       dtype=cp.float32 if fp32 else cp.float64)
         buf2 = cp.empty((blksize, nao, nao))
         buf1 = cp.empty((blksize, nao, nocc))
         for kbatch in aux_batch_iter:
@@ -214,7 +215,9 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1,
                 break
             naux_in_batch = aux_offsets[kbatch+1] - aux_offsets[kbatch]
             aux0 = aux1 = aux_ao_offset = aux_loc[ksh_offsets_cpu[kbatch]]
-            compressed = ndarray((nao_pair, naux_in_batch), buffer=buf)
+            compressed = ndarray((nao_pair, naux_in_batch),
+                                 dtype=cp.float32 if fp32 else cp.float64,
+                                 buffer=buf)
             for k0, k1 in lib.prange(0, naux_in_batch, blksize):
                 dk = k1 - k0
                 aux0, aux1 = aux1, aux1 + dk
@@ -227,7 +230,16 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1,
                 dm_oo = cp.asarray(dm_oo_full[aux0:aux1])
                 contract('rji,qj->iqr', dm_oo, _dm_factor_l, out=tmp)
                 contract('iqr,pi->pqr', tmp, _dm_factor_l, -.5*k_factor, beta, out=dm_tensor)
+                # the pseudo-DM handed to the integral kernel is cast to
+                # float32 when the kernel runs in fp32; the pre-contractions
+                # above stay float64 (they are the W^-1-weighted quantities
+                # that do not survive float32 -- see mixedprec/step8f)
+                if fp32:
+                    dm_tensor = dm_tensor.astype(cp.float32)
                 cp.take(dm_tensor.reshape(-1,dk), _pair_addresses, axis=0, out=compressed[:,k0:k1])
+                # undo the astype rebinding: the next iteration needs the
+                # float64 view over buf2 again
+                dm_tensor = ndarray((nao,nao,dk), buffer=buf2)
             err = kern_ip2(
                 ctypes.cast(ejk.data.ptr, ctypes.c_void_p),
                 ctypes.cast(compressed.data.ptr, ctypes.c_void_p),
@@ -592,6 +604,13 @@ def _j_energy_per_atom(int3c2e_opt, dm, verbose=None):
         ksh_offsets_gpu = cp.asarray(ksh_offsets_cpu+mol.nbas, dtype=np.int32)
 
         int3c2e_envs = int3c2e_opt.int3c2e_envs
+        # Deliberately float64, unlike the hybrid path in _jk_energy_per_atom.
+        # This branch is where pure functionals (PBE, r2SCAN, ...) reach ip2,
+        # and there it does not pay: measured on r2SCAN/def2-SVP/Tamoxifen the
+        # float32 kernel takes the Hessian 73.85s -> 71.37s (1.03x) while
+        # moving the frequencies 0.0011 -> 0.2589 cm^-1. The JK half is 41% of
+        # a B3LYP Hessian but only 11% of an r2SCAN one, so the same kernel is
+        # worth porting on one and not the other.
         kern_ip2 = libvhf_rys.ejk_int3c2e_ip2
         ej = cp.zeros_like(ej_aux)
         err = kern_ip2(
@@ -1183,6 +1202,23 @@ def int3c2e_scheme_ip2(omega=0, gout_width=None):
     return int3c2e_scheme(
         short_range=omega<0, gout_width=gout_width, deriv=(1,1,0))
 
+def _ip2_kernel(omega=0, lr_factor=1):
+    '''Pick the ejk_int3c2e_ip2 entry point for the active precision policy.
+
+    Both entry points take the same argument list; only ``dm`` and
+    ``density_auxvec`` change dtype, and ctypes hands those over as void
+    pointers. The float32 kernel does not implement range separation (see the
+    header of ejk_int3c2e_ip2_f32.cu), so range-separated hybrids keep the
+    float64 one. The kernel re-checks the same condition and returns an error
+    rather than trusting this test.
+
+    Returns (kernel, fp32) so the caller knows which dtype to build the
+    pseudo-DM in.
+    '''
+    if precision.get_precision() == 'fp32' and omega == 0 and lr_factor == 1:
+        return libvhf_rys.ejk_int3c2e_ip2_f32, True
+    return libvhf_rys.ejk_int3c2e_ip2, False
+
 def _int2c2e_ip2_per_atom(mol, dm, omega=None, lr_factor=None, sr_factor=None):
     '''Second order nuclear derivatives of 2c2e Coulomb integrals.
     '''
@@ -1246,7 +1282,8 @@ def partial_hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
     mf.with_df.reset() # Release GPU memory
 
     dm0 = mf.make_rdm1(mo_coeff, mo_occ)
-    ejk = _jk_energy_per_atom(intopt, dm0, verbose=log)
+    with hessobj.jk_precision():
+        ejk = _jk_energy_per_atom(intopt, dm0, verbose=log)
     t1 = log.timer_debug1('two-electron contribution', *time0)
 
     # Energy weighted density matrix

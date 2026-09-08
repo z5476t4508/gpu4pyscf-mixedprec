@@ -38,7 +38,7 @@ from gpu4pyscf.scf.jk import libvhf_rys
 TESTS = os.path.join(os.path.dirname(__file__), '..', 'gpu4pyscf', 'tests')
 
 # the kernels reachable from _jk_energy_per_atom / _j_energy_per_atom
-KERNELS = ['ejk_int3c2e_ip2', 'fill_int3c2e_ip1', 'fill_int3c2e_ipaux',
+KERNELS = ['ejk_int3c2e_ip2', 'ejk_int3c2e_ip2_f32', 'fill_int3c2e_ip1', 'fill_int3c2e_ipaux',
            'int2c2e_ip1', 'int2c2e_ip1ip2', 'int2c2e_ip1ip1']
 
 t_kern = collections.Counter()
