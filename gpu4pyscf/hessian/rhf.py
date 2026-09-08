@@ -931,27 +931,6 @@ class HessianBase(lib.StreamObject):
             return contextlib.nullcontext()
         return precision.fp32() if mode == 'fp32' else precision.fp64()
 
-    def jk_precision(self):
-        '''Run the enclosed block in this Hessian's precision lane, for the JK
-        half of partial_hess_elec.
-
-        Kept separate from cphf_precision because the two brackets cover
-        different code and were measured separately.  Inside
-        _jk_energy_per_atom only the ejk_int3c2e_ip2 kernel dispatch consults
-        the policy: step6h measured that bracketing this half was otherwise a
-        no-op in both time and frequency, and step8f measured why its
-        contractions must not join -- the ones that are quadratic forms
-        weighted by the ill-conditioned DF metric inverse move the frequencies
-        by up to 301x the lane in float32.
-
-        What the lane buys, measured on B3LYP/def2-SVP/Tamoxifen: the
-        ejk_int3c2e_ip2 kernel is 17.31s of the JK half's 34.88s.
-        '''
-        mode = self._resolve_precision()
-        if mode is None:
-            return contextlib.nullcontext()
-        return precision.fp32() if mode == 'fp32' else precision.fp64()
-
     def _resolve_precision(self):
         '''The precision lane this Hessian runs in.
 

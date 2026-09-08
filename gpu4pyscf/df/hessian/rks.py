@@ -48,12 +48,11 @@ def partial_hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
 
     omega, alpha, hyb = mf._numint.rsh_and_hybrid_coeff(mf.xc, spin=mol.spin)
     dm0 = mf.make_rdm1(mo_coeff, mo_occ)
-    with hessobj.jk_precision():
-        de2 = df_rhf_hess._jk_energy_per_atom(intopt, dm0, 1., hyb, verbose=log)
+    de2 = df_rhf_hess._jk_energy_per_atom(intopt, dm0, 1., hyb, verbose=log)
 
-        if abs(omega) > 1e-10 and abs(alpha-hyb) > 1e-10:
-            de2 += df_rhf_hess._jk_energy_per_atom(intopt, dm0, 0., alpha-hyb,
-                                                   omega, verbose=log)
+    if abs(omega) > 1e-10 and abs(alpha-hyb) > 1e-10:
+        de2 += df_rhf_hess._jk_energy_per_atom(intopt, dm0, 0., alpha-hyb,
+                                               omega, verbose=log)
     t1 = log.timer_debug1('computing ej, ek', *t1)
 
     # Energy weighted density matrix
