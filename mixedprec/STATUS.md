@@ -4,6 +4,7 @@
 
 | 你想干什么 | 去哪一节 |
 |---|---|
+| **先搞清这项目在优化什么** | **「项目范围: 主力泛函是 r2SCAN」** —— 纯泛函, 所以 COSX / JK 半边整节都不适用 |
 | **看对 CPU 的真实加速** | **「评价标准: 对 CPU 的记分卡」** —— 13-49x, 和混合精度自己的 1.6-2.7x 不是一回事 |
 | 看该借鉴什么 | **「借鉴 Direwolf」** —— 两阶段网格 / COSX, 以及许可边界 |
 | 接着干活 | **「待办 / 下一步」** —— 当前落点、还没量过的候选、已经关掉的门 |
@@ -15,6 +16,25 @@
 三个阶段: **阶段一** SCF/批量吞吐 (2026-08-22 ~ 09-04, 已收工) →
 **阶段二** 梯度 + 几何优化 (09-05 ~ 09-06, 已收工) →
 **阶段三** Hessian (09-06 ~ 09-08, 基本到顶)。
+
+### 项目范围: 主力泛函是 r2SCAN (纯泛函) —— 这一条决定了哪些杠杆能用 (2026-09-09 用户确认)
+
+之前只在 COSX 小节的脚注里写过, **没有落到范围层**, 所以估算 COSX 时仍然花了
+时间。现在钉死:
+
+- **主力泛函 = r2SCAN, 纯泛函 (GGA/meta-GGA), 没有精确交换。**
+- ⇒ **COSX 对主力场景收益恒为零, 不是"小", 是 0。** COSX 只加速精确交换 K;
+  纯泛函根本不构建 K。下面「COSX 收益估计」整节的 2.21x 天花板**只对 B3LYP
+  一类杂化泛函成立**, 读那一节时必须带着这个前提。
+- ⇒ 同理, 「B3LYP 的 JK 半边」整节 (第 1182 行起) 也是**杂化泛函专属**。
+- ⇒ 主力场景的成本结构完全由 **XC 网格**主导 (r2SCAN SCF 的 72.8%, 见
+  「能量为什么卡在 1.6x」)。**纯泛函这条路上, 唯一还有量级的杠杆在网格**,
+  不在 K。至于网格里还剩什么, 见「SCF 的 XC 网格已经是 fp32 了」一节 ——
+  09-09 发现原先"XC 不能走 fp32"的说法对 SCF 路径是错的, 那 4.81s 已经是
+  fp32 之后的数, 里面剩下的是 eval_ao / libxc / 开销, **尚未归属**。
+
+**优先级后果**: COSX 的 A 矩阵成本 (那个"还没量的决定性一环") **降级为可选**,
+只有在决定同时支持杂化泛函时才值得量。**不要**因为它是"唯一没关掉的门"就去做它。
 
 ## 环境 (已就绪, 2026-08-22; 运行方式 09-04 更正)
 
@@ -381,8 +401,48 @@ r2SCAN SCF (auto) 6.61s / 15 轮的归属:
 **而 XC 网格正是实测不能走 fp32 的那部分** (rho 的 cast 就会损害精度)。所以
 能量这一项在精度这条路上本来就没门 —— 1.6x 就是天花板, 不是没优化好。
 
+> **⚠ 2026-09-09 更正: 上面这句话是错的, 至少对 SCF 路径是错的。** 查代码
+> (还没实测) 发现 **SCF 的 XC 路径早就在跑 fp32 了** —— 详见紧接的下一小节。
+> "rho 的 cast 损害精度"那个结论来自 **Hessian** 的二阶导路径, 被我错误地
+> 搬到了 SCF 能量路径上。这正是本项目自己第 3 条规律 (误差落在二阶导上就不行,
+> 经过 SCF 收敛就行) 所区分的两种情形, **我把它们混成了一句话。**
+
 要再快必须换杠杆。Direwolf 的**两阶段网格**打的正是这 72.8%, 见下节 ——
 但实测只有 1.16x, 且对几何优化几乎无用, 原因也在下节。
+
+### SCF 的 XC 网格已经是 fp32 了 —— 所以那 4.81s 里没剩多少 GEMM (2026-09-09, **只查了代码, 未实测**)
+
+**证据全部来自读代码, 一次都没测**, 先说清楚。`gpu4pyscf/dft/numint.py` 里
+SCF 的 XC 路径 (`_nr_rks_task`) **两个大 GEMM 都已经有 fp32 分支**:
+
+- **密度侧** `_eval_rho2` (numint.py:207-211): `precision.get_precision()=='fp32'`
+  时把 `ao` 和 `cpos` 都 cast 成 float32, `rho` 本身仍回到 float64 喂 libxc。
+  代码注释写着依据: 实测 `sum|term|/|result| ~1.6` (几乎无抵消), fp32 保住
+  ~1e-7 相对精度, 远小于网格求积误差本身, 而**快约 25x**。
+- **Fock 侧** (`fp32_grid = precision.get_precision() == 'fp32'`, numint.py:585 附近):
+  `ao_mask` cast 成 float32 做 `ao @ (ao*w)^T`, `vmat` 保持 float64。
+  注释: 这是网格活儿里最大的单个 GEMM, fp32 **快约 28x**。
+
+**所以那 72.8% / 4.81s 是 fp32 之后的数字, 不是 fp64 的。** 结论跟着变:
+
+1. **"精度这条路在 SCF XC 上没门"这个说法要撤回** —— 不是没门, 是**门早就走过了**,
+   收益已经吃进了现在这个 4.81s 里。
+2. **更重要的是: 4.81s 里剩下的东西不再是 GEMM 主导的。** 两个大 GEMM 都快了
+   25-28x 之后, 剩下的应该是 **eval_ao (格点上求基函数值) + libxc 的
+   `eval_xc_eff` + block_loop/筛选开销**。这三块**一次都没有单独归属过** ——
+   而这才是"73% 合不合理"的真正答案所在。
+3. **顺手看到一个可能的重复工作**: `_nr_rks_task` 每次调用**跑了两遍
+   `ni.block_loop`** (第一遍算 rho, 第二遍做 Fock 侧收缩), 也就是
+   **每个 SCF 轮次把 AO 在格点上求了两次**。如果 eval_ao 在那 4.81s 里占比可观,
+   这就是个纯开销的靶子, 零精度风险 (代价是缓存 AO 的显存)。**占比未知, 必须先量。**
+
+**下一步 (还没做)**: 按本项目自己的规矩 ——「归属, 不做减法; 数调用次数; 每次
+计时前后同步设备」—— 把 4.81s 拆成 eval_ao / rho GEMM / libxc / Fock GEMM /
+其余 五项。**在拿到这张表之前, 不要动任何代码。**
+
+**还需要证伪的一件事**: 我只确认了代码里存在 fp32 分支, **没有确认那次
+6.61s 的 auto 通道测量确实把 `precision` 置成了 fp32**。如果 auto 通道在
+`nr_rks` 期间其实是 fp64, 上面整段推论都要重来。这是拆分脚本要顺带打印的第一个东西。
 
 
 ## 借鉴 Direwolf (2026-09-08, 用户指定; 只借思路不抄代码)
@@ -434,13 +494,17 @@ r2SCAN SCF (auto) 6.61s / 15 轮的归属:
 `has_warm_start` 时关掉它。价值在**单点和批量筛选**, 不在优化。
 **用户主场景是优化, 别把这 1.16x 当成主场景的收益。**
 
-### COSX: gpu4pyscf 完全没有
+### COSX: gpu4pyscf 完全没有 (⚠ 只对杂化泛函有意义, 主力 r2SCAN 收益为 0)
 
 Direwolf 有 chain-of-spheres 交换 (full-range K 和 RSH K_LR), 且 J/K 构建模式
 可独立组合 (RIJCOSX = J 用 RI + K 用 COSX)。gpu4pyscf 里 grep 不到任何 COSX。
 **收益已估过一轮, 见下节** —— 天花板 2.21x, 但决定性的一环 (A 矩阵) 还没量。
 
 ### COSX 收益估计 (2026-09-08): 天花板 2.21x, 但决定性的一环还没量
+
+> **⚠ 适用范围 (2026-09-09 补)**: 本节全部数字基于 **B3LYP (杂化)**。主力泛函
+> r2SCAN 是纯泛函, 不构建 K, **COSX 收益恒为 0**。所以本节结论是"如果将来要
+> 支持杂化泛函"的备料, 不是主线待办。见开头「项目范围」。
 
 用户指定"先估 COSX 的收益"。**结论: 还不能下结论**, 但已经把问题收窄到一个
 可测的点上。下面每一行都标了是实测还是推算。
@@ -525,14 +589,62 @@ COSX 里我能直接测的两块: 格点上求基函数值 (`eval_ao`) + 两个�
 Hessian 链 (`cphfutil.F`/`l1002.F`/`l1110.F`) 里一次都没有** —— 独立印证了
 「误差落在二阶导上就不能用 fp32」这条我花两天测出来的规律。
 
-### 状态
+### 编译状态 (2026-09-09 更新): 仍未编译成功, 但两个拦路的坑都已定位并验证了解法
 
-Direwolf **尚未编译成功** (第三方依赖只装到 toml-f)。构建命令:
+构建命令 (cmake 只在 venv 里, 故临时加 PATH; 不动系统):
 
-    cd /home/tong/soft/Direwolf && PATH="/home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/cmake/data/bin:$PATH" make -j 8
+    cd /home/tong/soft/Direwolf && \
+      PATH="/home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/cmake/data/bin:$PATH" \
+      make -j 12 > /tmp/dw_build.log 2>&1
 
-(cmake 只在 venv 里, 故临时加 PATH; 不动系统。编译要执行仓库外代码, 需用户批准。)
-**对 Direwolf 的直接性能/精度对比还没做 —— 这是用户明确要求的, 仍欠着。**
+09-09 跑了一次, **`make` 退出码 2**。日志 `/tmp/dw_build.log`。
+已建好的第三方依赖: `libcint` / `mctc-lib` / `toml-f` / `gcp` / `simple-dftd3`。
+**没建成的**: `libxc` / `OpenBLAS` / `dftd4` / `multicharge` (后两个是被前面卡住,
+还没轮到)。两个真实拦路点:
+
+**坑 1 — libxc 配置不过: CMake 4.x 拒绝老的 `cmake_minimum_required`。**
+
+    third_party/libxc/CMakeLists.txt:10 -> cmake_minimum_required(VERSION 3.1)
+    CMake Error: Compatibility with CMake < 3.5 has been removed from CMake.
+
+venv 里的 cmake 是 **4.4.2**, 从 4.0 起不再支持 <3.5 的策略版本。
+**解法 (已实测通过, 未落到构建里)**: 导出环境变量, 不用改 Direwolf 的文件 ——
+
+    export CMAKE_POLICY_VERSION_MINIMUM=3.5
+
+验证方式: 拿这个变量把 libxc 配到 `/tmp/libxc_cfgtest`, `Configuring done /
+Generating done` 通过。**只验证了 configure, 没验证 build。**
+注: `third_party/libxc/build/` 里留着上次失败的 `CMakeCache.txt`, 重跑前可能要清掉
+(清理动作我没做, 因为 `rm -rf` 被权限拦了)。
+
+**坑 2 — OpenBLAS 认不出这台机器的 CPU。**
+
+    Makefile:160: *** OpenBLAS: Detecting CPU failed. Please set TARGET explicitly
+
+CPU 是 **Intel Core Ultra 9 285K (Arrow Lake)**, 而 vendored 的 OpenBLAS 是
+**0.3.20**, 那个版本的 `TargetList.txt` 里**没有 ALDERLAKE 及以后的任何目标**
+(x86 只到 SKYLAKEX / COOPERLAKE / SAPPHIRERAPIDS / ZEN)。CPU 探测失败后
+`getarch_2nd.c` 拿不到 `SGEMM_DEFAULT_UNROLL_M` 之类的宏, 报一串
+"undeclared" —— **那串编译错误是症状, 不是原因, 别去改 getarch_2nd.c**。
+
+**打算用的解法 (还没跑)**: `export TARGET=HASWELL`。理由: Arrow Lake 有 AVX2、
+**没有 AVX-512**, 而 HASWELL 正是 OpenBLAS 的 AVX2 内核路径; 新版 OpenBLAS 里
+ALDERLAKE 本来就归在 HASWELL 家族。所以这不是"降级凑合", 是这个版本下的对口
+目标。**但这一条没有实测, 只是推理。**
+
+**⚠ 这一点对后面的对比有影响**: Direwolf 的 CPU 性能数字取决于 OpenBLAS 编得
+好不好。做 gpu4pyscf vs Direwolf 对比时, **必须在报告里写明 OpenBLAS 是用
+`TARGET=HASWELL` 编的**, 否则读者无法判断 CPU 侧是否被人为拖慢。
+
+**下一次尝试的完整命令** (未执行, 等用户决定):
+
+    cd /home/tong/soft/Direwolf && \
+      PATH="/home/tong/soft/gpu4pyscf/.venv/lib/python3.14/site-packages/cmake/data/bin:$PATH" \
+      CMAKE_POLICY_VERSION_MINIMUM=3.5 TARGET=HASWELL \
+      make -j 12 > /tmp/dw_build.log 2>&1
+
+**对 Direwolf 的直接性能/精度对比仍然欠着** —— 编不出来就做不了。
+
 
 ## 待办 / 下一步 (恢复项目时从这里开工)
 
@@ -550,6 +662,9 @@ Hessian 都在 2.6-4.1x, 剩下的时间要么已经移植过, 要么**实测不
 (Tamoxifen 537 AO / def2-SVP。误差是投影后频率对 fp64 的 max|dnu|。)
 
 ### 1. 还没量过的候选 (按「先量再动」的顺序)
+
+**先读开头「项目范围」**: 主力是 r2SCAN (纯泛函), 所以 **COSX 的 A 矩阵成本
+不在这张表里** —— 它只对杂化泛函有收益, 已降级为可选。
 
 1. **`_contract_rho1_fxc` 每次调用新分配数组** (`dft/numint.py:1686`, 没有
    `out=`)。在 `for ia in range(natm)` 里被调, 57 原子 × 每个格点块各一次,
@@ -1180,6 +1295,9 @@ bracket 的结果 (Tamoxifen 537 AO/def2-SVP):
 
 
 ## B3LYP 的 JK 半边: 归属 + 精度边界 (2026-09-07 实测)
+
+> **⚠ 适用范围 (2026-09-09 补)**: 本节只对**杂化泛函**成立。纯泛函没有 K,
+> 这半边不存在。主力是 r2SCAN, 见开头「项目范围」。
 
 用户选了「写 `ejk_int3c2e_ip2_f32.cu` 追 B3LYP」。**先归属再移植** —— 上一轮
 `_get_vxc_deriv2` 就是先写了 500 行再发现不能用。
