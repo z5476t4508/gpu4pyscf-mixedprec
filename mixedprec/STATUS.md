@@ -9,6 +9,7 @@
 | 看该借鉴什么 | **「借鉴 Direwolf」** —— 两阶段网格 / COSX, 以及许可边界 |
 | 接着干活 | **「待办 / 下一步」** —— 当前落点、还没量过的候选、已经关掉的门 |
 | 动手改精度之前 | 「待办」第 3 条 (五次移植的规律) 和第 4 条 (验收怎么做) |
+| 找基准集 | **「基准集 mixedprec/benchmark/」** (2026-09-09 立项) |
 | 编译 / 跑测试 | 「待办」第 5 条 |
 | 找某个脚本 | 文末「基准文件」 |
 | 查某个结论怎么来的 | 按日期找对应小节, 每节都带实测数据 |
@@ -644,6 +645,119 @@ ALDERLAKE 本来就归在 HASWELL 家族。所以这不是"降级凑合", 是这
       make -j 12 > /tmp/dw_build.log 2>&1
 
 **对 Direwolf 的直接性能/精度对比仍然欠着** —— 编不出来就做不了。
+
+
+## 基准集 mixedprec/benchmark/ (2026-09-09 立项)
+
+**三个用途** (用户确认): (1) **对外验证集** —— 拿具名外部代码 (g16 测试套件
+等) 对能量/力/Hessian, 补哨兵缺的那块「对外验证」(哨兵目前只对自己比 fp64);
+(2) **标准性能基准** —— 固定分子×基组×方法计时, 跟踪后续改动的吞吐影响;
+(3) **Direwolf 对比** —— 之前欠着的那个跨代码对比就跑这套 (依赖 Direwolf
+编译成功, 见上面编译状态节)。
+
+**几何就收 5 个, 不再扩** (用户确认):
+
+| 文件 | 体系 | 说明 |
+|---|---|---|
+| `geoms/020_Vitamin_C.xyz` | 20 原子 | 项目三级尺寸的小端 |
+| `geoms/057_Tamoxifen.xyz` | 57 原子 | 项目三级尺寸的中端 (主力) |
+| `geoms/095_Azadirachtin.xyz` | 95 原子 | 项目三级尺寸的大端 |
+| `geoms/r14.xyz` | 39 原子 | Ru 有机金属阳离子 C12H21O2N2PRu⁺ |
+| `geoms/methanol.xyz` | 6 原子 | `extract_methanol.py` 从 g16 `tests/methanols0.fchk` 提取 (收敛几何, Bohr→Angstrom) |
+
+**状态** (2026-09-10 更新): runner `run_benchmark.py` 已写 (复用
+`step9_scorecard.py` 的 `cpu_run`/`gpu_run`, conv_tol/auxbasis 与记分卡一致;
+梯度只存内存算误差列, JSON 不存梯度数组)。另写 `validate_methanol.py`:
+**对外验证必须独立于 runner 的矩阵** —— g16 参照是常规积分 (无 DF), 拿
+DF+def2-svp 的能量对 g16 会把 DF 误差和基组失配折算成「代码误差」; 验证脚本
+跑 b3lyp/6-31+G(d,p) 无 DF, 且打印 CPU PySCF 作第三条腿。
+
+**g16 等级已查明** (2026-09-10): fchk 不含 route 段, 但**头两行注释写了**:
+`Freq  RB3LYP  6-31+G(d,p)` —— 是 RB3LYP/6-31+G(d,p), 总能量
+-115.7348716828283 Eh。对外验证那列不再是「等级未知」。
+
+立项当天计划曾丢失过一次 (目录建了、哪儿都没记), 现已写入
+STATUS.md 和长期记忆, 不再丢。
+
+### 通宵任务清单 (2026-09-09 深夜) —— 2026-09-10 全部完成, 结果见下节
+
+- [x] `extract_methanol.py` 修 bug ×3 (三元组分组 / 4 元组解包; 第三次运行时
+      还发现之前把输出文件截断在了错误上, geoms/methanol.xyz 曾是空文件)
+- [x] 核对 methanol.xyz: 脚本重跑, 与手写版坐标差 ≤1e-8 Å (纯舍入), 以脚本为准
+- [x] g16 等级查明: fchk 头部注释 `Freq RB3LYP 6-31+G(d,p)`, E=-115.7348716828 Eh
+- [x] runner `run_benchmark.py` + 验证脚本 `validate_methanol.py` 写完并跑通
+- [x] 冒烟 (methanol) + 全量 (5 分子 × hf/r2scan × fp64/auto, 能量+梯度)
+- [x] 结果写回 STATUS.md (下节); commit 待做 (不 push)
+
+**执行通道故障记录**: 09-09 深夜 + 09-10 早上各断一次, 第二次持续 ~7h。期间
+长短命令的通过率还不一致 (绝对路径短命令比 env 前缀长命令容易过), 排查脚本
+probe_*.py 就是在这个约束下写的, 保留在目录里作 wheel 遮蔽 bug 的调查记录。
+
+### 基准集首轮结果 (2026-09-10)
+
+**复现**:
+
+```sh
+cd /home/tong/soft/gpu4pyscf
+.venv/bin/python mixedprec/benchmark/run_benchmark.py          # 性能矩阵
+.venv/bin/python mixedprec/benchmark/validate_methanol.py --fp64  # 对外验证
+```
+
+**对外验证 (methanol, b3lyp/6-31+g(d,p), 常规积分无 DF, 几何+能量同源
+methanols0.fchk)**:
+
+| | 能量 (Eh) | vs g16 |
+|---|---|---|
+| g16 参照 | -115.7348716828 | — |
+| CPU PySCF | -115.7348719017 | -2.188e-07 |
+| GPU fp64 | -115.7348719016 | -2.188e-07 |
+| GPU auto | -115.7348719016 | -2.188e-07 |
+
+三方一致, **2.19e-07 Eh ≈ 0.14 kJ/mol, 哨兵缺的「具名外部代码验证」补上了**。
+两个坑, 以后对 g16 都适用:
+1. **6d/5d 约定**: Gaussian 的 Pople 基组默认笛卡尔 d (6d), PySCF 默认球谐 (5d),
+   差 **1.66e-03 Eh** —— 不加 `mol.cart=True` 会把约定差当代码误差。
+2. **验证矩阵必须独立于性能矩阵**: 性能矩阵是 DF+def2-svp (为计时), 拿它对
+   g16 会把 DF 误差+基组失配折算成代码误差 (实测表面差值 0.17~0.78 Eh)。
+
+**性能矩阵** (RTX 5090, def2-svp, DF, auxbasis=def2-universal-jkfit 两边钉死,
+conv_tol=1e-10, 能量+梯度单点; 完整数据 `benchmark/results/benchmark.json`):
+
+| 体系 (AO) | | fp64 | auto | 加速 | \|dg\|/f64 |
+|---|---|---|---|---|---|
+| Tamoxifen (537) | hf SCF | 5.21s | 3.56s | 1.46x | — |
+| | hf 梯度 | 5.03s | 1.86s | **2.70x** | 8.3e-06 |
+| | r2SCAN SCF | 9.11s | 5.88s | 1.55x | — |
+| | r2SCAN 梯度 | 2.23s | 0.58s | **3.85x** | 1.1e-05 |
+| Azadirachtin (934) | hf SCF | 38.70s | 27.82s | 1.39x | — |
+| | hf 梯度 | 21.57s | 9.96s | **2.17x** | 2.6e-05 |
+| | r2SCAN SCF | 33.52s | 20.76s | 1.62x | — |
+| | r2SCAN 梯度 | 8.21s | 1.62s | **5.07x** | 2.5e-05 |
+| Vitamin C (208) | hf 梯度 | 0.64s | 0.22s | 2.9x | 8.9e-06 |
+| | r2SCAN 梯度 | 0.40s | 0.20s | 2.0x | 1.0e-05 |
+| r14 (378, UHF) | hf SCF | 12.71s | 9.01s | 1.41x | — |
+| | r2SCAN SCF | 33.22s | 17.73s | 1.87x | — |
+| methanol (48) | — | 秒级 | 秒级 | — | ~2e-06 |
+
+与 09-08 记分卡数字一致 (Tamoxifen hf: SCF 1.58x↔1.46x, 力 2.70x↔2.70x),
+数字互相对得上。
+
+**新发现 (3 条)**:
+1. **wheel 遮蔽是静默的, 而且路径错了照样中招**: `sys.path` 里没有**仓库根**时
+   (例如只插入 `mixedprec/`), `import gpu4pyscf` 解析到 venv 的发布版 wheel
+   (1.8.1, 无 `lib.precision`), `mf.precision_mode = 'auto'` 变成无效属性 ——
+   全程 fp64 但**不报错、不告警**。当日实测: 同一台机器同一份代码, 经 wheel 跑
+   Tamoxifen auto 梯度 5.10s (1.00x), 经源码树 1.86s (2.70x)。step9_scorecard
+   也有此问题: 它只把 `mixedprec/` 插入 sys.path, 不带
+   `PYTHONPATH=/home/tong/soft/gpu4pyscf` 跑就是 wheel。**鉴伪特征**: auto 与
+   fp64 的梯度差若只有 ~1e-8 量级 (原子级非确定性噪声) 而非 ~1e-5 (真 fp32),
+   就是跑在 wheel 上。
+2. **r14 的 xyz 头部自相矛盾**: 声称 `charge=1 spin=0`, 但 C12H21O2N2PRu⁺ 有
+   181 个电子 (奇数), spin=0 不可能。取双重态 (charge=1 spin=1, Ru(III) d5 低
+   自旋最自然), runner 里开壳层走 UHF/UKS (`gpu_run_os`/`cpu_run_os`)。
+3. **开壳层 fp32 梯度误差大三个量级**: r14 UHF 的 \|dg\|/f64 = 3.0e-03 (hf) /
+   5.0e-04 (r2scan), 闭壳层一律 ~1e-05。UHF 的 fp32 梯度内核 (或其误差传播)
+   值得单独立项查, 基准集先如实报数。
 
 
 ## 待办 / 下一步 (恢复项目时从这里开工)
