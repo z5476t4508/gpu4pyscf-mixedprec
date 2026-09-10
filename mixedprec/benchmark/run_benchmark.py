@@ -59,7 +59,16 @@ from step9_scorecard import cpu_run, gpu_run, timed  # noqa: E402
 
 
 def gpu_run_os(mol, xc, mode, do_grad, do_hess, auxbasis):
-    """gpu_run for open-shell systems: UHF (or UKS) instead of RHF/RKS."""
+    """gpu_run for open-shell systems: UHF (or UKS) instead of RHF/RKS.
+
+    init_guess='huckel' is REQUIRED for r14's UHF lane: the default minao
+    guess traps the SCF in a wrong state that DIIS never escapes (50-100
+    cycles of 1e-6 Eh oscillation). With huckel the GPU lane converges to
+    -2049.86009516 Eh (lower than every CPU stall point). NB the CPU UHF
+    lane does NOT converge on r14 under ANY remedy tried (minao, huckel,
+    level shift, damping, SOSCF) -- CPU UHF is not a usable reference for
+    this row; the r2SCAN UKS lane converges everywhere (2026-09-10).
+    """
     import cupy as cp
     from gpu4pyscf import scf as gpu_scf, dft as gpu_dft
     out = {}
@@ -69,9 +78,12 @@ def gpu_run_os(mol, xc, mode, do_grad, do_hess, auxbasis):
         mf = gpu_dft.UKS(mol, xc=xc).density_fit(auxbasis=auxbasis)
     mf.conv_tol = 1e-10
     mf.verbose = 0
+    mf.init_guess = 'huckel'
+    mf.max_cycle = 100        # the huckel trajectory needs >50 cycles
     mf.precision_mode = mode
     (e,), out['t_scf'] = timed(lambda: (mf.kernel(),))
     out['e'] = float(e)
+    out['converged'] = bool(mf.converged)
     if do_grad:
         g, out['t_grad'] = timed(lambda: mf.Gradients().kernel())
         out['g'] = cp.asnumpy(g) if hasattr(g, 'get') else np.asarray(g)
@@ -93,8 +105,11 @@ def cpu_run_os(mol, xc, do_grad, do_hess, auxbasis):
         mf = cpu_dft.UKS(mol, xc=xc).density_fit(auxbasis=auxbasis)
     mf.conv_tol = 1e-10
     mf.verbose = 0
+    mf.init_guess = 'huckel'
+    mf.max_cycle = 100
     t0 = time.perf_counter()
     out['e'] = mf.kernel()
+    out['converged'] = bool(mf.converged)
     out['t_scf'] = time.perf_counter() - t0
     if do_grad:
         t0 = time.perf_counter()
@@ -179,7 +194,8 @@ def main():
         try:
             out = runner(mol, xc, mode, True, args.hessian, args.auxbasis)
             rec.update({k: out[k] for k in
-                        ('e', 't_scf', 't_grad', 't_hess') if k in out})
+                        ('e', 't_scf', 't_grad', 't_hess', 'converged')
+                        if k in out})
             if 'g' in out:
                 grads[(name, xc, mode)] = out['g']
         except Exception as exc:            # e.g. r14 SCF failure: mark it
@@ -243,9 +259,10 @@ def main():
         def fe(k):
             v = r.get(k)
             return f'{v:10.2e}' if v is not None else '        --'
+        flag = '' if r.get('converged', False) else '  NOT-CONVERGED'
         print(f'  {r["geom"]:24s} {r["xc"]:7s} {r["mode"]:6s} '
               f'{ts("t_scf")} {ts("t_grad")} {ts("t_hess")} '
-              f'{fe("gerr_f64")} {fe("gerr_cpu")}', flush=True)
+              f'{fe("gerr_f64")} {fe("gerr_cpu")}{flag}', flush=True)
         if 'e_g16' in r:
             print(f'  {"":40s}energy vs g16 {r["g16_level"]} '
                   f'(geometry AND energy from methanols0.fchk): '

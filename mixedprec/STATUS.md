@@ -735,9 +735,14 @@ conv_tol=1e-10, 能量+梯度单点; 完整数据 `benchmark/results/benchmark.j
 | | r2SCAN 梯度 | 8.21s | 1.62s | **5.07x** | 2.5e-05 |
 | Vitamin C (208) | hf 梯度 | 0.64s | 0.22s | 2.9x | 8.9e-06 |
 | | r2SCAN 梯度 | 0.40s | 0.20s | 2.0x | 1.0e-05 |
-| r14 (378, UHF) | hf SCF | 12.71s | 9.01s | 1.41x | — |
-| | r2SCAN SCF | 33.22s | 17.73s | 1.87x | — |
+| r14 (378, UHF) | r2SCAN SCF | 33.22s | 17.73s | 1.87x | — |
 | methanol (48) | — | 秒级 | 秒级 | — | ~2e-06 |
+
+r14 的 **hf/UHF 行不进精度对比** (多解体系, 见发现 3; 且 CPU UHF 在 r14 上
+任何手段都收敛不了, 无参照可用), 其 r2SCAN 行 GPU fp64 = GPU auto = CPU =
+-2057.69345208 Eh, 逐位一致。runner 现已逐行记录 `converged` 旗标并在表格里
+标注 NOT-CONVERGED; 开壳层行用 `init_guess='huckel'` + `max_cycle=100`
+(默认 minao 初猜把 SCF 困在错误态, DIIS 永远逃不出来, CPU/GPU 皆如此)。
 
 与 09-08 记分卡数字一致 (Tamoxifen hf: SCF 1.58x↔1.46x, 力 2.70x↔2.70x),
 数字互相对得上。
@@ -755,9 +760,14 @@ conv_tol=1e-10, 能量+梯度单点; 完整数据 `benchmark/results/benchmark.j
 2. **r14 的 xyz 头部自相矛盾**: 声称 `charge=1 spin=0`, 但 C12H21O2N2PRu⁺ 有
    181 个电子 (奇数), spin=0 不可能。取双重态 (charge=1 spin=1, Ru(III) d5 低
    自旋最自然), runner 里开壳层走 UHF/UKS (`gpu_run_os`/`cpu_run_os`)。
-3. **开壳层 fp32 梯度误差大三个量级**: r14 UHF 的 \|dg\|/f64 = 3.0e-03 (hf) /
-   5.0e-04 (r2scan), 闭壳层一律 ~1e-05。UHF 的 fp32 梯度内核 (或其误差传播)
-   值得单独立项查, 基准集先如实报数。
+3. **r14 UHF 是多解体系, \|dg\| 列对它的 hf 行无效**: 181 电子的 Ru d 壳层近
+   简并, 存在至少两个相距 ~4.5e-3 Eh 的 SCF 解 (-2049.860095 与 -2049.864545,
+   都是合法收敛解)。落在哪个盆地取决于 fp32 起步的舍入噪声 —— 实测同参数 auto
+   两次分别落进两个解; fp64 从 auto 的轨道重启会留在 auto 的解 (解是真的, 不是
+   fp32 幻影)。~~此前记的「UHF fp32 梯度误差 3e-3」~~ **已证伪**: 同一 SCF 态下
+   梯度 A/B 实测 fp32 vs fp64 差 **1.45e-12**, fp32 梯度内核完全没问题, 之前的
+   大数全是态差。r14 的 hf 行只能看计时 (且轮数 50~100 波动, 计时也别当真),
+   r2SCAN 行三方能量逐位一致, 是干净数据。
 
 
 ## 待办 / 下一步 (恢复项目时从这里开工)

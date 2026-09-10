@@ -65,6 +65,7 @@ def cpu_run(mol, xc, do_grad, do_hess, auxbasis):
     t0 = time.perf_counter()
     e = mf.kernel()
     out['e'] = e
+    out['converged'] = bool(mf.converged)
     out['t_scf'] = time.perf_counter() - t0
     if do_grad:
         t0 = time.perf_counter()
@@ -90,6 +91,7 @@ def gpu_run(mol, xc, mode, do_grad, do_hess, auxbasis):
     mf.precision_mode = mode
     (e,), out['t_scf'] = timed(lambda: (mf.kernel(),))
     out['e'] = float(e)
+    out['converged'] = bool(mf.converged)
     if do_grad:
         g, out['t_grad'] = timed(lambda: mf.Gradients().kernel())
         out['g'] = cp.asnumpy(g) if hasattr(g, 'get') else np.asarray(g)
