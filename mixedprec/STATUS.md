@@ -672,6 +672,34 @@ ALDERLAKE 本来就归在 HASWELL 家族。所以这不是"降级凑合", 是这
 DF+def2-svp 的能量对 g16 会把 DF 误差和基组失配折算成「代码误差」; 验证脚本
 跑 b3lyp/6-31+G(d,p) 无 DF, 且打印 CPU PySCF 作第三条腿。
 
+**基准严谨化 (2026-09-10 下午, 用户定盘)**: r14 剔除出默认矩阵 (多解干扰),
+正式矩阵 = 4 闭壳层体系 × {def2-svp, def2-tzvp} × {DF-RHF, DF-r2SCAN,
+DF-B3LYP} × {fp64, auto}。E/G 计时 ×3 取中位 (首跑兼 CUDA 懒加载预热),
+Hessian 单发; 每格带精度列 (E/G/H 三量, H 走 vibanalysis 的投影频率 +
+热化学)。CPU Hessian 参照做到 methanol/VitC/Tamoxifen 两基组
+(Azadirachtin 天级成本, 豁免并注明)。旧 schema 结果归档为
+`results/benchmark_v1_2026-09-10.json`。
+
+**Hessian 精度的指标学** (methanol 冒烟实测): (1) max|dν| 在非驻点几何上被
+软模态污染 (dν ~ dH/(2μω), ω→0 发散) —— CPU 网格 level 3→5 时 GPU-CPU 差距
+0.55 → 27 cm⁻¹ 不是网格收敛问题, 是指标问题; **主指标 = rms(dν) + ΔZPE +
+ΔS_vib**, max 为参考列。(2) 精度代价 (auto vs fp64, 同实现同网格) rms
+3e-5~2e-3 cm⁻¹, 干净。(3) 跨实现差 (fp64 vs CPU PySCF): HF 1e-3 cm⁻¹ (锚),
+GGA/meta-GGA 0.04~0.17 rms —— XC 网格实现系统性差, 与混合精度无关;
+热化学层面 ΔZPE ≤ 2e-6 Eh, 化学可忽略。
+
+**正式基准完成 (2026-09-11, 报告 = `benchmark/REPORT.md`)**: 69 行全矩阵
+(4 闭壳层体系 × svp/tzvp × hf/r2scan/b3lyp × fp64/auto/cpu)。核心结论:
+auto 能量 ≤2×10⁻¹⁰ Eh (对 CPU), 梯度 ≤2.6×10⁻⁵ (geomeTRIC 阈值的 1/10),
+频率 rms ≤2×10⁻³ cm⁻¹; 梯度加速 1.9~7.1× 随体系增大, Hessian 1.4~7.6×,
+对 CPU 综合一个量级以上 (Tamo svp B3LYP Hessian 285×)。边界: r2SCAN
+Hessian ≥934 AO 撞 32 GB 墙 (hf/B3LYP 到 ~1900 AO 可过), Aza tzvp 的
+hf/b3lyp auto SCF 不收敛 (新鲁棒性发现, 已旗标), 跨实现网格系统差
+(HF 1e-3 / GGA 0.01-0.19 rms, 热化学可忽略)。方法学注记: SCF 计时必须
+冷启动单发 (热启动实测 5.2s→1.6s 污染); max|dν| 被软模态污染, 主指标用
+rms+ΔZPE+ΔS_vib。CPU 相位曾被 tmpfs 上的 PySCF chkfile (~46 GB) 撑爆
+触发看门狗误杀两次 —— 教训: 长 CPU 任务一律 `TMPDIR=<磁盘> + setsid`。
+
 **g16 等级已查明** (2026-09-10): fchk 不含 route 段, 但**头两行注释写了**:
 `Freq  RB3LYP  6-31+G(d,p)` —— 是 RB3LYP/6-31+G(d,p), 总能量
 -115.7348716828283 Eh。对外验证那列不再是「等级未知」。
@@ -747,7 +775,23 @@ r14 的 **hf/UHF 行不进精度对比** (多解体系, 见发现 3; 且 CPU UHF
 与 09-08 记分卡数字一致 (Tamoxifen hf: SCF 1.58x↔1.46x, 力 2.70x↔2.70x),
 数字互相对得上。
 
+**硬件边界 (2026-09-10 实测, 用户确认要做 out-of-core)**: 934 AO (95 原子
+纯主族 C35H44O16) 的解析 Hessian 是 5090 的墙 —— B3LYP fp64 峰值 30/32 GB
+(擦线), **r2SCAN 两车道 OOM (干净进程复现确认, 非碎片)**。能量/梯度/几何
+优化不受此限。已提出的解法 (按投入排):
+1. fp32 CDERI (`c8aedd5`, 砍半 24 GB 的 CDERI) + 小辅助基组 + 粗网格, 半天
+   实验, 目标 r2SCAN @ 934 AO 过线; 同时充当方案 2 的精度验收标准
+2. **真 out-of-core (G16 思路, 但中间层是主机内存)**: 本机 123 GB RAM +
+   PCIe 5.0 (~40-50 GB/s), 把 hess/CPHF 大张量按 naux/ngrid 分块, pinned
+   buffer 双缓冲流式; 墙从 32 GB 抬到 ~120 GB, 内存受限步骤慢 1.2-2x。
+   `df.loop` 已有按 aux 分块骨架。预期周级工程, 收益: 解析 Hessian 的
+   体系上限从显卡容量变成内存容量 (~2000 AO, 覆盖金属+TZVP 催化体系)
+3. 多卡分片 (CDERI 按 aux 维可分, 需确认多卡现状)
+用户场景: 100+ 原子催化/物理有机体系的 TS 优化 —— 优化本身是梯度驱动
+(5090 没问题), 唯一的墙是最后一次确认性 Hessian。
+
 **新发现 (3 条)**:
+
 1. **wheel 遮蔽是静默的, 而且路径错了照样中招**: `sys.path` 里没有**仓库根**时
    (例如只插入 `mixedprec/`), `import gpu4pyscf` 解析到 venv 的发布版 wheel
    (1.8.1, 无 `lib.precision`), `mf.precision_mode = 'auto'` 变成无效属性 ——
