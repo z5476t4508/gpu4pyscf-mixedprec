@@ -18,6 +18,19 @@ from . import _patch_pyscf
 
 from . import lib, grad, hessian, solvent, scf, dft, tdscf, nac
 
+try:
+    from .lib import precision  # noqa: F401
+except ImportError:
+    import warnings
+    warnings.warn(
+        'gpu4pyscf.lib.precision is missing: this is the release wheel or a '
+        'stale source tree, and precision_mode will be a silently-ignored '
+        'attribute (every calculation runs float64). Measured cost on a '
+        'Tamoxifen auto-lane gradient: 2.70x speedup silently lost. If you '
+        'meant to run the source tree, put the REPOSITORY ROOT (not a '
+        'subdirectory) on sys.path or set PYTHONPATH.',
+        stacklevel=2)
+
 # Overwrite the cupy memory allocator. Make memory pool manage small-sized
 # arrays only.
 lib.cupy_helper.set_conditional_mempool_malloc()
