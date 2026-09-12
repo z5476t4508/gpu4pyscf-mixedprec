@@ -645,8 +645,12 @@ def _j_energy_per_atom(int3c2e_opt, dm, verbose=None):
     # ...
     mem_avail = get_avail_mem(exclude_memory_pool=True)
     word_avail = mem_avail // 8
-    batch_size = min(naux, int(word_avail*0.75) // (3*nao_pair*2))
-    blksize = min(naux, int(word_avail*0.15) // (nao**2*8) * 8)
+    # buf0+buf1 are 3*nao_pair*batch_size*8 bytes each, j3c_full is
+    # 3*nao**2*blksize*8: the old 0.75+0.15 fractions summed to 1.2x of
+    # mem_avail and OOM'd on ~934-AO r2SCAN Hessians (measured 2026-09-11:
+    # 35.9 GB requested against 29.9 GB available). Keep the total <= 0.85.
+    batch_size = min(naux, int(word_avail*0.50) // (3*nao_pair*2))
+    blksize = min(naux, int(word_avail*0.10) // (nao**2*8) * 8)
     assert batch_size > 0 and blksize > 0
     log.debug1('mem_avail=%.3f MB, batch_size=%d, blksize=%d',
                mem_avail*1e-6, batch_size, blksize)
