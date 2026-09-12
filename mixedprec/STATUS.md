@@ -688,6 +688,17 @@ Hessian 单发; 每格带精度列 (E/G/H 三量, H 走 vibanalysis 的投影频
 GGA/meta-GGA 0.04~0.17 rms —— XC 网格实现系统性差, 与混合精度无关;
 热化学层面 ΔZPE ≤ 2e-6 Eh, 化学可忽略。
 
+**2026-09-11 下午加演收尾**:
+4. **`_contract_rho1_fxc` 候选否决** (`check_contract_rho1.py`): 微基准实测
+   现实现 43 µs/call,「matvec+out=」替代 269 µs —— cuBLAS 批量 GEMM 在小块
+   形状上打不过逐元素核,「纯分配开销」假设反向。零改动, 关闭。
+5. **wheel 遮蔽守卫** (commit `5519639`, `gpu4pyscf/__init__.py`): 源码树内
+   `from .lib import precision` 失败时告警 (防半残构建)。**wheel 本体告不了**
+   (它没有这段代码, 鸡生蛋); venv wheel 的补丁被权限挡在 site-packages 外,
+   待用户手工打: 在 `.venv/lib/python3.14/site-packages/gpu4pyscf/__init__.py`
+   的 `__version__ = '1.8.1'` 之后加一段 `warnings.warn(...)` —— 措辞见源码树
+   同文件的守卫。哨兵 9/9。
+
 **两处 Hessian 修复 + 一条路线关闭 (2026-09-11 下午)**:
 1. **auto SCF 发散守卫** (commit `9792bfd`, scf/hf.py): Aza tzvp (~1877 AO) 的
    hf/b3lyp auto 车道 fp32 相发散 (ΔE 在 ±1-10 Eh 震荡, 永远够不着 1e-4 的
