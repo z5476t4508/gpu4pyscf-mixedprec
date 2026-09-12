@@ -45,6 +45,19 @@ overlap_zero_eigenvalue_threshold = getattr(__config__, 'scf_hf_overlap_zero_eig
 # mixed-precision policy
 _PRECISION_SWITCH_TOL = getattr(__config__, 'scf_hf_precision_switch_tol', 1e-4)
 
+# Divergence guard for the 'auto' policy: on large exact-exchange systems
+# (measured: ~1877 AO, def2-tzvp, Azadirachtin) the fp32 phase can oscillate
+# with delta_E of *Eh* -- never approaching the switch tol while DIIS
+# thrashes. If, after _PRECISION_SWITCH_CHAOS_AFTER cycles, |dE| still
+# exceeds _PRECISION_SWITCH_CHAOS_TOL for this many consecutive cycles,
+# switch to fp64 anyway: a rough fp32 density is a fine fp64 starting point.
+_PRECISION_SWITCH_CHAOS_TOL = getattr(
+    __config__, 'scf_hf_precision_switch_chaos_tol', 1e-2)
+_PRECISION_SWITCH_CHAOS_AFTER = getattr(
+    __config__, 'scf_hf_precision_switch_chaos_after', 10)
+_PRECISION_SWITCH_CHAOS_STREAK = getattr(
+    __config__, 'scf_hf_precision_switch_chaos_streak', 3)
+
 __all__ = [
     'get_jk', 'get_occ', 'get_grad', 'damping', 'level_shift', 'get_fock',
     'energy_elec', 'RHF', 'SCF'
@@ -276,6 +289,7 @@ def _kernel_body(mf, conv_tol, conv_tol_grad, dump_chk, dm0, callback,
     x_orth = mf.check_linear_dependency(s1e, log)
     t1 = log.timer('SCF initialization', *t0)
     scf_conv = False
+    chaos_streak = 0     # consecutive divergent-looking fp32 cycles (auto)
 
     # Skip SCF iterations. Compute only the total energy of the initial density
     if mf.max_cycle <= 0:
@@ -349,6 +363,20 @@ def _kernel_body(mf, conv_tol, conv_tol_grad, dump_chk, dm0, callback,
             # consecutive small changes only wastes fp64 iterations
             if abs(e_tot - last_hf_e) < _PRECISION_SWITCH_TOL:
                 precision.set_precision('fp64')
+            else:
+                # divergence guard: past the early cycles, an fp32 phase
+                # whose energy change is still ~1e-2 Eh cycle after cycle
+                # is thrashing, not converging -- measured on ~1900-AO
+                # exact-exchange systems where it never recovers
+                chaos_streak = chaos_streak + 1 if (
+                    cycle + 1 > _PRECISION_SWITCH_CHAOS_AFTER
+                    and abs(e_tot - last_hf_e) > _PRECISION_SWITCH_CHAOS_TOL
+                ) else 0
+                if chaos_streak >= _PRECISION_SWITCH_CHAOS_STREAK:
+                    log.info('auto policy: fp32 phase diverging (delta_E '
+                             '>%g for %d cycles); switching to fp64',
+                             _PRECISION_SWITCH_CHAOS_TOL, chaos_streak)
+                    precision.set_precision('fp64')
         e_diff = abs(e_tot-last_hf_e)
         if(e_diff < conv_tol and norm_gorb < conv_tol_grad):
             scf_conv = True
