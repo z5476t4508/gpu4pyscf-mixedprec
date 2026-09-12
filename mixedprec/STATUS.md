@@ -688,6 +688,24 @@ Hessian 单发; 每格带精度列 (E/G/H 三量, H 走 vibanalysis 的投影频
 GGA/meta-GGA 0.04~0.17 rms —— XC 网格实现系统性差, 与混合精度无关;
 热化学层面 ΔZPE ≤ 2e-6 Eh, 化学可忽略。
 
+**两处 Hessian 修复 + 一条路线关闭 (2026-09-11 下午)**:
+1. **auto SCF 发散守卫** (commit `9792bfd`, scf/hf.py): Aza tzvp (~1877 AO) 的
+   hf/b3lyp auto 车道 fp32 相发散 (ΔE 在 ±1-10 Eh 震荡, 永远够不着 1e-4 的
+   切换阈值; r2SCAN J-only 同体系正常 —— 不稳定的是精确交换 K 的 fp32 收缩,
+   悬崖在 1042~1877 AO 之间)。加混沌触发器: 第 10 轮后连续 3 轮 |ΔE|>1e-2
+   即强制切 fp64。验收: 失效格收敛 (|dE|≤2e-12 vs fp64)、健康格逐位不变
+   (Tamoxifen 自然切换在第 6 轮, 守卫摸不到)、哨兵 9/9 (36.1s)。
+2. **DF Hessian 内存预算超支** (commit `09e00bb`, df/hessian/rhf.py
+   `_j_energy_per_atom`): buf0+buf1 (0.75) + j3c_full (0.15) = **1.2× 可用
+   显存**, 实测 35.9 GB vs 29.9 GB —— 这才是 r2SCAN Hessian ≥934 AO OOM 的
+   真正原因 (不是 CDERI, fp32 CDERI 推不动墙, 见 3)。改成 0.50+0.10=0.85×。
+   验收: **三个 OOM 格全部复活** (Aza svp 1687s / Tamo tzvp 705s /
+   Aza tzvp ~1877 AO 4607s, 全矩阵零 OOM), VitC 零回归 (19.3s vs 19.4s),
+   Aza svp auto 344s = **4.9×**, 哨兵 9/9。
+3. **fp32 CDERI 实验关闭**: 精度免费 (dν max 1.3e-3 cm⁻¹, ΔZPE 1.2e-8 Eh)
+   但单独开关推不动墙 (OOM 不变) —— 墙在响应路径的 buf/j3c 张量, 已由 2 修复。
+   out-of-core 的精度验收标准由此确定 (fp32 存储层可用)。`check_cderi_fp32.py`。
+
 **正式基准完成 (2026-09-11, 报告 = `benchmark/REPORT.md`)**: 69 行全矩阵
 (4 闭壳层体系 × svp/tzvp × hf/r2scan/b3lyp × fp64/auto/cpu)。核心结论:
 auto 能量 ≤2×10⁻¹⁰ Eh (对 CPU), 梯度 ≤2.6×10⁻⁵ (geomeTRIC 阈值的 1/10),
