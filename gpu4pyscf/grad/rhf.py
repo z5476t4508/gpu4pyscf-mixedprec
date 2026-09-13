@@ -380,6 +380,7 @@ def get_grad_hcore(mf_grad, mo_coeff=None, mo_occ=None):
     orbo_sorted = mo_sorted[:,mo_occ>0]
 
     opt = Int3c2eOpt(sorted_mol, fakemol).build(tril=False)
+    nao1 = sorted_mol.nao
     # `work` below is batch_size x 3 x nao^2 fp64; a fixed batch of 32
     # allocates 27.6 GB at ~3370 AO (measured 2026-09-13, Azadirachtin
     # def2-qzvp) and OOMs. Cap it by available memory: at most ~1/8 of
@@ -390,7 +391,6 @@ def get_grad_hcore(mf_grad, mo_coeff=None, mo_occ=None):
     eval_ip1, _, aux_offsets = _int3c2e_ip1_evaluator(
         opt, int3c2e_scheme_ip1(omega, 27), batch_size, 'fill_int3c2e_ip1', omega)
     pair_addresses = opt.pair_and_diag_indices(cart=True, original_ao_order=False)[0]
-    nao1 = sorted_mol.nao
     work = cp.zeros([batch_size,3,nao1*nao1])
     for batch_id, (p0, p1) in enumerate(zip(aux_offsets[:-1], aux_offsets[1:])):
         tmp = eval_ip1(batch_id)
