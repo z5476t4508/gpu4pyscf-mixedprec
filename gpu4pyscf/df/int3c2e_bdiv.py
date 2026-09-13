@@ -29,7 +29,7 @@ from pyscf.gto.mole import (
 from gpu4pyscf.lib import logger
 from gpu4pyscf.lib.cupy_helper import (
     load_library, contract, dist_matrix, asarray, hermi_triu, transpose_sum,
-    ndarray)
+    ndarray, get_avail_mem)
 from gpu4pyscf.lib.utils import splits_by_blocksize
 from gpu4pyscf.lib import multi_gpu
 from gpu4pyscf.gto.mole import (
@@ -795,6 +795,15 @@ def _int3c2e_ip1_evaluator(int3c2e_opt, scheme, batch_size,
     l_ctr_aux_offsets = np.append(0, np.cumsum(auxmol.l_ctr_counts))
     uniq_l_ctr_aux = auxmol.uniq_l_ctr
     aux_loc = auxmol.ao_loc
+    # The per-batch j3c tensor is 3 * nao_pair * naux_in_batch * 8 bytes;
+    # a fixed shell count per batch OOM'd at ~3300 AO (measured 2026-09-13,
+    # Azadirachtin def2-qzvp: ~52 GB requested). Bound naux per batch to a
+    # quarter of free VRAM.
+    mem_avail = get_avail_mem(exclude_memory_pool=True)
+    fns_per_shell_max = (laux + 1) * (laux + 2) // 2   # cartesian
+    naux_batch_max = max(1, int(mem_avail * .25) // (3 * nao_pair * 8)
+                         // fns_per_shell_max)
+    batch_size = min(batch_size, naux_batch_max)
     l_ctr_aux_offsets, uniq_l_ctr_aux = _split_l_ctr_pattern(
         l_ctr_aux_offsets, uniq_l_ctr_aux, batch_size)
     aux_sorting = argsort_aux(l_ctr_aux_offsets, uniq_l_ctr_aux)
