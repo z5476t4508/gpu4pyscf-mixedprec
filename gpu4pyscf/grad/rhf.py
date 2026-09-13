@@ -24,6 +24,7 @@ from gpu4pyscf.grad.dispersion import get_dispersion
 from gpu4pyscf.gto.ecp import get_ecp_ip
 from gpu4pyscf.lib import utils
 from gpu4pyscf.lib import precision
+from gpu4pyscf.lib.cupy_helper import get_avail_mem
 from gpu4pyscf.lib.cupy_helper import (
     tag_array, contract, condense, transpose_sum, get_avail_mem, ndarray)
 from gpu4pyscf.__config__ import props as gpu_specs
@@ -379,7 +380,12 @@ def get_grad_hcore(mf_grad, mo_coeff=None, mo_occ=None):
     orbo_sorted = mo_sorted[:,mo_occ>0]
 
     opt = Int3c2eOpt(sorted_mol, fakemol).build(tril=False)
-    batch_size = min(32, natm)
+    # `work` below is batch_size x 3 x nao^2 fp64; a fixed batch of 32
+    # allocates 27.6 GB at ~3370 AO (measured 2026-09-13, Azadirachtin
+    # def2-qzvp) and OOMs. Cap it by available memory: at most ~1/8 of
+    # free VRAM, at least 1.
+    mem_avail = get_avail_mem(exclude_memory_pool=True)
+    batch_size = min(32, natm, max(1, int(mem_avail * .125) // (3 * nao1 * nao1)))
     omega = 0.
     eval_ip1, _, aux_offsets = _int3c2e_ip1_evaluator(
         opt, int3c2e_scheme_ip1(omega, 27), batch_size, 'fill_int3c2e_ip1', omega)
