@@ -1,0 +1,20 @@
+&molecule
+ imult      = 1
+ icharge    = 0
+ functional = 'R2SCAN'
+ baselabel  = 'def2svp'
+ J          = 'RI'
+ K          = 'RI'
+ ri_aux_basis = 'ccpvdzjkfit'
+ calc_force = .true.
+ n_threads  = 24
+&end
+
+&atoms
+C      -1.52636971      0.93061060      0.00314849
+H      -1.19343567     -0.11622719     -0.02084982
+H      -1.19341888      1.43323917     -0.91543662
+H      -2.61806625      0.94578541      0.02941138
+O      -1.08239227      1.60766345      1.17584429
+H      -0.11756599      1.61548671      1.18940645
+&end
