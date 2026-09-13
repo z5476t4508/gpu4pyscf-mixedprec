@@ -707,6 +707,24 @@ GGA/meta-GGA 0.04~0.17 rms —— XC 网格实现系统性差, 与混合精度�
    的 `__version__ = '1.8.1'` 之后加一段 `warnings.warn(...)` —— 措辞见源码树
    同文件的守卫。哨兵 9/9。
 
+**OOM 打地鼠战绩 + 第五处待查 (2026-09-13 深夜)**: 用户问「更大的体系怎么办」
+→ 造 Aza/def2-qzvp (~3371 AO) 探针 (`find_hess_wall.py`), 墙逐个现形:
+1. `get_grad_hcore` 的 `work = batch(32,硬编码)×3×nao²` @ 3370 AO = 27.6 GB
+   一次分配 → 已修 (`1918c10`, 显存感知 cap)。中间踩了个 nao1 先用的顺序
+   slip (`8032eb5`)。
+2. ip1 evaluator 的 aux 壳层批固定 32 壳 → per-batch j3c 张量 ~52 GB
+   → 已修 (`53435b2`, evaluator 内按显存收口, naux/批 ≤ 可用显存的 1/4)。
+3. **第五处 (未修)**: 修完 1+2 后 qzvp Hessian 走得更深, 死在
+   `_get_vh1` (`df/hessian/rhf.py:1048` proc) 的散射赋值:
+   `j3c[j_addr,i_addr] = compressed_dj[x,:,k0:k1]` 广播失败
+   shape (6040615,3) vs (6040615,8) —— **形状 bug 不是 OOM**, qzvp 才触发
+   (1877 AO 及以下全部正常)。两种可能: qzvp 壳层结构 (l=4) 暴露的潜在
+   索引 bug; 或 53435b2 的 evaluator 收口与 `_get_vh1` 的 buf/blksize
+   假设交互。**下一步**: 打印 j3c_full/compressed_dj/blksize 实际形状定责,
+   再决定修法。日志 `results/wallfinder.log`。
+规律确认: 「固定分块不看显存」已四实例; 本轮全部修法都是 `get_avail_mem`
+收口, 零精度风险。out-of-core 迄今未需要 —— qzvp 之下显存感知分块够用。
+
 **两处 Hessian 修复 + 一条路线关闭 (2026-09-11 下午)**:
 1. **auto SCF 发散守卫** (commit `9792bfd`, scf/hf.py): Aza tzvp (~1877 AO) 的
    hf/b3lyp auto 车道 fp32 相发散 (ΔE 在 ±1-10 Eh 震荡, 永远够不着 1e-4 的
