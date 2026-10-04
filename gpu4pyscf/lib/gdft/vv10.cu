@@ -27,6 +27,121 @@
 
 #define NG_PER_BLOCK      128
 
+// Block-wide tree reduction of three doubles (used by the multi-warp VV10
+// UWE kernel). blockDim.x is a power of two in every caller, and every
+// thread enters with __syncthreads() balanced, so the barriers below are
+// uniform across the block.
+__device__
+static void _vv10_block_reduce3(double& U, double& W, double& E)
+{
+    __shared__ double s_U[NG_PER_BLOCK];
+    __shared__ double s_W[NG_PER_BLOCK];
+    __shared__ double s_E[NG_PER_BLOCK];
+    s_U[threadIdx.x] = U;
+    s_W[threadIdx.x] = W;
+    s_E[threadIdx.x] = E;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            s_U[threadIdx.x] += s_U[threadIdx.x + stride];
+            s_W[threadIdx.x] += s_W[threadIdx.x + stride];
+            s_E[threadIdx.x] += s_E[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    U = s_U[0];
+    W = s_W[0];
+    E = s_E[0];
+}
+
+// Issue #10 candidate C1: the reference kernel assigns one grid point i
+// to each 128-thread block but walks the j-loop serially inside each
+// thread, so each block runs its dominant loop on a single warp of
+// parallelism while the other three warps idle. The multi-warp variant
+// keeps the block-to-i mapping identical (ngrids blocks) and spreads the
+// j-loop of each i across all NG_PER_BLOCK threads: thread t handles
+// every NG_PER_BLOCK-th j, and the per-i sums are produced by a block
+// reduction at the end. The arithmetic is unchanged (same fp64
+// expressions); the result differs from the reference kernel only by the
+// fp64 summation order (tree reduction over 128 partials instead of one
+// serial chain), measured by the issue #10 precision probe before any
+// benchmark use. Selected at runtime via the environment variable
+// GPU4PYSCF_VV10_UWE_KERNEL (empty/unset = reference 'warp1', 'warp4' =
+// this kernel); the default never changes without that opt-in.
+__global__
+static void vv10_fock_eval_UWE_multiwarp_kernel(double* __restrict__ U, double* __restrict__ W, double* __restrict__ E,
+                                                const double* __restrict__ grid_coord, const double* __restrict__ rho_weight,
+                                                const double* __restrict__ omega, const double* __restrict__ kappa,
+                                                const int ngrids)
+{
+    const int i = blockIdx.x;
+    const bool active = i < ngrids;
+
+    double omega_i = NAN;
+    double kappa_i = NAN;
+    double3 r_i = { NAN, NAN, NAN };
+    if (active) {
+        omega_i = omega[i];
+        kappa_i = kappa[i];
+        r_i.x = grid_coord[i * 3 + 0];
+        r_i.y = grid_coord[i * 3 + 1];
+        r_i.z = grid_coord[i * 3 + 2];
+    }
+
+    double U_i = 0;
+    double W_i = 0;
+    double E_i = 0;
+
+    __shared__ double3 shared_omega_kappa_rhow_j[NG_PER_BLOCK];
+    __shared__ double3 shared_r_j[NG_PER_BLOCK];
+
+    for (int j_block_offset = 0; j_block_offset < ngrids; j_block_offset += NG_PER_BLOCK) {
+        const int j = j_block_offset + threadIdx.x;
+        if (j < ngrids) {
+            shared_omega_kappa_rhow_j[threadIdx.x].x = omega[j];
+            shared_omega_kappa_rhow_j[threadIdx.x].y = kappa[j];
+            shared_omega_kappa_rhow_j[threadIdx.x].z = rho_weight[j];
+            shared_r_j[threadIdx.x].x = grid_coord[j * 3 + 0];
+            shared_r_j[threadIdx.x].y = grid_coord[j * 3 + 1];
+            shared_r_j[threadIdx.x].z = grid_coord[j * 3 + 2];
+        }
+        __syncthreads();
+
+        const int block_upper_bound = min(NG_PER_BLOCK, ngrids - j_block_offset);
+        // thread t takes j_in_block = t, t+blockDim.x, ... within this
+        // 128-j chunk: all four warps cooperate on the j-loop
+        for (int j_in_block = threadIdx.x; j_in_block < block_upper_bound; j_in_block += blockDim.x) {
+            const double omega_j = shared_omega_kappa_rhow_j[j_in_block].x;
+            const double kappa_j = shared_omega_kappa_rhow_j[j_in_block].y;
+            const double3 r_j = shared_r_j[j_in_block];
+            const double rho_weight_j = shared_omega_kappa_rhow_j[j_in_block].z;
+
+            const double r_ij2 = (r_i.x - r_j.x) * (r_i.x - r_j.x) + (r_i.y - r_j.y) * (r_i.y - r_j.y) + (r_i.z - r_j.z) * (r_i.z - r_j.z);
+            const double g_ij = omega_i * r_ij2 + kappa_i;
+            const double g_ji = omega_j * r_ij2 + kappa_j;
+            const double g_sum = g_ij + g_ji;
+            const double g_ij_ji_sum_1 = 1 / (g_ij * g_ji * g_sum);
+            const double Phi_ij = -g_ij_ji_sum_1; // Prefactor of 1.5 is applied later
+
+            const double E_ij = rho_weight_j * Phi_ij;
+            const double U_ij = E_ij * (g_sum + g_ij) * g_ji * g_ij_ji_sum_1;
+            const double W_ij = U_ij * r_ij2;
+
+            U_i += U_ij;
+            W_i += W_ij;
+            E_i += E_ij;
+        }
+        __syncthreads();
+    }
+
+    _vv10_block_reduce3(U_i, W_i, E_i);
+    if (threadIdx.x == 0 && active) {
+        U[i] = -U_i * 1.5;
+        W[i] = -W_i * 1.5;
+        E[i] = E_i * 1.5;
+    }
+}
+
 __global__
 static void vv10_fock_eval_UWE_kernel(double* __restrict__ U, double* __restrict__ W, double* __restrict__ E,
                                       const double* __restrict__ grid_coord, const double* __restrict__ rho_weight,
@@ -646,6 +761,34 @@ static void vv10_hess_eval_D_B_in_double_grid_response_offdiagonal_kernel(double
     D_B[B_atom * 9 * ngrids + 8 * ngrids + i] = -(2 * 1.5) * D_B_i[8];
 }
 
+// Issue #10 candidate C1: runtime kernel selection for the VV10 UWE
+// evaluation. The reference 'warp1' kernel (one 128-thread block per grid
+// point) is the default and remains bit-for-bit the historical path.
+// 'warp4' routes to the multi-warp variant (four warps cooperating on
+// each grid point's j-loop; same fp64 arithmetic, reduction-order-only
+// difference, see the kernel comment). Selection is a process-lifetime
+// decision read from GPU4PYSCF_VV10_UWE_KERNEL once; anything other than
+// "warp4" (including unset) keeps the reference kernel, and an unknown
+// value is reported and ignored rather than guessing.
+static int vv10_uwe_kernel_variant()
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char* env = getenv("GPU4PYSCF_VV10_UWE_KERNEL");
+        if (env != nullptr && strcmp(env, "warp4") == 0) {
+            cached = 1;
+        } else {
+            if (env != nullptr && strlen(env) > 0 && strcmp(env, "warp1") != 0) {
+                fprintf(stderr, "vv10 UWE kernel selector: unknown value "
+                        "'%s' (expected warp1|warp4); using the reference "
+                        "warp1 kernel\n", env);
+            }
+            cached = 0;
+        }
+    }
+    return cached;
+}
+
 extern "C" {
 __host__
 int VXC_vv10nlc_fock_eval_UWE(const cudaStream_t stream,
@@ -654,10 +797,18 @@ int VXC_vv10nlc_fock_eval_UWE(const cudaStream_t stream,
                               const double* omega, const double* kappa,
                               const int ngrids)
 {
-    const dim3 threads(NG_PER_BLOCK);
-    const dim3 blocks((ngrids+NG_PER_BLOCK-1)/NG_PER_BLOCK);
-    vv10_fock_eval_UWE_kernel<<<blocks, threads, 0, stream>>>(U, W, E,
-                                                              grid_coord, rho_weight, omega, kappa, ngrids);
+    if (vv10_uwe_kernel_variant() == 1) {
+        // one block per grid point; the j-loop inside is cooperative
+        const dim3 threads(NG_PER_BLOCK);
+        const dim3 blocks(ngrids);
+        vv10_fock_eval_UWE_multiwarp_kernel<<<blocks, threads, 0, stream>>>(
+            U, W, E, grid_coord, rho_weight, omega, kappa, ngrids);
+    } else {
+        const dim3 threads(NG_PER_BLOCK);
+        const dim3 blocks((ngrids+NG_PER_BLOCK-1)/NG_PER_BLOCK);
+        vv10_fock_eval_UWE_kernel<<<blocks, threads, 0, stream>>>(
+            U, W, E, grid_coord, rho_weight, omega, kappa, ngrids);
+    }
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA Error of vv10 fock eval_UWE: %s\n", cudaGetErrorString(err));
