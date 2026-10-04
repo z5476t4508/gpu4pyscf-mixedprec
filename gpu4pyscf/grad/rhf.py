@@ -384,9 +384,12 @@ def get_grad_hcore(mf_grad, mo_coeff=None, mo_occ=None):
     # `work` below is batch_size x 3 x nao^2 fp64; a fixed batch of 32
     # allocates 27.6 GB at ~3370 AO (measured 2026-09-13, Azadirachtin
     # def2-qzvp) and OOMs. Cap it by available memory: at most ~1/8 of
-    # free VRAM, at least 1.
+    # free VRAM, at least 1. The factor 8 is the fp64 itemsize: without
+    # it the cap bounds the tensor to 100% of free VRAM instead of the
+    # documented 1/8 (found by the issue-#11 chunk audit, 2026-10-04;
+    # the original fix omitted the itemsize conversion).
     mem_avail = get_avail_mem(exclude_memory_pool=True)
-    batch_size = min(32, natm, max(1, int(mem_avail * .125) // (3 * nao1 * nao1)))
+    batch_size = min(32, natm, max(1, int(mem_avail * .125) // (3 * nao1 * nao1 * 8)))
     omega = 0.
     eval_ip1, _, aux_offsets = _int3c2e_ip1_evaluator(
         opt, int3c2e_scheme_ip1(omega, 27), batch_size, 'fill_int3c2e_ip1', omega)
