@@ -239,16 +239,28 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
     #   'auto'  - early iterations in fp32; once the energy change drops
     #             below _PRECISION_SWITCH_TOL, switch to fp64 for the tail
     #             iterations and the final energy (restores full accuracy).
+    #   'auto+verify' - the auto policy plus the opt-in UKS solution-
+    #             stability verification (gpu4pyscf.scf.stability_verify):
+    #             after the SCF converges, one strict-fp64 reference SCF
+    #             from the same init guess is run; if the two trajectories
+    #             converge to different densities, a bounded fp64
+    #             refinement from the auto density decides whether that is
+    #             an fp32 fixed-point displacement (same solution; the
+    #             stationary point is adopted) or a genuine branch split
+    #             (the lower stationary solution is kept; see
+    #             stability_verify's docstring for the measured motivation).
     _mode = getattr(mf, 'precision_mode', None)
-    if _mode is not None and _mode not in ('fp64', 'fp32', 'auto'):
+    if _mode is not None and _mode not in ('fp64', 'fp32', 'auto',
+                                           'auto+verify'):
         raise ValueError(
-            f"precision_mode must be None, 'fp64', 'fp32' or 'auto', got {_mode!r}")
+            f"precision_mode must be None, 'fp64', 'fp32', 'auto' or "
+            f"'auto+verify', got {_mode!r}")
     _precision_saved = precision.get_precision()
-    if _mode in ('auto', 'fp32'):
+    if _mode in ('auto', 'auto+verify', 'fp32'):
         precision.set_precision('fp32')
     else:
         precision.set_precision('fp64')
-    _mixed_auto = _mode == 'auto'
+    _mixed_auto = _mode in ('auto', 'auto+verify')
     try:
         return _kernel_body(mf, conv_tol, conv_tol_grad, dump_chk, dm0, callback,
                             conv_check, _mixed_auto, log, t0, t1, **kwargs)
@@ -456,6 +468,21 @@ def scf(mf, dm0=None, **kwargs):
         mf.e_tot = _kernel(mf, mf.conv_tol, mf.conv_tol_grad,
                             dm0=dm0, callback=mf.callback,
                             conv_check=mf.conv_check, **kwargs)[1]
+
+    # opt-in solution-stability verification (precision_mode='auto+verify'):
+    # one strict-fp64 reference SCF from the same init guess; keeps the
+    # lower converged solution when the auto policy landed on a different
+    # branch (near-degenerate UKS stationary pairs).  Default policies
+    # never enter this branch.
+    if getattr(mf, 'precision_mode', None) == 'auto+verify':
+        if mf.converged:
+            from gpu4pyscf.scf import stability_verify
+            stability_verify.verify_solution_stability(mf)
+        else:
+            mf.scf_summary['stability_verification'] = {
+                'policy': 'auto+verify',
+                'skipped': 'main SCF did not converge',
+            }
 
     logger.timer(mf, 'SCF', *cput0)
     mf._finalize()
@@ -787,8 +814,10 @@ class SCF(pyscf_lib.StreamObject):
 
     # Mixed-precision policy for the SCF iterations. None/'fp64' runs
     # everything in float64; 'fp32' runs every iteration with float32
-    # contractions; 'auto' starts in float32 and finishes in float64. See
-    # gpu4pyscf.lib.precision.
+    # contractions; 'auto' starts in float32 and finishes in float64;
+    # 'auto+verify' additionally runs the opt-in UKS solution-stability
+    # verification pass after convergence (see
+    # gpu4pyscf.scf.stability_verify).  See gpu4pyscf.lib.precision.
     precision_mode = None
 
     # Adaptive SCF convergence threshold for geometry optimization: 'auto'
