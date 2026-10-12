@@ -160,6 +160,13 @@ def _get_exc_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
         ngrids_local = grid_end - grid_start
         log.debug(f"{ngrids_local} grids on Device {device_id}")
 
+        # LC-22: opt-in larger grid blocks for the gradient XC loops (same
+        # knob and guard as the SCF side, dft.numint LC-11).  Probe
+        # (2026-10-06-lc21-grad-blocksize): whole-gradient 1.14-1.34x at
+        # 16384 on the four-method cells, dg <= 3e-13 Eh/Bohr.
+        loop_blksize = numint._effective_scf_blksize(
+            numint._scf_grid_blksize(), grid_start, grid_end, ngrids_glob)
+
         # The gradient's grid contractions are the same shape as the energy's
         # and cancel just as little, so float32 is safe here too; exc1_ao and
         # the density matrix stay float64. See dft.numint._nr_rks_task.
@@ -171,9 +178,10 @@ def _get_exc_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
         dm_mask_buf = cupy.empty(nao*nao)
         if xctype == 'LDA':
             ao_deriv = 1
-            aow_buf = cupy.empty(MIN_BLK_SIZE * max(nao, 1*nocc))
+            aow_buf = cupy.empty(loop_blksize * max(nao, 1*nocc))
             for ao_mask, idx, weight, _ in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, None,
-                                                         grid_range=(grid_start, grid_end)):
+                                                         grid_range=(grid_start, grid_end),
+                                                         loop_blksize=loop_blksize):
                 mo_coeff_mask = cupy.take(mo_coeff, idx, axis=0, out=mo_buf[:len(idx)])
                 if fp32_grid:
                     ao_mask = ao_mask.astype(cupy.float32)
@@ -188,9 +196,10 @@ def _get_exc_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
         elif xctype == 'GGA':
 
             ao_deriv = 2
-            aow_buf = cupy.empty(MIN_BLK_SIZE * max(nao * 3, 2*nocc, 4))
+            aow_buf = cupy.empty(loop_blksize * max(nao * 3, 2*nocc, 4))
             for ao_mask, idx, weight, _ in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, None,
-                                                         grid_range=(grid_start, grid_end)):
+                                                         grid_range=(grid_start, grid_end),
+                                                         loop_blksize=loop_blksize):
                 mo_coeff_mask = cupy.take(mo_coeff, idx, axis=0, out=mo_buf[:len(idx)])
                 if fp32_grid:
                     ao_mask = ao_mask.astype(cupy.float32)
@@ -208,9 +217,10 @@ def _get_exc_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
 
         elif xctype == 'MGGA':
             ao_deriv = 2
-            aow_buf = cupy.empty(MIN_BLK_SIZE * max(nao * 3, 2*nocc, 5))
+            aow_buf = cupy.empty(loop_blksize * max(nao * 3, 2*nocc, 5))
             for ao_mask, idx, weight, _ in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, None,
-                                                         grid_range=(grid_start, grid_end)):
+                                                         grid_range=(grid_start, grid_end),
+                                                         loop_blksize=loop_blksize):
                 mo_coeff_mask = cupy.take(mo_coeff, idx, axis=0, out=mo_buf[:len(idx)])
                 if fp32_grid:
                     ao_mask = ao_mask.astype(cupy.float32)
@@ -296,10 +306,17 @@ def get_nlc_exc(ni, mol, grids, xc_code, dms, relativity=0, hermi=1,
         raise NotImplementedError('Additive NLC')
     nlc_pars, fac = nlc_coefs[0]
 
+    # LC-22: opt-in larger grid blocks (same knob as LC-11/LC-21); the rho
+    # pieces are hstacked to the full grid before _vv10nlc, so the two
+    # loops only need CONSISTENT partitions, which loop_blksize gives.
+    ngrids = grids.coords.shape[0]
+    loop_blksize = numint._effective_scf_blksize(
+        numint._scf_grid_blksize(), 0, ngrids, ngrids)
     ao_deriv = 1
     vvrho = []
     for ao_mask, mask, weight, coords \
-            in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, max_memory=max_memory):
+            in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, max_memory=max_memory,
+                             loop_blksize=loop_blksize):
         if nset == 1:
             mo_coeff_mask = mo_coeff[mask]
             rho = numint.eval_rho2(_sorted_mol, ao_mask[:4], mo_coeff_mask, mo_occ, None, xctype, with_lapl=False)
@@ -317,13 +334,26 @@ def get_nlc_exc(ni, mol, grids, xc_code, dms, relativity=0, hermi=1,
     vv_vxc = xc_deriv.transform_vxc(rho, vxc, 'GGA', spin=0)
 
     ao_deriv = 2
+    # LC-88: the grid contractions in this loop carry no cancellation
+    # (same shape as the main-XC gradient's, whose fp32_grid discipline is
+    # inherited upstream), so they follow the same precision mode: in fp32
+    # the AO is cast once per block and _gga_grad_sum_'s _d1_dot_ GEMMs run
+    # in the operands' dtype; the einsum against the float64 dm_mask and
+    # the exc1 accumulator stay float64.  Before LC-88 this loop was the
+    # only grid-contraction surface without the cast (measured in LC-87:
+    # nlc_gga_grad_sum ran fp64 on BOTH lanes = 16.5% of the auto-lane
+    # t_grad while the main-XC gga_grad_sum ran 4.6x faster on auto).
+    fp32_grid = precision.get_precision() == 'fp32'
     exc1 = cupy.zeros((nao,3))
     p1 = 0
     for ao_mask, mask, weight, coords \
-            in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, max_memory):
+            in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, max_memory,
+                             loop_blksize=loop_blksize):
         p0, p1 = p1, p1 + weight.size
         wv = vv_vxc[:,p0:p1] * weight
         wv[0] *= .5  # *.5 because vmat + vmat.T at the end
+        if fp32_grid:
+            ao_mask = ao_mask.astype(cupy.float32)
         vmat_tmp = _gga_grad_sum_(ao_mask, wv)
         #add_sparse(vmat, vmat_tmp, mask)
         dm_mask = dm[mask[:,None],mask]
