@@ -655,8 +655,13 @@ class Grids(lib.StreamObject):
         self._non0ao_idx = None
         return self
 
-    def _build_non0ao_idx_cache(self, opt=None):
-        '''cache ao indices'''
+    def _build_non0ao_idx_cache(self, opt=None, blksize=None):
+        '''cache ao indices
+
+        blksize keys the cache: entries built for different block
+        partitions of the same grid are not interchangeable, so callers
+        pass the loop block size (multiple of numint.MIN_BLK_SIZE).
+        '''
         from gpu4pyscf.dft import numint
         if opt is None:
             opt = numint._GDFTOpt.from_mol(self.mol)
@@ -672,7 +677,8 @@ class Grids(lib.StreamObject):
         nbas = len(ao_loc) - 1
         ngrids = self.size
         cutoff = numint.AO_THRESHOLD
-        block_size = numint.MIN_BLK_SIZE
+        block_size = numint.MIN_BLK_SIZE if blksize is None else blksize
+        assert block_size % numint.MIN_BLK_SIZE == 0
         nblocks = (ngrids + block_size - 1) // block_size
         non0shl_mask = cp.zeros((nblocks, nbas), dtype=np.int8)
         coords = cp.asarray(self.coords, order='F')
@@ -732,14 +738,20 @@ class Grids(lib.StreamObject):
         t1 = log.timer_debug2('init ao sparsity', *t1)
         return non0ao_idx
 
-    def get_non0ao_idx(self, opt=None):
+    def get_non0ao_idx(self, opt=None, blksize=None):
         if self._non0ao_idx is None:
-            self._non0ao_idx = self._build_non0ao_idx_cache(opt)
+            self._non0ao_idx = {}
+        from gpu4pyscf.dft import numint
+        cache_key = numint.MIN_BLK_SIZE if blksize is None else blksize
+        entry = self._non0ao_idx.get(cache_key)
+        if entry is None:
+            entry = self._build_non0ao_idx_cache(opt, blksize=blksize)
+            self._non0ao_idx[cache_key] = entry
 
         ((idx, idx_sections),
          (non0shl_idx, non0shl_idx_sections),
          ctr_offsets_slice,
-         (ao_loc_slice, ao_loc_slice_sections)) = self._non0ao_idx
+         (ao_loc_slice, ao_loc_slice_sections)) = entry
         idx = cp.split(asarray(idx, dtype=np.int32), idx_sections)
         non0shl_idx = cp.split(asarray(non0shl_idx, dtype=np.int32), non0shl_idx_sections)
         ao_loc_slice = cp.split(asarray(ao_loc_slice, dtype=np.int32), ao_loc_slice_sections)
