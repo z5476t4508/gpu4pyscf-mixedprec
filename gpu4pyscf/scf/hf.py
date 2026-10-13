@@ -239,16 +239,49 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
     #   'auto'  - early iterations in fp32; once the energy change drops
     #             below _PRECISION_SWITCH_TOL, switch to fp64 for the tail
     #             iterations and the final energy (restores full accuracy).
+    #   'auto+verify' - the auto policy plus the opt-in UKS solution-
+    #             stability verification (gpu4pyscf.scf.stability_verify):
+    #             after the SCF converges, one strict-fp64 reference SCF
+    #             from the same init guess is run; if the two trajectories
+    #             converge to different densities, a bounded fp64
+    #             refinement from the auto density decides whether that is
+    #             an fp32 fixed-point displacement (same solution; the
+    #             stationary point is adopted) or a genuine branch split
+    #             (the lower stationary solution is kept; see
+    #             stability_verify's docstring for the measured motivation).
+    #   'auto+strict' - the auto policy plus the strict fp64-reference
+    #             matching route (stability_verify.verify_reference_match,
+    #             LC-76): the fp64-lane solution is returned (reference
+    #             adopted unconditionally on a distinct result) or the
+    #             route fails closed with the exact reason -- the contract
+    #             is matching the identical-settings FP64 trajectory, not
+    #             selecting the lower stationary solution.
     _mode = getattr(mf, 'precision_mode', None)
-    if _mode is not None and _mode not in ('fp64', 'fp32', 'auto'):
+    if _mode is not None and _mode not in ('fp64', 'fp32', 'auto',
+                                           'auto+verify', 'auto+strict'):
         raise ValueError(
-            f"precision_mode must be None, 'fp64', 'fp32' or 'auto', got {_mode!r}")
+            f"precision_mode must be None, 'fp64', 'fp32', 'auto', "
+            f"'auto+verify' or 'auto+strict', got {_mode!r}")
     _precision_saved = precision.get_precision()
-    if _mode in ('auto', 'fp32'):
+    if _mode in ('auto', 'auto+verify', 'auto+strict', 'fp32'):
         precision.set_precision('fp32')
     else:
         precision.set_precision('fp64')
-    _mixed_auto = _mode == 'auto'
+    _mixed_auto = _mode in ('auto', 'auto+verify', 'auto+strict')
+    # LC-105: the opt-in GPU4PYSCF_SCF_VMAT_F32 knob runs the XC vmat
+    # grid contractions in fp32 on PURE-fp64 lanes only.  The auto
+    # family's fp64 tail resolves get_precision()=='fp64' but must stay
+    # bitwise fp64 (measured e_tot shift 3.5e-11 when the cast is
+    # ungated, 2026-10-13-lc105 part 3), and stability_verify's strict
+    # fp64-reference siblings (marked _strict_fp64_reference) must never
+    # feel the knob.  Outside an SCF kernel the lane flag stays False:
+    # standalone nr_rks/nr_uks contractions are unchanged.
+    from gpu4pyscf.dft import numint as _numint_mod
+    _vmat_f32_saved = _numint_mod._scf_vmat_f32_lane
+    _numint_mod._scf_vmat_f32_lane = (
+        _numint_mod._scf_vmat_f32()
+        and not _mixed_auto
+        and not getattr(mf, '_strict_fp64_reference', False))
     try:
         return _kernel_body(mf, conv_tol, conv_tol_grad, dump_chk, dm0, callback,
                             conv_check, _mixed_auto, log, t0, t1, **kwargs)
@@ -256,6 +289,7 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         # the policy above mutates process-global state; leaving it set would
         # silently contaminate the next calculation if this one raised
         precision.set_precision(_precision_saved)
+        _numint_mod._scf_vmat_f32_lane = _vmat_f32_saved
 
 
 def _kernel_body(mf, conv_tol, conv_tol_grad, dump_chk, dm0, callback,
@@ -456,6 +490,32 @@ def scf(mf, dm0=None, **kwargs):
         mf.e_tot = _kernel(mf, mf.conv_tol, mf.conv_tol_grad,
                             dm0=dm0, callback=mf.callback,
                             conv_check=mf.conv_check, **kwargs)[1]
+
+    # opt-in solution-stability verification (precision_mode='auto+verify'):
+    # one strict-fp64 reference SCF from the same init guess; keeps the
+    # lower converged solution when the auto policy landed on a different
+    # branch (near-degenerate UKS stationary pairs).  Default policies
+    # never enter this branch.
+    if getattr(mf, 'precision_mode', None) == 'auto+verify':
+        if mf.converged:
+            from gpu4pyscf.scf import stability_verify
+            stability_verify.verify_solution_stability(mf)
+        else:
+            mf.scf_summary['stability_verification'] = {
+                'policy': 'auto+verify',
+                'skipped': 'main SCF did not converge',
+            }
+    elif getattr(mf, 'precision_mode', None) == 'auto+strict':
+        # strict fp64-reference matching (LC-76): the fp64-lane solution
+        # or fail-closed -- see stability_verify.verify_reference_match
+        if mf.converged:
+            from gpu4pyscf.scf import stability_verify
+            stability_verify.verify_reference_match(mf)
+        else:
+            mf.scf_summary['stability_verification'] = {
+                'policy': 'auto+strict',
+                'skipped': 'main SCF did not converge',
+            }
 
     logger.timer(mf, 'SCF', *cput0)
     mf._finalize()
@@ -787,8 +847,12 @@ class SCF(pyscf_lib.StreamObject):
 
     # Mixed-precision policy for the SCF iterations. None/'fp64' runs
     # everything in float64; 'fp32' runs every iteration with float32
-    # contractions; 'auto' starts in float32 and finishes in float64. See
-    # gpu4pyscf.lib.precision.
+    # contractions; 'auto' starts in float32 and finishes in float64;
+    # 'auto+verify' additionally runs the opt-in UKS solution-stability
+    # verification pass after convergence (see
+    # gpu4pyscf.scf.stability_verify); 'auto+strict' runs the strict
+    # fp64-reference matching route (the fp64-lane solution or fail
+    # closed; stability_verify.verify_reference_match).
     precision_mode = None
 
     # Adaptive SCF convergence threshold for geometry optimization: 'auto'
