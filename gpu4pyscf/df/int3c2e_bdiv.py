@@ -35,8 +35,8 @@ from gpu4pyscf.lib import multi_gpu
 from gpu4pyscf.gto.mole import (
     PTR_BAS_COORD, SortedMole, RysIntEnvVars, extract_pgto_params, groupby)
 from gpu4pyscf.scf.jk import (
-    _nearest_power2, _scale_sp_ctr_coeff, _cache_q_cond_and_non0pairs,
-    _check_rsh_factors, SHM_SIZE, libvhf_rys)
+    _nearest_power2, _scale_sp_ctr_coeff, _check_rsh_factors, SHM_SIZE,
+    libvhf_rys)
 from gpu4pyscf.__config__ import props as gpu_specs
 
 __all__ = [
@@ -114,6 +114,154 @@ def contract_int3c2e_auxvec(mol, auxmol, auxvec, sort_output=True,
         vj = int3c2e_opt.mol.apply_CT_mat_C(vj)
     return vj
 
+def _sort_pair_ij_order(ish0, nish, jsh0, njsh, nbas, tile=4):
+    '''Host reproduction of PBCsort_pair_ij's enumeration order
+    (lib/pbc/supmol_sr_estimator.cu: sort_pair_ij_kernel).  Returns
+    ish*nbas+jsh as int64 in the exact order the device kernel writes,
+    including partial i/j tiles; the tiled order is preserved so the
+    q-cond estimator input array stays bit-identical to the reference
+    assembly path.
+    '''
+    parts = []
+    for i_tile in range((nish + tile - 1) // tile):
+        nish_rem = min(tile, nish - i_tile * tile)
+        for j_tile in range((njsh + tile - 1) // tile):
+            njsh_rem = njsh - j_tile * tile
+            if njsh_rem >= tile:
+                seg = np.arange(nish_rem * tile)
+                ir, jr = seg // tile, seg - seg // tile * tile
+            else:
+                seg = np.arange(nish_rem * njsh_rem)
+                ir, jr = seg // njsh_rem, seg - seg // njsh_rem * njsh_rem
+            i = ish0 + i_tile * tile + ir
+            j = jsh0 + j_tile * tile + jr
+            parts.append(i.astype(np.int64) * nbas + j)
+    if not parts:
+        return np.empty(0, dtype=np.int64)
+    return np.concatenate(parts)
+
+def _screen_bas_pairs_qcond(mol, rys_envs, precision=1e-14, tile=4, tril=True):
+    '''Screened shell-pair lists for Int3c2eOpt.build: returns
+    {group_key: uint32 pair array} equivalent to
+    {k: v[0] for k, v in _cache_q_cond_and_non0pairs(...).items()}.
+
+    Int3c2eOpt.build re-sorts the pairs (cp.sort) and discards the
+    q-cond values, so the descending-q ordering _group_by_split_points
+    computes for the JK screening engines is wasted work here (measured
+    2026-10-06: 41-73 ms of a 60-102 ms build on consumer cells).  This
+    path keeps only the screening decision:
+
+    * pair assembly runs host-side in PBCsort_pair_ij's tiled order
+      (bit-identical input to the estimator kernel);
+    * the SAME int2e_qcond_estimator kernel is called with the same
+      scheme/omega factors as the reference;
+    * the keep predicate q_cond > log(precision) is exactly the
+      bin >= 1 subset _group_by_split_points retains
+      (cp.searchsorted(split_points, q, side='left') >= 1
+      <=> q > split_points[0] = log(precision)).
+
+    The result is the identical SET of surviving pairs per group; build
+    then sorts, so the cached arrays are bit-identical to the reference
+    path.
+    '''
+    from gpu4pyscf.pbc.gto import int1e
+    omega = mol.omega
+    ls = np.arange(LMAX+1)
+    li = ls[:,None]
+    lj = ls
+    lij = li + lj
+    nfi = (li + 1) * (li + 2) // 2
+    nfj = (lj + 1) * (lj + 2) // 2
+    nroots = lij + 1
+    if omega < 0:
+        nroots *= 2
+
+    SIZEOF_FLOAT = ctypes.sizeof(ctypes.c_float)
+    gout_width = 29
+    unit = (li+1)*(lj+1)*2 + (li+1)*(lj+1)*(lij+1) + 6 + nroots*2
+    shm_size = 1024 * 48 - 1024
+    nsp_max = _nearest_power2(shm_size // (unit*SIZEOF_FLOAT))
+    gout_size = nfi * nfj
+    gout_stride = (gout_size+gout_width-1) // gout_width
+    gout_stride = _nearest_power2(gout_stride, return_leq=False)
+    nsp_per_block = THREADS // gout_stride
+    nsp_per_block = np.where(nsp_per_block < nsp_max, nsp_per_block, nsp_max)
+    gout_stride = THREADS // nsp_per_block
+    gout_stride_dev = cp.asarray(gout_stride, dtype=np.int32)
+    shm_size = nsp_per_block * (unit*SIZEOF_FLOAT)
+    # (pp|pp) requires more shm than this estimation. 5888 is the required size
+    max_shm_size = max(shm_size.max(), 5888*SIZEOF_FLOAT)
+
+    l_ctr_offsets = np.append(0, np.cumsum(mol.l_ctr_counts))
+    nbas = mol.nbas
+    uniq_l = mol.uniq_l_ctr[:,0]
+    n_groups = np.count_nonzero(uniq_l <= LMAX)
+    if tril:
+        pair_keys = [(i, j) for i in range(n_groups) for j in range(i+1)]
+    else:
+        pair_keys = [(i, j) for i in range(n_groups) for j in range(n_groups)]
+
+    ovlp_mask = int1e._shell_overlap_mask(mol, precision=precision**2)
+    if tril:
+        ovlp_mask = cp.tril(ovlp_mask)
+    ovlp_mask = cp.asnumpy(ovlp_mask.ravel())
+
+    # Host-side pair assembly in the device kernel's tiled order; integer
+    # indices only, so the values are bit-identical to the elementwise
+    # device assembly.
+    parts = []
+    for i, j in pair_keys:
+        ish0, ish1 = l_ctr_offsets[i], l_ctr_offsets[i+1]
+        jsh0, jsh1 = l_ctr_offsets[j], l_ctr_offsets[j+1]
+        pij = _sort_pair_ij_order(ish0, ish1-ish0, jsh0, jsh1-jsh0, nbas, tile)
+        parts.append(pij[ovlp_mask[pij]])
+    if parts:
+        all_pairs = cp.asarray(np.concatenate(parts), dtype=np.uint32)
+    else:
+        all_pairs = cp.empty(0, dtype=np.uint32)
+    offsets = np.append(0, np.cumsum([len(p) for p in parts]))
+
+    q_out = None
+    if len(all_pairs) > 0:
+        shl_pair_offsets = []
+        sp0 = sp1 = 0
+        for (i, j), part in zip(pair_keys, parts):
+            sp0, sp1 = sp1, sp1 + len(part)
+            nspb = THREADS // int(gout_stride[uniq_l[i], uniq_l[j]]) * 8
+            shl_pair_offsets.append(np.arange(sp0, sp1, nspb, dtype=np.int32))
+        shl_pair_offsets.append(np.int32(sp1))
+        shl_pair_offsets = cp.asarray(np.hstack(shl_pair_offsets), dtype=np.int32)
+
+        lr_factor = sr_factor = 1
+        if omega < 0:
+            lr_factor = 0
+        if omega > 0:
+            sr_factor = 0
+        q_out = cp.empty(len(all_pairs), dtype=np.float32)
+        libvhf_rys.int2e_qcond_estimator.restype = ctypes.c_int
+        err = libvhf_rys.int2e_qcond_estimator(
+            ctypes.cast(q_out.data.ptr, ctypes.c_void_p),
+            ctypes.byref(rys_envs),
+            ctypes.c_int(max_shm_size),
+            ctypes.c_int(len(shl_pair_offsets) - 1),
+            ctypes.cast(all_pairs.data.ptr, ctypes.c_void_p),
+            ctypes.cast(shl_pair_offsets.data.ptr, ctypes.c_void_p),
+            ctypes.cast(gout_stride_dev.data.ptr, ctypes.c_void_p),
+            ctypes.c_double(omega),
+            ctypes.c_double(lr_factor),
+            ctypes.c_double(sr_factor))
+        if err != 0:
+            raise RuntimeError('int2e_qcond_estimator kernel failed')
+
+    threshold = math.log(precision)
+    bas_ij_cache = {}
+    for k, key in enumerate(pair_keys):
+        seg = all_pairs[offsets[k]:offsets[k+1]]
+        if q_out is not None and len(seg) > 0:
+            seg = seg[q_out[offsets[k]:offsets[k+1]] > threshold]
+        bas_ij_cache[key] = seg
+    return bas_ij_cache
+
 class Int3c2eOpt:
     def __init__(self, mol, auxmol):
         self.mol = mol
@@ -136,10 +284,10 @@ class Int3c2eOpt:
         self._int3c2e_envs = RysIntEnvVars.new(
             mol.natm, mol.nbas, _atm, _bas, _env, ao_loc)
 
-        bas_pair_cache = _cache_q_cond_and_non0pairs(
+        bas_pair_cache = _screen_bas_pairs_qcond(
             mol, self._int3c2e_envs, cutoff, tril=tril)
         self.bas_ij_cache = {
-            k: cp.sort(v[0]) for k, v in mol.iter_pair_by_l(bas_pair_cache)}
+            k: cp.sort(v) for k, v in mol.iter_pair_by_l(bas_pair_cache)}
         return self
 
     @property
