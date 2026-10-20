@@ -24,7 +24,9 @@ Reference for Lebedev-Laikov grid:
 '''
 
 
+import os
 import sys
+import warnings
 import ctypes
 import numpy
 import numpy as np
@@ -199,6 +201,121 @@ def get_C_interface_scheme_id(becke_scheme):
         return 101
     else:
         raise ValueError(f"becke_scheme = {becke_scheme} not recognized")
+
+# Relative inertia-eigenvalue gap below which the principal frame is treated
+# as ill-defined and the molecular-frame knob falls back to lab-frame grids.
+_MOLFRAME_DEGENERACY_TOL = 1e-6
+
+# Relative magnitude of the in-plane 4th complex moment below which it is
+# treated as isotropic by the symmetric-top tie-breaker (same class as the
+# eigenvalue tolerance above).
+_MOLFRAME_SYMTOP_TOL = 1e-6
+
+def _symtop_inplane_axes(p, masses, u):
+    '''Covariant in-plane axes (v1, v2) for a symmetric top whose unique
+    inertia axis is the unit eigenvector u (rows v1, v2 of the frame, with
+    v2 = u x v1 so the frame is right-handed).
+
+    The in-plane second moments are isotropic by the degeneracy itself, so
+    the axes are resolved by the 4th complex moment
+    mu_4 = sum_i m_i (p_i . e1 + i p_i . e2)^4 over an arbitrary in-plane
+    working basis (e1, e2).  Under a rigid rotation |mu_4| is invariant and
+    arg(mu_4) shifts by 4 times the in-plane rotation component, so
+    v1 = cos(arg(mu_4)/4) e1 + sin(arg(mu_4)/4) e2 is covariant regardless
+    of the working-basis choice.  Returns (None, None, None) when |mu_4| is
+    too small (3-fold/5-fold/6-fold symmetric tops, linear molecules).
+
+    Only the 4-fold class is resolved, because its whole ambiguity class
+    {2*pi*m/4} lies inside the 48 signed permutations to which the Lebedev
+    tables are invariant: the selection is covariant at the grid-set level
+    for EVERY rotation.  The 3/5/6-fold classes are provably unresolvable by
+    any deterministic rule: the geometry's C_k symmetry makes the in-plane
+    angle observable only modulo 2*pi/k, while the branch-selection
+    discrepancy accumulates the rotation's winding in 2*pi/k units, giving
+    an exactly-covariant frame with probability 1/3 (k=3, 6) or 1/5 (k=5)
+    over uniform rotations, independent of the rule; those classes keep
+    the lab-frame fallback.  Row order and axis signs are benign for the
+    same reason (table symmetry under the 48 signed permutations).'''
+    # working basis: any completion of u; the 4-fold phase cancels its choice
+    j = int(numpy.argmin(abs(u)))
+    a = numpy.zeros(3)
+    a[j] = 1.0
+    e1 = a - numpy.dot(a, u) * u
+    e1 /= numpy.linalg.norm(e1)
+    e2 = numpy.cross(u, e1)
+    z = p @ e1 + 1j * p @ e2
+    norm = float(masses @ (abs(z) ** 4))
+    if norm <= 0:
+        return None, None
+    mu = masses @ (z ** 4)
+    if abs(mu) <= _MOLFRAME_SYMTOP_TOL * norm:
+        return None, None
+    phi = numpy.angle(mu) / 4
+    v1 = numpy.cos(phi) * e1 + numpy.sin(phi) * e2
+    return v1, numpy.cross(u, v1)
+
+def _principal_frame(mol):
+    '''Right-handed frame A (rows = inertia principal axes in lab
+    coordinates) for the molecular-frame grid scheme.  Returns None when no
+    covariant frame is available; spherical tops, linear molecules and
+    3/5/6-fold symmetric tops are in that class (the last provably so, see
+    _symtop_inplane_axes).  4-fold-resolvable symmetric tops (exactly one
+    degenerate inertia pair with a non-isotropic in-plane 4th moment:
+    D2d/D4h/C4v and accidental near-degeneracies) are resolved by the
+    tie-breaker.'''
+    coords = numpy.asarray(mol.atom_coords(), dtype=float)
+    masses = numpy.asarray(mol.atom_mass_list(), dtype=float)
+    if masses.sum() <= 0:
+        return None
+    com = numpy.einsum('i,ij->j', masses, coords) / masses.sum()
+    p = coords - com
+    # gyration tensor G = sum_i m_i p_i p_i^T; inertia = tr(G)*I - G
+    gyt = numpy.einsum('i,ij,ik->jk', masses, p, p)
+    inertia = numpy.trace(gyt) * numpy.eye(3) - gyt
+    scale = abs(inertia).max()
+    if scale <= 0:
+        return None
+    evals, evecs = numpy.linalg.eigh(inertia)
+    degenerate = numpy.diff(evals) <= _MOLFRAME_DEGENERACY_TOL * scale
+    if not degenerate.any():
+        # asymmetric top.  Any deterministic sign convention is fine: a
+        # discrepancy between the frames of a geometry and its rotated copy
+        # is a signed permutation, and the Lebedev-Laikov (node, weight)
+        # tables are invariant under all 48 signed permutations
+        # (tests/test_molframe_grids.py), so the placed grid set is
+        # unaffected.
+        for k in range(3):
+            i = numpy.argmax(abs(evecs[:, k]))
+            if evecs[i, k] < 0:
+                evecs[:, k] = -evecs[:, k]
+        if numpy.linalg.det(evecs) < 0:
+            evecs[:, 2] = -evecs[:, 2]
+        return evecs.T.copy()
+    if degenerate.all():
+        # spherical top: no unique axis at all
+        return None
+    # symmetric top: the eigenvalue separated from the degenerate pair has a
+    # well-defined covariant eigenvector (its separation exceeds the
+    # degeneracy tolerance by construction)
+    iu = 0 if degenerate[1] else 2
+    u = evecs[:, iu]
+    v1, v2 = _symtop_inplane_axes(p, masses, u)
+    if v1 is None:
+        return None
+    return numpy.vstack([v1, v2, u])
+
+def _molframe_enabled():
+    '''Opt-in GPU4PYSCF_GRID_MOLFRAME=1: generate the per-atom angular tables
+    in the molecule's inertia-principal frame instead of the lab frame, which
+    makes the weighted grid set rigid-rotation covariant (energies invariant
+    under rigid rotations to floating-point noise).  Near-degenerate inertia
+    tensors fall back to the standard lab-frame grids with a warning.'''
+    raw = os.environ.get('GPU4PYSCF_GRID_MOLFRAME', '')
+    if raw == '1':
+        return True
+    if raw:
+        warnings.warn(f'GPU4PYSCF_GRID_MOLFRAME={raw!r} ignored; expected 1')
+    return False
 
 def gen_atomic_grids(mol, atom_grid={}, radi_method=radi.gauss_chebyshev,
                      level=3, prune=nwchem_prune, **kwargs):
@@ -480,6 +597,19 @@ class Grids(lib.StreamObject):
         t0 = log.init_timer()
         atom_grids_tab = self.gen_atomic_grids(
             mol, self.atom_grid, self.radi_method, self.level, self.prune, **kwargs)
+        self._molframe_applied = None
+        if _molframe_enabled():
+            frame = _principal_frame(mol)
+            if frame is None:
+                logger.warn(mol, 'GPU4PYSCF_GRID_MOLFRAME ignored: '
+                            'no covariant principal frame (spherical top, '
+                            'linear molecule or unresolved in-plane moments); '
+                            'building lab-frame grids')
+            else:
+                frame_gpu = cupy.asarray(frame)
+                atom_grids_tab = {symb: (r @ frame_gpu, vol)
+                                  for symb, (r, vol) in atom_grids_tab.items()}
+                self._molframe_applied = frame
         self.coords, self.weights = self.get_partition(
             mol, atom_grids_tab, self.radii_adjust, self.atomic_radii, self.becke_scheme)
 
@@ -600,6 +730,7 @@ class Grids(lib.StreamObject):
         self.non0tab = None
         self.screen_index = None
         self._non0ao_idx = None
+        self._molframe_applied = None
         return self
 
     gen_atomic_grids = lib.module_method(
@@ -655,8 +786,13 @@ class Grids(lib.StreamObject):
         self._non0ao_idx = None
         return self
 
-    def _build_non0ao_idx_cache(self, opt=None):
-        '''cache ao indices'''
+    def _build_non0ao_idx_cache(self, opt=None, blksize=None):
+        '''cache ao indices
+
+        blksize keys the cache: entries built for different block
+        partitions of the same grid are not interchangeable, so callers
+        pass the loop block size (multiple of numint.MIN_BLK_SIZE).
+        '''
         from gpu4pyscf.dft import numint
         if opt is None:
             opt = numint._GDFTOpt.from_mol(self.mol)
@@ -672,7 +808,8 @@ class Grids(lib.StreamObject):
         nbas = len(ao_loc) - 1
         ngrids = self.size
         cutoff = numint.AO_THRESHOLD
-        block_size = numint.MIN_BLK_SIZE
+        block_size = numint.MIN_BLK_SIZE if blksize is None else blksize
+        assert block_size % numint.MIN_BLK_SIZE == 0
         nblocks = (ngrids + block_size - 1) // block_size
         non0shl_mask = cp.zeros((nblocks, nbas), dtype=np.int8)
         coords = cp.asarray(self.coords, order='F')
@@ -732,14 +869,20 @@ class Grids(lib.StreamObject):
         t1 = log.timer_debug2('init ao sparsity', *t1)
         return non0ao_idx
 
-    def get_non0ao_idx(self, opt=None):
+    def get_non0ao_idx(self, opt=None, blksize=None):
         if self._non0ao_idx is None:
-            self._non0ao_idx = self._build_non0ao_idx_cache(opt)
+            self._non0ao_idx = {}
+        from gpu4pyscf.dft import numint
+        cache_key = numint.MIN_BLK_SIZE if blksize is None else blksize
+        entry = self._non0ao_idx.get(cache_key)
+        if entry is None:
+            entry = self._build_non0ao_idx_cache(opt, blksize=blksize)
+            self._non0ao_idx[cache_key] = entry
 
         ((idx, idx_sections),
          (non0shl_idx, non0shl_idx_sections),
          ctr_offsets_slice,
-         (ao_loc_slice, ao_loc_slice_sections)) = self._non0ao_idx
+         (ao_loc_slice, ao_loc_slice_sections)) = entry
         idx = cp.split(asarray(idx, dtype=np.int32), idx_sections)
         non0shl_idx = cp.split(asarray(non0shl_idx, dtype=np.int32), non0shl_idx_sections)
         ao_loc_slice = cp.split(asarray(ao_loc_slice, dtype=np.int32), ao_loc_slice_sections)
