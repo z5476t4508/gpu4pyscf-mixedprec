@@ -988,17 +988,34 @@ class SortedMole(Mole, SortedGTO):
             ij_tasks = [(i, j) for i in range(groups) for j in range(i+1)]
         else:
             ij_tasks = [(i, j) for i in range(groups) for j in range(groups)]
+        # Select all pair indices on the host with ONE device transfer.
+        # The per-(i,j) loop below used to run arange/add/fancy-index as
+        # ~5 tiny cupy kernels per group pair; at consumer sizes that host
+        # loop dominated (measured 2026-10-06: 13-22 ms of a 16-28 ms
+        # _Int1eOpt build, ~150 kernel launches at 27 us each, while the
+        # selection itself is <1 ms of device work). Integer indices only,
+        # so the values are bit-identical to the elementwise-GPU assembly.
+        if not isinstance(mask, np.ndarray):
+            mask = cp.asnumpy(mask)
+        pair_idx = np.arange(nbas, dtype=np.int32)[:,None] * nbas \
+                 + np.arange(nbas, dtype=np.int32)
+        parts = []
         for i, j in ij_tasks:
             ish0, ish1 = l_ctr_offsets[i], l_ctr_offsets[i+1]
             jsh0, jsh1 = l_ctr_offsets[j], l_ctr_offsets[j+1]
-            t_ij = (cp.arange(ish0, ish1, dtype=np.int32)[:,None] * nbas +
-                    cp.arange(jsh0, jsh1, dtype=np.int32))
+            sub_mask = mask[ish0:ish1,jsh0:jsh1]
             if hermi == 1 and i == j:
-                sub_mask = mask[ish0:ish1,jsh0:jsh1].copy()
-                sub_mask = cp.tril(sub_mask)
-            else:
-                sub_mask = mask[ish0:ish1,jsh0:jsh1]
-            bas_ij_cache[i,j] = t_ij[sub_mask]
+                sub_mask = np.tril(sub_mask)
+            parts.append(pair_idx[ish0:ish1,jsh0:jsh1][sub_mask])
+        if parts:
+            all_pairs = cp.asarray(np.concatenate(parts), dtype=np.int32)
+        else:
+            all_pairs = cp.empty(0, dtype=np.int32)
+        p0 = 0
+        for (i, j), part in zip(ij_tasks, parts):
+            p1 = p0 + len(part)
+            bas_ij_cache[i,j] = all_pairs[p0:p1]
+            p0 = p1
         return bas_ij_cache
 
     def aggregate_shl_pairs(self, bas_ij_cache=None, nsp_per_block=512):
