@@ -110,6 +110,11 @@ class DF(lib.StreamObject):
             self._cderi, self._cderi_idx = _cholesky_eri(
                 intopt, omega=omega, lr_factor=lr_factor, sr_factor=sr_factor,
                 use_gpu_memory=self.use_gpu_memory)
+            n_canon = _canonicalize_duplicate_pair_columns(
+                self._cderi, self._cderi_idx[0], mol.nao)
+            if n_canon > 0:
+                log.debug1('canonicalized %d duplicate AO-pair cderi columns',
+                           n_canon)
             log.timer_debug1('cholesky_eri', *t0)
         return self
 
@@ -690,6 +695,54 @@ def _cholesky_eri(intopt, *, omega=None, lr_factor=None, sr_factor=None,
 
         cderi = multi_gpu.run(proc, non_blocking=True)
     return cderi, cderi_idx
+
+def _canonicalize_duplicate_pair_columns(cderi, pair_addresses, nao):
+    '''Bitwise-equalize the duplicate AO-pair columns of the CDERI.
+
+    pair_and_diag_indices enumerates the full AO rectangle inside diagonal
+    shell-pair blocks, so the CDERI stores both (i,j) and (j,i) columns for
+    the cross AO pairs of one shell. The two columns hold the same integrals
+    but reach their values through different cart2sph/solve contraction
+    orders, so they can differ at the last bits. fill_symmetric writes both
+    symmetric cells from every column; when the duplicate columns are not
+    bitwise equal, the racing stores make the unpacked CDERI (and the DF
+    exchange matrix) vary between launches. The J path is unaffected (the
+    duplicate pairs carry the diagonal-block dm_sparse halving). Copying the
+    first-occurrence column onto its duplicates restores the intended
+    bitwise (ij|P) == (ji|P) symmetry, which makes the racing writes
+    harmless and the DF exchange build deterministic.
+
+    Returns the number of overwritten duplicate columns.
+    '''
+    if isinstance(pair_addresses, cp.ndarray):
+        pair_np = cp.asnumpy(pair_addresses)
+    else:
+        pair_np = np.asarray(pair_addresses)
+    pair_np = pair_np.astype(np.int64, copy=False).ravel()
+    i, j = np.divmod(pair_np, nao)
+    key = np.minimum(i * nao + j, j * nao + i)
+    order = np.argsort(key, kind='stable')
+    keys = key[order]
+    bounds = np.flatnonzero(np.concatenate(([True], keys[1:] != keys[:-1],
+                                             [True])))
+    src_cols = []
+    dst_cols = []
+    for b0, b1 in zip(bounds[:-1], bounds[1:]):
+        if b1 - b0 > 1:
+            group = order[b0:b1]
+            src_cols.extend([group[0]] * (b1 - b0 - 1))
+            dst_cols.extend(group[1:].tolist())
+    if not dst_cols:
+        return 0
+    src_np = np.asarray(src_cols)
+    dst_np = np.asarray(dst_cols)
+    arrays = cderi.values() if isinstance(cderi, dict) else cderi
+    for arr in arrays:
+        if isinstance(arr, cp.ndarray):
+            arr[:, cp.asarray(dst_np)] = arr[:, cp.asarray(src_np)]
+        else:
+            arr[:, dst_np] = arr[:, src_np]
+    return len(dst_cols)
 
 def _decompose_j2c(auxmol, aux_sorting=None,
                    omega=None, lr_factor=None, sr_factor=None):
