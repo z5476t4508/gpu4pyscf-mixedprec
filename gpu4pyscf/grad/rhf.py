@@ -384,9 +384,12 @@ def get_grad_hcore(mf_grad, mo_coeff=None, mo_occ=None):
     # `work` below is batch_size x 3 x nao^2 fp64; a fixed batch of 32
     # allocates 27.6 GB at ~3370 AO (measured 2026-09-13, Azadirachtin
     # def2-qzvp) and OOMs. Cap it by available memory: at most ~1/8 of
-    # free VRAM, at least 1.
+    # free VRAM, at least 1. The factor 8 is the fp64 itemsize: without
+    # it the cap bounds the tensor to 100% of free VRAM instead of the
+    # documented 1/8 (found by the issue-#11 chunk audit, 2026-10-04;
+    # the original fix omitted the itemsize conversion).
     mem_avail = get_avail_mem(exclude_memory_pool=True)
-    batch_size = min(32, natm, max(1, int(mem_avail * .125) // (3 * nao1 * nao1)))
+    batch_size = min(32, natm, max(1, int(mem_avail * .125) // (3 * nao1 * nao1 * 8)))
     omega = 0.
     eval_ip1, _, aux_offsets = _int3c2e_ip1_evaluator(
         opt, int3c2e_scheme_ip1(omega, 27), batch_size, 'fill_int3c2e_ip1', omega)
@@ -593,11 +596,35 @@ class GradientsBase(lib.StreamObject):
         order of magnitude below geomeTRIC's 3e-4 convergence threshold, so
         it does not move where the optimiser stops.  Set precision_mode on
         the gradient object itself to override.
+
+        'auto+verify' (the UKS solution-stability policy,
+        gpu4pyscf.scf.stability_verify) carries the same meaning for the
+        gradient kernels: the verification pass resolves the *solution*
+        selection, not the kernel precision, so the gradient still runs
+        fp32 kernels.  'auto+strict' (the strict fp64-reference matching
+        route, stability_verify.verify_reference_match) likewise: it
+        selects the solution, the gradient kernels stay fp32 (override
+        with precision_mode on this gradient object).
         '''
         mode = self.precision_mode
         if mode is None:
             mode = getattr(self.base, 'precision_mode', None)
         if mode == 'auto':
+            mode = 'fp32'
+            # (SP-16) below _AUTO_HEAD_MIN_AO the plain-auto SCF is
+            # bitwise the fp64 lane (SP-14), and the fp32 gradient casts
+            # are measured non-winners there (SP-10: NLC piece 0.86-1.04
+            # vs a <=0.50 bar; SP-15: t_grad C/B 0.99-1.15, dg-vs-B up
+            # to 8.6e-7): resolve fp64 so the whole lane, gradient
+            # included, rides the exact fp64 path.  The verify/strict
+            # variants keep fp32 gradients -- their contracts select
+            # solutions, not kernel precision.
+            from gpu4pyscf.scf.hf import _AUTO_HEAD_MIN_AO
+            if self.mol.nao < _AUTO_HEAD_MIN_AO:
+                mode = 'fp64'
+        elif mode == 'auto+verify':
+            mode = 'fp32'
+        elif mode == 'auto+strict':
             mode = 'fp32'
         if mode is not None and mode not in ('fp64', 'fp32'):
             raise ValueError(
