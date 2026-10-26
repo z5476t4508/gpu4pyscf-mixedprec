@@ -19,17 +19,26 @@ from gpu4pyscf import dft
 from gpu4pyscf.lib import precision
 
 def setUpModule():
-    global mol_sph
+    global mol_sph, mol_uks
     mol_sph = pyscf.M(atom='''
 O       0.0000000000    -0.0000000000     0.1174000000
 H      -0.7570000000    -0.0000000000    -0.4696000000
-H       0.7570000000     0.0000000000    -0.4696000000''',
+H       0.7570000000    -0.0000000000    -0.4696000000''',
                       basis='def2-svp', output='/dev/null', verbose=1)
+    mol_uks = pyscf.M(atom='''
+C       0.0000000000     0.0000000000     0.1274000000
+O       0.0000000000     1.1000000000    -0.4600000000
+H       0.8700000000    -0.5500000000    -0.4600000000
+H      -0.8700000000    -0.5500000000    -0.4600000000''',
+                      basis='def2-svp', spin=1, charge=-1,
+                      output='/dev/null', verbose=1)
 
 def tearDownModule():
-    global mol_sph
+    global mol_sph, mol_uks
     mol_sph.stdout.close()
     del mol_sph
+    mol_uks.stdout.close()
+    del mol_uks
 
 class KnownValues(unittest.TestCase):
 
@@ -235,6 +244,72 @@ class KnownValues(unittest.TestCase):
         ref = g.kernel()
         with precision.fp32():
             got = g.kernel()
+        self.assertLess(float(np.abs(got - ref).max()), 1e-5)
+
+    def test_uks_hybrid_gradient_uses_the_fp32_kernel(self):
+        '''the unrestricted path (df/grad/uhf.py) used to hardcode the
+        float64 int3c2e_ip1 kernel, so a UKS hybrid gradient silently
+        ignored fp32 mode -- an 'auto' gradient then fell back to fp64
+        kernels without any signal'''
+        from gpu4pyscf.df.grad import uhf as df_uhf_grad
+        mf = dft.UKS(mol_uks, xc='b3lyp').density_fit()
+        mf.conv_tol = 1e-10
+        mf.kernel()
+        g = mf.nuc_grad_method()
+        g.auxbasis_response = True
+        ref = g.kernel()
+
+        seen = []
+        real_lib = df_uhf_grad.libvhf_rys
+        class Probe:
+            def __getattr__(self, name):
+                seen.append(name)
+                return getattr(real_lib, name)
+        df_uhf_grad.libvhf_rys = Probe()
+        try:
+            with precision.fp32():
+                got = g.kernel()
+        finally:
+            df_uhf_grad.libvhf_rys = real_lib
+        self.assertIn('sum_ejk_int3c2e_ip1_f32', seen)
+        self.assertNotIn('sum_ejk_int3c2e_ip1', seen)
+        # far under geomeTRIC's 3e-4 Eh/Bohr convergence threshold
+        self.assertLess(float(np.abs(got - ref).max()), 1e-5)
+
+    def test_uks_hybrid_auto_gradient_resolves_fp64_below_gate(self):
+        '''the production lane: below _AUTO_HEAD_MIN_AO (SP-16) an 'auto'
+        mean-field object resolves its gradient to the EXACT fp64
+        kernels (grad/rhf.py _resolve_precision) -- the fp32 gradient
+        casts are measured non-winners there (SP-10/SP-15); the fp32
+        kernel machinery itself stays covered by the explicit-fp32 test
+        above'''
+        from gpu4pyscf.df.grad import uhf as df_uhf_grad
+        mf = dft.UKS(mol_uks, xc='b3lyp').density_fit()
+        mf.conv_tol = 1e-10
+        mf.precision_mode = 'auto'
+        mf.kernel()
+        g = mf.nuc_grad_method()
+        g.auxbasis_response = True
+
+        seen = []
+        real_lib = df_uhf_grad.libvhf_rys
+        class Probe:
+            def __getattr__(self, name):
+                seen.append(name)
+                return getattr(real_lib, name)
+        df_uhf_grad.libvhf_rys = Probe()
+        try:
+            got = g.kernel()
+        finally:
+            df_uhf_grad.libvhf_rys = real_lib
+        self.assertIn('sum_ejk_int3c2e_ip1', seen)
+        self.assertNotIn('sum_ejk_int3c2e_ip1_f32', seen)
+        # reference: fp64 kernels on the SAME auto-converged SCF state
+        # (the same lane now -- delta is the reduction-order class)
+        g2 = mf.nuc_grad_method()
+        g2.auxbasis_response = True
+        g2.precision_mode = 'fp64'
+        ref = g2.kernel()
         self.assertLess(float(np.abs(got - ref).max()), 1e-5)
 
 if __name__ == '__main__':
