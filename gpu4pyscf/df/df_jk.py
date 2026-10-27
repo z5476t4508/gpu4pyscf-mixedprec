@@ -303,7 +303,7 @@ class _DFHF:
                     rks.initialize_grids(self, mol, dm[0]+dm[1])
                 n, exc, vxc = ni.nr_uks(mol, self.grids, self.xc, dm)
                 log.debug('nelec by numeric integration = %s', n)
-                if self.do_nlc():
+                if self.do_nlc() and not numint._scf_head_nlc_suppressed():
                     if ni.libxc.is_nlc(self.xc):
                         xc = self.xc
                     else:
@@ -336,7 +336,7 @@ class _DFHF:
                 rks.initialize_grids(self, mol, dm)
                 n, exc, vxc = ni.nr_rks(mol, self.grids, self.xc, dm)
                 log.debug('nelec by numeric integration = %s', n)
-                if self.do_nlc():
+                if self.do_nlc() and not numint._scf_head_nlc_suppressed():
                     if ni.libxc.is_nlc(self.xc):
                         xc = self.xc
                     else:
@@ -381,7 +381,7 @@ class _DFHF:
                     log.debug('nelec by numeric integration = %s', n)
                     t0 = log.timer('vxc', *t0)
                     
-                    if self.do_nlc():
+                    if self.do_nlc() and not numint._scf_head_nlc_suppressed():
                         if ni.libxc.is_nlc(self.xc):
                             xc = self.xc
                         else:
@@ -543,15 +543,25 @@ def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True,
                 buf = cp.empty((dm_batch_size+1, blksize * nao*nocc), dtype=buf_dtype)
                 buf1 = buf[-1]
 
-        for cderi, cderi_tril in dfobj.loop(blksize=blksize, unpack=with_k):
-            if fp32 and cderi_tril is not None:
+        # SP-28: with the persistent fp32 cderi block cache admitted,
+        # iterate its blocks (fp32 tril blocks for J, fp32-unpacked views
+        # for K) and skip the per-block casts; bitwise-identical to the
+        # per-call _cast_cderi path, fail-closed to it otherwise
+        if fp32 and dfobj._get_cderi_f32_blocks(blksize) is not None:
+            blocks = dfobj.loop_f32(blksize=blksize, unpack=with_k)
+            cast_blocks = False
+        else:
+            blocks = dfobj.loop(blksize=blksize, unpack=with_k)
+            cast_blocks = fp32
+        for cderi, cderi_tril in blocks:
+            if cast_blocks and cderi_tril is not None:
                 cderi_tril = _cast_cderi(cderi_tril)
             if with_j:
                 auxvec = contract('np,Lp->nL', _dm_sparse, cderi_tril)
                 contract('nL,Lp->np', auxvec, cderi_tril, beta=1, out=vj)
 
             if with_k:
-                if fp32 and cderi is not None:
+                if cast_blocks and cderi is not None:
                     cderi = _cast_cderi(cderi)
                 nL = len(cderi)
                 for s in range(nspin):
