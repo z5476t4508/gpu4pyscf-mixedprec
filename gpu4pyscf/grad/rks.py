@@ -43,6 +43,46 @@ ALIGNED = getattr(__config__, 'grid_aligned', 16*16)
 libgdft = numint.libgdft
 libgdft.GDFT_make_dR_dao_w.restype = ctypes.c_int
 
+_GRAD_GRID_F32 = None     # cached env value; None = not yet read
+
+def _grad_grid_f32():
+    '''Whether to run the XC grid contractions in float32 on the fp64
+    gradient lane (opt-in precision-policy knob, LC-101).
+
+    GPU4PYSCF_GRAD_GRID_F32=1 casts the block AO to float32 for the
+    gradient grid-contraction calls (_d1_dot_/_gga_grad_sum_/
+    _tau_grad_dot_, including get_nlc_exc's deriv=2 loop) when the
+    resolved gradient mode is fp64.  The discipline is exactly the auto
+    lane's existing fp32_grid path (LC-88): the density evaluation keeps
+    its original float64 AO (bitwise-identical rho), the contraction
+    helpers run in the operands' float32 dtype with no pre-sized fp64
+    buffers, and the dm_mask einsum and the exc1 accumulator stay
+    float64.  Measured same-orbital swap cost (2026-10-13-lc101):
+    max|dg| 1.3e-7..2.3e-6 Eh/Bohr at 1.16-2.47x t_grad on GGA+tau/NLC
+    workloads; plain-GGA cells pay the per-block AO cast without a
+    matching GEMM win (b3lyp/benzene/tzvp 0.805x) -- opt in per
+    workload.  RKS only: the UKS _get_exc_task surface is closed by
+    LC-89 (slower on all configs) and get_nlc_exc gates the knob on
+    nset == 1; the auto/fp32 lanes already cast (this knob is a no-op
+    there).  With the knob on, the fp64-lane gradient is no longer the
+    bitwise strict fp64 reference ((b3)-class precision policy, cf.
+    GPU4PYSCF_DF_IP1_F32).
+    '''
+    global _GRAD_GRID_F32
+    if _GRAD_GRID_F32 is None:
+        import os
+        raw = os.environ.get('GPU4PYSCF_GRAD_GRID_F32', '')
+        if raw == '1':
+            _GRAD_GRID_F32 = True
+        elif raw:
+            warnings.warn(f'GPU4PYSCF_GRAD_GRID_F32={raw!r} ignored; '
+                          'expected 1 to enable fp32 grid contractions '
+                          'on the fp64 gradient lane')
+            _GRAD_GRID_F32 = False
+        else:
+            _GRAD_GRID_F32 = False
+    return _GRAD_GRID_F32
+
 def energy_ee(ks_grad, mol=None, dm=None, verbose=None):
     '''
     Computes the first-order derivatives of the two-electron energy
@@ -160,46 +200,69 @@ def _get_exc_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
         ngrids_local = grid_end - grid_start
         log.debug(f"{ngrids_local} grids on Device {device_id}")
 
+        # LC-22: opt-in larger grid blocks for the gradient XC loops (same
+        # knob and guard as the SCF side, dft.numint LC-11).  Probe
+        # (2026-10-06-lc21-grad-blocksize): whole-gradient 1.14-1.34x at
+        # 16384 on the four-method cells, dg <= 3e-13 Eh/Bohr.
+        loop_blksize = numint._effective_scf_blksize(
+            numint._scf_grid_blksize(), grid_start, grid_end, ngrids_glob)
+
         # The gradient's grid contractions are the same shape as the energy's
         # and cancel just as little, so float32 is safe here too; exc1_ao and
         # the density matrix stay float64. See dft.numint._nr_rks_task.
+        # LC-101: GPU4PYSCF_GRAD_GRID_F32=1 extends the same contraction
+        # discipline to the fp64 lane (rho keeps the fp64 AO and its
+        # pre-sized buffer; only the post-rho contraction calls take the
+        # fp32 copy with dtype-sized buffers).
         fp32_grid = precision.get_precision() == 'fp32'
-        _gbuf = (lambda b: None) if fp32_grid else (lambda b: b)
+        contr_f32 = fp32_grid or _grad_grid_f32()
+        _gbuf = (lambda b: None) if contr_f32 else (lambda b: b)
+        _rbuf = (lambda b: None) if fp32_grid else (lambda b: b)
         exc1_ao = cupy.zeros((nao,3))
         vtmp_buf = cupy.empty((3*nao*nao))
         mo_buf = cupy.empty_like(mo_coeff)
         dm_mask_buf = cupy.empty(nao*nao)
         if xctype == 'LDA':
             ao_deriv = 1
-            aow_buf = cupy.empty(MIN_BLK_SIZE * max(nao, 1*nocc))
+            aow_buf = cupy.empty(loop_blksize * max(nao, 1*nocc))
             for ao_mask, idx, weight, _ in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, None,
-                                                         grid_range=(grid_start, grid_end)):
+                                                         grid_range=(grid_start, grid_end),
+                                                         loop_blksize=loop_blksize):
                 mo_coeff_mask = cupy.take(mo_coeff, idx, axis=0, out=mo_buf[:len(idx)])
                 if fp32_grid:
                     ao_mask = ao_mask.astype(cupy.float32)
                 rho = numint.eval_rho2(_sorted_mol, ao_mask[0], mo_coeff_mask,
-                                       mo_occ, None, xctype, buf=_gbuf(aow_buf))
+                                       mo_occ, None, xctype, buf=_rbuf(aow_buf))
                 vxc = ni.eval_xc_eff(xc_code, rho, 1, xctype=xctype, spin=0)[1][0]
                 wv = cupy.multiply(weight, vxc, out=vxc)
-                aow = numint._scale_ao(ao_mask[0], wv, out=_gbuf(aow_buf))
-                vtmp = _d1_dot_(ao_mask[1:4], aow.T, out=_gbuf(vtmp_buf))
+                if contr_f32 and not fp32_grid:
+                    ao_contr = ao_mask.astype(cupy.float32)
+                else:
+                    ao_contr = ao_mask
+                aow = numint._scale_ao(ao_contr[0], wv, out=_gbuf(aow_buf))
+                vtmp = _d1_dot_(ao_contr[1:4], aow.T, out=_gbuf(vtmp_buf))
                 dm_mask = take_last2d(dm, idx, out=dm_mask_buf)
                 exc1_ao[idx] += cupy.einsum('nij,ij->ni', vtmp, dm_mask).T
         elif xctype == 'GGA':
 
             ao_deriv = 2
-            aow_buf = cupy.empty(MIN_BLK_SIZE * max(nao * 3, 2*nocc, 4))
+            aow_buf = cupy.empty(loop_blksize * max(nao * 3, 2*nocc, 4))
             for ao_mask, idx, weight, _ in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, None,
-                                                         grid_range=(grid_start, grid_end)):
+                                                         grid_range=(grid_start, grid_end),
+                                                         loop_blksize=loop_blksize):
                 mo_coeff_mask = cupy.take(mo_coeff, idx, axis=0, out=mo_buf[:len(idx)])
                 if fp32_grid:
                     ao_mask = ao_mask.astype(cupy.float32)
                 rho = numint.eval_rho2(_sorted_mol, ao_mask[:4], mo_coeff_mask,
-                                       mo_occ, None, xctype, buf=_gbuf(aow_buf))
+                                       mo_occ, None, xctype, buf=_rbuf(aow_buf))
                 vxc = ni.eval_xc_eff(xc_code, rho, 1, xctype=xctype, spin=0, work=aow_buf)[1]
                 wv = cupy.multiply(weight, vxc, out=vxc)
                 wv[0] *= .5
-                vtmp = _gga_grad_sum_(ao_mask, wv, buf=_gbuf(aow_buf), out=_gbuf(vtmp_buf))
+                if contr_f32 and not fp32_grid:
+                    ao_contr = ao_mask.astype(cupy.float32)
+                else:
+                    ao_contr = ao_mask
+                vtmp = _gga_grad_sum_(ao_contr, wv, buf=_gbuf(aow_buf), out=_gbuf(vtmp_buf))
                 dm_mask = take_last2d(dm, idx, out=dm_mask_buf)
                 exc1_ao[idx] += cupy.einsum('nij,ij->ni', vtmp, dm_mask).T
 
@@ -208,20 +271,25 @@ def _get_exc_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
 
         elif xctype == 'MGGA':
             ao_deriv = 2
-            aow_buf = cupy.empty(MIN_BLK_SIZE * max(nao * 3, 2*nocc, 5))
+            aow_buf = cupy.empty(loop_blksize * max(nao * 3, 2*nocc, 5))
             for ao_mask, idx, weight, _ in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, None,
-                                                         grid_range=(grid_start, grid_end)):
+                                                         grid_range=(grid_start, grid_end),
+                                                         loop_blksize=loop_blksize):
                 mo_coeff_mask = cupy.take(mo_coeff, idx, axis=0, out=mo_buf[:len(idx)])
                 if fp32_grid:
                     ao_mask = ao_mask.astype(cupy.float32)
                 rho = numint.eval_rho2(_sorted_mol, ao_mask[:4], mo_coeff_mask,
-                                       mo_occ, None, xctype, with_lapl=False, buf=_gbuf(aow_buf))
+                                       mo_occ, None, xctype, with_lapl=False, buf=_rbuf(aow_buf))
                 vxc = ni.eval_xc_eff(xc_code, rho, 1, xctype=xctype, spin=0, work=aow_buf)[1]
                 wv = cupy.multiply(weight, vxc, out=vxc)
                 wv[0] *= .5
                 wv[4] *= .5  # for the factor 1/2 in tau
-                vtmp = _gga_grad_sum_(ao_mask, wv, buf=_gbuf(aow_buf), out=_gbuf(vtmp_buf))
-                vtmp = _tau_grad_dot_(ao_mask, wv[4], accumulate=True, buf=_gbuf(aow_buf), out=vtmp)
+                if contr_f32 and not fp32_grid:
+                    ao_contr = ao_mask.astype(cupy.float32)
+                else:
+                    ao_contr = ao_mask
+                vtmp = _gga_grad_sum_(ao_contr, wv, buf=_gbuf(aow_buf), out=_gbuf(vtmp_buf))
+                vtmp = _tau_grad_dot_(ao_contr, wv[4], accumulate=True, buf=_gbuf(aow_buf), out=vtmp)
                 dm_mask = take_last2d(dm, idx, out=dm_mask_buf)
                 exc1_ao[idx] += cupy.einsum('nij,ij->ni', vtmp, dm_mask).T
 
@@ -296,10 +364,17 @@ def get_nlc_exc(ni, mol, grids, xc_code, dms, relativity=0, hermi=1,
         raise NotImplementedError('Additive NLC')
     nlc_pars, fac = nlc_coefs[0]
 
+    # LC-22: opt-in larger grid blocks (same knob as LC-11/LC-21); the rho
+    # pieces are hstacked to the full grid before _vv10nlc, so the two
+    # loops only need CONSISTENT partitions, which loop_blksize gives.
+    ngrids = grids.coords.shape[0]
+    loop_blksize = numint._effective_scf_blksize(
+        numint._scf_grid_blksize(), 0, ngrids, ngrids)
     ao_deriv = 1
     vvrho = []
     for ao_mask, mask, weight, coords \
-            in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, max_memory=max_memory):
+            in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, max_memory=max_memory,
+                             loop_blksize=loop_blksize):
         if nset == 1:
             mo_coeff_mask = mo_coeff[mask]
             rho = numint.eval_rho2(_sorted_mol, ao_mask[:4], mo_coeff_mask, mo_occ, None, xctype, with_lapl=False)
@@ -317,13 +392,44 @@ def get_nlc_exc(ni, mol, grids, xc_code, dms, relativity=0, hermi=1,
     vv_vxc = xc_deriv.transform_vxc(rho, vxc, 'GGA', spin=0)
 
     ao_deriv = 2
+    # LC-88: the grid contractions in this loop carry no cancellation
+    # (same shape as the main-XC gradient's, whose fp32_grid discipline is
+    # inherited upstream), so they follow the same precision mode: in fp32
+    # the AO is cast once per block and _gga_grad_sum_'s _d1_dot_ GEMMs run
+    # in the operands' dtype; the einsum against the float64 dm_mask and
+    # the exc1 accumulator stay float64.  Before LC-88 this loop was the
+    # only grid-contraction surface without the cast (measured in LC-87:
+    # nlc_gga_grad_sum ran fp64 on BOTH lanes = 16.5% of the auto-lane
+    # t_grad while the main-XC gga_grad_sum ran 4.6x faster on auto).
+    # LC-101: GPU4PYSCF_GRAD_GRID_F32=1 extends the cast to the fp64 lane
+    # (RKS only -- nset == 1).  SP-10 (2026-10-25) note: LC-88's original
+    # intent cast this loop in fp32 mode for BOTH spin structures, and
+    # LC-101's regrouping below silently un-cast the UKS path even in
+    # fp32 mode (contradicting LC-101's own comment at the time).  SP-10
+    # repaired that regrouping and measured it preregistered on the
+    # production UKS+NLC doublet cells (methoxy/ethoxy/NO2 q0s1 wb97m-v,
+    # 43-204 AO): the numerics were harmless (dg swap 3e-10..1e-9, e_tot
+    # bitwise) but the cost justification FAILED everywhere -- the NLC
+    # piece ratio 0.86-1.04 at the <=0.5x bar, t_grad 0.97-1.02; the
+    # LC-87/LC-101 cast wins are GEMM-bound-shape-only (>= ~222 AO) and
+    # these deriv=2 contractions are launch/memory-bound.  Per the
+    # preregistered revert branch the un-cast UKS behavior is kept
+    # DELIBERATELY (measured winless, not accidentally); the knob stays
+    # RKS-only (LC-89).  Silent re-introduction of the fp32-mode UKS
+    # cast without fresh evidence is barred by
+    # tools/tests/test_nlc_grad_fp32.py::TestUksFp32ModeCast.
+    fp32_grid = precision.get_precision() == 'fp32'
+    contr_f32 = (fp32_grid or _grad_grid_f32()) and nset == 1
     exc1 = cupy.zeros((nao,3))
     p1 = 0
     for ao_mask, mask, weight, coords \
-            in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, max_memory):
+            in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, max_memory,
+                             loop_blksize=loop_blksize):
         p0, p1 = p1, p1 + weight.size
         wv = vv_vxc[:,p0:p1] * weight
         wv[0] *= .5  # *.5 because vmat + vmat.T at the end
+        if contr_f32:
+            ao_mask = ao_mask.astype(cupy.float32)
         vmat_tmp = _gga_grad_sum_(ao_mask, wv)
         #add_sparse(vmat, vmat_tmp, mask)
         dm_mask = dm[mask[:,None],mask]
