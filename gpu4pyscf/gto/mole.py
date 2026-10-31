@@ -46,6 +46,65 @@ def cart2sph_by_l(l, normalized='sp'):
         _c2s[l,device_id,normalized] = cp.asarray(c2s, order='C')
     return _c2s[l,device_id,normalized]
 
+def _canonical_env_layout(bas, env):
+    '''MR-11 (2026-10-23): re-pack the basis-data blocks of _env in a
+    deterministic layout.  pyscf's Mole.build collects element symbols into
+    a set (``uniq_atoms = {a[0] for a in self._atom}``), whose iteration
+    order is PYTHONHASHSEED-dependent, and make_env appends the per-element
+    basis blocks to _env in that order -- so the env layout (and the bas PTR
+    columns) vary across processes while the VALUES are a pure permutation
+    (22 distinct layouts in a 60-process census on dopamine/def2-tzvp).
+    This rewrites the blocks in first-occurrence order over bas rows, so
+    the layout becomes a pure function of the basis data.
+
+    Value-preserving by construction: each unique block is copied bitwise,
+    only its placement (and the bas PTR columns) changes.  Data outside the
+    basis blocks (the _atm-referenced region and anything appended after
+    the AO basis region, e.g. ECP) is kept in place.  Slots inside the old
+    basis region that no bas row references (general-contraction leftovers
+    of the decontract path) are zeroed.  Fails closed (RuntimeError) on
+    overlapping blocks, which the pyscf packing never produces.
+    '''
+    bas = np.asarray(bas)
+    blocks = []          # (old_ptr, length), first occurrence over bas rows
+    seen = set()
+    for row in bas:
+        nprim = int(row[NPRIM_OF])
+        nctr = int(row[NCTR_OF])
+        for ptr, n in ((int(row[PTR_EXP]), nprim),
+                       (int(row[PTR_COEFF]), nprim * nctr)):
+            if (ptr, n) not in seen:
+                seen.add((ptr, n))
+                blocks.append((ptr, n))
+    if not blocks:
+        return bas, env
+    ordered = sorted(blocks)
+    for (p0, n0), (p1, n1) in zip(ordered, ordered[1:]):
+        if p1 < p0 + n0:
+            raise RuntimeError(
+                f'basis _env blocks overlap ({p0},{n0}) vs ({p1},{n1}); '
+                'refusing to canonicalize the env layout')
+    # read every block before writing any new position: a relocated block
+    # may overwrite a not-yet-copied old location
+    src = [np.array(env[p:p+n]) for p, n in blocks]
+    lo = min(p for p, _ in blocks)
+    hi = max(p + n for p, n in blocks)
+    new_env = np.array(env, copy=True)
+    ptr_map = {}
+    at = lo
+    for (p, n), v in zip(blocks, src):
+        new_env[at:at+n] = v
+        ptr_map[(p, n)] = at
+        at += n
+    new_env[at:hi] = 0
+    new_bas = bas.copy()
+    for i, row in enumerate(bas):
+        nprim = int(row[NPRIM_OF])
+        nctr = int(row[NCTR_OF])
+        new_bas[i, PTR_EXP] = ptr_map[(int(row[PTR_EXP]), nprim)]
+        new_bas[i, PTR_COEFF] = ptr_map[(int(row[PTR_COEFF]), nprim * nctr)]
+    return new_bas, new_env
+
 def basis_seg_contraction(mol, allow_replica=1, sparse_coeff=False):
     '''transform generally contracted basis to segment contracted basis.
     Note return_mol.cart is set to True.
@@ -137,6 +196,7 @@ def basis_seg_contraction(mol, allow_replica=1, sparse_coeff=False):
     pmol.cart = True
     pmol._bas = np.asarray(np.vstack(_bas), dtype=np.int32)
     pmol._env = _env
+    pmol._bas, pmol._env = _canonical_env_layout(pmol._bas, pmol._env)
 
     if not sparse_coeff:
         contr_coeff = block_diag(contr_coeff)
@@ -988,17 +1048,34 @@ class SortedMole(Mole, SortedGTO):
             ij_tasks = [(i, j) for i in range(groups) for j in range(i+1)]
         else:
             ij_tasks = [(i, j) for i in range(groups) for j in range(groups)]
+        # Select all pair indices on the host with ONE device transfer.
+        # The per-(i,j) loop below used to run arange/add/fancy-index as
+        # ~5 tiny cupy kernels per group pair; at consumer sizes that host
+        # loop dominated (measured 2026-10-06: 13-22 ms of a 16-28 ms
+        # _Int1eOpt build, ~150 kernel launches at 27 us each, while the
+        # selection itself is <1 ms of device work). Integer indices only,
+        # so the values are bit-identical to the elementwise-GPU assembly.
+        if not isinstance(mask, np.ndarray):
+            mask = cp.asnumpy(mask)
+        pair_idx = np.arange(nbas, dtype=np.int32)[:,None] * nbas \
+                 + np.arange(nbas, dtype=np.int32)
+        parts = []
         for i, j in ij_tasks:
             ish0, ish1 = l_ctr_offsets[i], l_ctr_offsets[i+1]
             jsh0, jsh1 = l_ctr_offsets[j], l_ctr_offsets[j+1]
-            t_ij = (cp.arange(ish0, ish1, dtype=np.int32)[:,None] * nbas +
-                    cp.arange(jsh0, jsh1, dtype=np.int32))
+            sub_mask = mask[ish0:ish1,jsh0:jsh1]
             if hermi == 1 and i == j:
-                sub_mask = mask[ish0:ish1,jsh0:jsh1].copy()
-                sub_mask = cp.tril(sub_mask)
-            else:
-                sub_mask = mask[ish0:ish1,jsh0:jsh1]
-            bas_ij_cache[i,j] = t_ij[sub_mask]
+                sub_mask = np.tril(sub_mask)
+            parts.append(pair_idx[ish0:ish1,jsh0:jsh1][sub_mask])
+        if parts:
+            all_pairs = cp.asarray(np.concatenate(parts), dtype=np.int32)
+        else:
+            all_pairs = cp.empty(0, dtype=np.int32)
+        p0 = 0
+        for (i, j), part in zip(ij_tasks, parts):
+            p1 = p0 + len(part)
+            bas_ij_cache[i,j] = all_pairs[p0:p1]
+            p0 = p1
         return bas_ij_cache
 
     def aggregate_shl_pairs(self, bas_ij_cache=None, nsp_per_block=512):

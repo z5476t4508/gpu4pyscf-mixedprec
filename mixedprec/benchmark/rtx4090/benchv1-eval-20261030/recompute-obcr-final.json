@@ -1,0 +1,4292 @@
+{
+ "schema": "benchv1-independent-recompute-v1",
+ "generated_at_utc": "2026-10-30T22:20:10Z",
+ "independent": true,
+ "mode": "obcr",
+ "citable": true,
+ "allow_partial": false,
+ "schedule_path": "/data/results/gpu4pyscf-agent/tasks/issue-9/2026-10-30-benchv1-exec/schedule-v2.json",
+ "schedule_sha256": "1387f51be84d0276aaf8a041b17f2db12e9fb955e03b54ef275b1ccecbca1bbc",
+ "batch_id": "benchv1-20261030-obcr",
+ "source_commit": "8d144edf6ff16211147cb149ffe6dfdc38478e0f",
+ "counts": {
+  "planned": 64,
+  "gate_pass": 64,
+  "gate_fail_or_missing": 0,
+  "actual_scf_fp32_C": 35,
+  "gated_fallback_C": 29
+ },
+ "full_coverage": true,
+ "full_cohort_available": true,
+ "comparisons": {
+  "O_to_B": {
+   "n": 64,
+   "primary_geomean": 2.35813442556311,
+   "median_speedup": 1.7456648641776749,
+   "total_time_ratio": 3.941489260764332,
+   "ci95_bootstrap": [
+    2.318837351977726,
+    2.3988611365542862
+   ]
+  },
+  "B_to_C": {
+   "n": 64,
+   "primary_geomean": 0.9989195833164284,
+   "median_speedup": 1.004443114550082,
+   "total_time_ratio": 1.0070356128294264,
+   "ci95_bootstrap": [
+    0.9844249219812655,
+    1.014959556532275
+   ]
+  },
+  "O_to_C": {
+   "n": 64,
+   "primary_geomean": 2.3555866577876268,
+   "median_speedup": 1.7393486308130428,
+   "total_time_ratio": 3.969220053174412,
+   "ci95_bootstrap": [
+    2.302383167096209,
+    2.412857588458231
+   ]
+  }
+ },
+ "merge_fidelity": {
+  "role_docs_checked": 256,
+  "mismatches": []
+ },
+ "coverage_gaps": [],
+ "pin_defects": [],
+ "per_case": [
+  {
+   "tag": "acetaminophen_b3lyp_def2-svp",
+   "molecule": "acetaminophen",
+   "method": "b3lyp",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 3.072537,
+     "median_t_cderi_s": 0.1788675,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 1.886777,
+     "median_t_cderi_s": 0.1349015,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 2.7614445,
+     "median_t_cderi_s": 0.13407550000000001,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 1.9153875,
+     "median_t_cderi_s": 0.133739,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 6.696658338967154e-09
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 0.0,
+     "max_dg_vs_R": 1.0174128181716924e-05
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 0.0,
+     "max_dg_vs_R": 1.0174128156847928e-05
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "acetaminophen_m062x_def2-svp",
+   "molecule": "acetaminophen",
+   "method": "m062x",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 4.1791920000000005,
+     "median_t_cderi_s": 0.17891600000000002,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 2.484132,
+     "median_t_cderi_s": 0.1333535,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 3.974209,
+     "median_t_cderi_s": 0.13334600000000002,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 2.4589345,
+     "median_t_cderi_s": 0.134121,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 6.821210263296962e-13,
+     "max_dg_vs_R": 6.260359342036281e-09
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 1.2249112977258392e-05
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 1.224911299502196e-05
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "acetaminophen_wb97mv_def2-svp",
+   "molecule": "acetaminophen",
+   "method": "wb97mv",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 33.611637,
+     "median_t_cderi_s": 0.178921,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 5.374611,
+     "median_t_cderi_s": 0.132344,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 32.9262375,
+     "median_t_cderi_s": 0.1305215,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 5.413506,
+     "median_t_cderi_s": 0.1324235,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 1.3242247298705934e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 8.253664418589324e-11,
+     "max_dg_vs_R": 1.1064896291657078e-05
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 8.253664418589324e-11,
+     "max_dg_vs_R": 1.1064896291657078e-05
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "acetaminophen_r2scan3c_def2-mtzvpp",
+   "molecule": "acetaminophen",
+   "method": "r2scan3c",
+   "basis": "def2-mtzvpp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 4.817212,
+     "median_t_cderi_s": 0.246658,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 2.800371,
+     "median_t_cderi_s": 0.191558,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 4.4514605,
+     "median_t_cderi_s": 0.1893555,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 3.06101,
+     "median_t_cderi_s": 0.1884115,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.2737367544323206e-13,
+     "max_dg_vs_R": 1.2665424264923786e-12
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 6.721391605069016e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.094947017729282e-13,
+     "max_dg_vs_R": 6.19243134725167e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "vanillin_b3lyp_def2-svp",
+   "molecule": "vanillin",
+   "method": "b3lyp",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 3.0695959999999998,
+     "median_t_cderi_s": 0.1730775,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 1.9471335,
+     "median_t_cderi_s": 0.1276675,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 2.912724,
+     "median_t_cderi_s": 0.128802,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 1.9242020000000002,
+     "median_t_cderi_s": 0.1295365,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 1.0260510663329114e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 8.389796896324242e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 8.38979687500796e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "vanillin_m062x_def2-svp",
+   "molecule": "vanillin",
+   "method": "m062x",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 4.3257205,
+     "median_t_cderi_s": 0.1745425,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 2.3776095,
+     "median_t_cderi_s": 0.12742399999999998,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 3.8489934999999997,
+     "median_t_cderi_s": 0.128274,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 2.3254435,
+     "median_t_cderi_s": 0.1271195,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 9.056555505537744e-09
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 7.3155066502295085e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 7.315506667993077e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "vanillin_wb97mv_def2-svp",
+   "molecule": "vanillin",
+   "method": "wb97mv",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 34.006043000000005,
+     "median_t_cderi_s": 0.171533,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 5.424719,
+     "median_t_cderi_s": 0.1226245,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 33.959523,
+     "median_t_cderi_s": 0.1230955,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 5.4013065000000005,
+     "median_t_cderi_s": 0.123129,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 2.0371153652831708e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.468833943363279e-10,
+     "max_dg_vs_R": 8.397111205482588e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.468833943363279e-10,
+     "max_dg_vs_R": 8.397111180613592e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "vanillin_r2scan3c_def2-mtzvpp",
+   "molecule": "vanillin",
+   "method": "r2scan3c",
+   "basis": "def2-mtzvpp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 4.7931485,
+     "median_t_cderi_s": 0.237263,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 2.602036,
+     "median_t_cderi_s": 0.18115199999999998,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 4.2707565,
+     "median_t_cderi_s": 0.180393,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 2.972676,
+     "median_t_cderi_s": 0.1802225,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 6.661338147750939e-13
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.2737367544323206e-13,
+     "max_dg_vs_R": 5.9105025220773655e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.3415046851150692e-11,
+     "max_dg_vs_R": 5.070918648542033e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "salicylic_acid_b3lyp_def2-svp",
+   "molecule": "salicylic_acid",
+   "method": "b3lyp",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 2.8388400000000003,
+     "median_t_cderi_s": 0.15498299999999998,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 1.772275,
+     "median_t_cderi_s": 0.1083795,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 2.5566095,
+     "median_t_cderi_s": 0.1082495,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 1.7527645,
+     "median_t_cderi_s": 0.10819100000000001,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.2737367544323206e-13,
+     "max_dg_vs_R": 5.239013667335257e-09
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.2737367544323206e-13,
+     "max_dg_vs_R": 7.406422536604396e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.2737367544323206e-13,
+     "max_dg_vs_R": 7.406422525946255e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "salicylic_acid_m062x_def2-svp",
+   "molecule": "salicylic_acid",
+   "method": "m062x",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 3.6092185,
+     "median_t_cderi_s": 0.155331,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 2.0203420000000003,
+     "median_t_cderi_s": 0.1088795,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 3.3057135000000004,
+     "median_t_cderi_s": 0.107845,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 2.108168,
+     "median_t_cderi_s": 0.107806,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 3.410605131648481e-13,
+     "max_dg_vs_R": 7.107363586555948e-09
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.1368683772161603e-13,
+     "max_dg_vs_R": 7.391309612359009e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.1368683772161603e-13,
+     "max_dg_vs_R": 7.3913096336752915e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "salicylic_acid_wb97mv_def2-svp",
+   "molecule": "salicylic_acid",
+   "method": "wb97mv",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 25.8626135,
+     "median_t_cderi_s": 0.1535265,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 4.7232970000000005,
+     "median_t_cderi_s": 0.105798,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 25.4140815,
+     "median_t_cderi_s": 0.1052905,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 4.638054,
+     "median_t_cderi_s": 0.10489799999999999,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 1.6612717868014215e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 3.2025582186179236e-10,
+     "max_dg_vs_R": 7.038462001673906e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 3.2025582186179236e-10,
+     "max_dg_vs_R": 7.038461983910338e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "salicylic_acid_r2scan3c_def2-mtzvpp",
+   "molecule": "salicylic_acid",
+   "method": "r2scan3c",
+   "basis": "def2-mtzvpp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 4.176324,
+     "median_t_cderi_s": 0.2060885,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 2.5354085,
+     "median_t_cderi_s": 0.1476675,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 3.868961,
+     "median_t_cderi_s": 0.146369,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 2.503936,
+     "median_t_cderi_s": 0.1466005,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.2737367544323206e-13,
+     "max_dg_vs_R": 6.927791673660977e-13
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.1368683772161603e-13,
+     "max_dg_vs_R": 6.032101762087905e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.1368683772161603e-13,
+     "max_dg_vs_R": 5.835391704067661e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "benzoic_acid_b3lyp_def2-svp",
+   "molecule": "benzoic_acid",
+   "method": "b3lyp",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 2.4434355,
+     "median_t_cderi_s": 0.1470995,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 1.519374,
+     "median_t_cderi_s": 0.100806,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 2.180442,
+     "median_t_cderi_s": 0.0999005,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 1.5212715,
+     "median_t_cderi_s": 0.099831,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.2737367544323206e-13,
+     "max_dg_vs_R": 4.1812184825573695e-09
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 3.410605131648481e-13,
+     "max_dg_vs_R": 4.457355178288935e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 3.410605131648481e-13,
+     "max_dg_vs_R": 4.457355188947076e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "benzoic_acid_m062x_def2-svp",
+   "molecule": "benzoic_acid",
+   "method": "m062x",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 3.1544755,
+     "median_t_cderi_s": 0.1462445,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 1.8648465,
+     "median_t_cderi_s": 0.10005800000000001,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 2.7841545,
+     "median_t_cderi_s": 0.09981899999999999,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 1.9773445,
+     "median_t_cderi_s": 0.099583,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 5.684341886080801e-13,
+     "max_dg_vs_R": 8.528367345661536e-09
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 4.886171186768706e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 4.886171200979561e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "benzoic_acid_wb97mv_def2-svp",
+   "molecule": "benzoic_acid",
+   "method": "wb97mv",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 20.71161,
+     "median_t_cderi_s": 0.1460755,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 3.7404314999999997,
+     "median_t_cderi_s": 0.09798399999999999,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 20.284470499999998,
+     "median_t_cderi_s": 0.0962525,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 3.861505,
+     "median_t_cderi_s": 0.0972855,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 3.410605131648481e-13,
+     "max_dg_vs_R": 1.1608534578044782e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.716671249596402e-10,
+     "max_dg_vs_R": 4.814367629890626e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.716671249596402e-10,
+     "max_dg_vs_R": 4.814367629890626e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "benzoic_acid_r2scan3c_def2-mtzvpp",
+   "molecule": "benzoic_acid",
+   "method": "r2scan3c",
+   "basis": "def2-mtzvpp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 3.626001,
+     "median_t_cderi_s": 0.1911565,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 2.139272,
+     "median_t_cderi_s": 0.13062,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 3.145129,
+     "median_t_cderi_s": 0.12931399999999998,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 2.1522585000000003,
+     "median_t_cderi_s": 0.1302515,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.2737367544323206e-13,
+     "max_dg_vs_R": 5.551115123125783e-13
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 3.410605131648481e-13,
+     "max_dg_vs_R": 3.362857039945766e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 3.410605131648481e-13,
+     "max_dg_vs_R": 3.5027052867064867e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "uracil_b3lyp_def2-svp",
+   "molecule": "uracil",
+   "method": "b3lyp",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 2.2833674999999998,
+     "median_t_cderi_s": 0.138186,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 1.4613205,
+     "median_t_cderi_s": 0.0894135,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 2.0207349999999997,
+     "median_t_cderi_s": 0.0901435,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 1.4410319999999999,
+     "median_t_cderi_s": 0.089846,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 5.684341886080801e-13,
+     "max_dg_vs_R": 1.9019701369415998e-09
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 0.0,
+     "max_dg_vs_R": 6.47874230708112e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 0.0,
+     "max_dg_vs_R": 6.478742310633834e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "uracil_m062x_def2-svp",
+   "molecule": "uracil",
+   "method": "m062x",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 2.858823,
+     "median_t_cderi_s": 0.13792100000000002,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 1.634406,
+     "median_t_cderi_s": 0.089788,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 2.372573,
+     "median_t_cderi_s": 0.090158,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 1.7046934999999999,
+     "median_t_cderi_s": 0.089723,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.2737367544323206e-13,
+     "max_dg_vs_R": 2.509370489178764e-09
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.2737367544323206e-13,
+     "max_dg_vs_R": 9.807116189364251e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.2737367544323206e-13,
+     "max_dg_vs_R": 9.807116189364251e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "uracil_wb97mv_def2-svp",
+   "molecule": "uracil",
+   "method": "wb97mv",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 16.8531455,
+     "median_t_cderi_s": 0.136185,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 3.2638355,
+     "median_t_cderi_s": 0.0859875,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 16.676042000000002,
+     "median_t_cderi_s": 0.0867715,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 3.254175,
+     "median_t_cderi_s": 0.086064,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.2737367544323206e-13,
+     "max_dg_vs_R": 1.071341593217312e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.3646862246096134e-11,
+     "max_dg_vs_R": 7.420772647037666e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.3646862246096134e-11,
+     "max_dg_vs_R": 7.4207726257213835e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "uracil_r2scan3c_def2-mtzvpp",
+   "molecule": "uracil",
+   "method": "r2scan3c",
+   "basis": "def2-mtzvpp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 3.3908175,
+     "median_t_cderi_s": 0.180523,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 2.030902,
+     "median_t_cderi_s": 0.1168825,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 2.9322660000000003,
+     "median_t_cderi_s": 0.115909,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 1.9655805000000002,
+     "median_t_cderi_s": 0.117839,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.2737367544323206e-13,
+     "max_dg_vs_R": 5.542233338928781e-13
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.2737367544323206e-13,
+     "max_dg_vs_R": 4.305187697895008e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.2737367544323206e-13,
+     "max_dg_vs_R": 4.365247907145431e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "cytosine_b3lyp_def2-svp",
+   "molecule": "cytosine",
+   "method": "b3lyp",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 2.5808725,
+     "median_t_cderi_s": 0.13948100000000002,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 1.555567,
+     "median_t_cderi_s": 0.09133150000000001,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 2.077363,
+     "median_t_cderi_s": 0.091768,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 1.5566564999999999,
+     "median_t_cderi_s": 0.0918175,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 1.9420980379436514e-09
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 5.684341886080801e-13,
+     "max_dg_vs_R": 4.005660937167477e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 5.684341886080801e-13,
+     "max_dg_vs_R": 4.005660944272904e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "cytosine_m062x_def2-svp",
+   "molecule": "cytosine",
+   "method": "m062x",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 2.838471,
+     "median_t_cderi_s": 0.141156,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 1.6285685,
+     "median_t_cderi_s": 0.091345,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 2.6747955,
+     "median_t_cderi_s": 0.0920645,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 1.770099,
+     "median_t_cderi_s": 0.09257499999999999,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 2.3082864508694456e-09
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.2737367544323206e-13,
+     "max_dg_vs_R": 6.6578301449737864e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.2737367544323206e-13,
+     "max_dg_vs_R": 6.657830187606351e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "cytosine_wb97mv_def2-svp",
+   "molecule": "cytosine",
+   "method": "wb97mv",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 17.962941999999998,
+     "median_t_cderi_s": 0.1401085,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 3.3889519999999997,
+     "median_t_cderi_s": 0.0893385,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 17.545309,
+     "median_t_cderi_s": 0.08964,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 3.4753985,
+     "median_t_cderi_s": 0.0894355,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.2737367544323206e-13,
+     "max_dg_vs_R": 1.2597414666970508e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.28821464185603e-11,
+     "max_dg_vs_R": 4.5586144992171285e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.28821464185603e-11,
+     "max_dg_vs_R": 4.558614506322556e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "cytosine_r2scan3c_def2-mtzvpp",
+   "molecule": "cytosine",
+   "method": "r2scan3c",
+   "basis": "def2-mtzvpp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 3.5856125,
+     "median_t_cderi_s": 0.180796,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 1.931381,
+     "median_t_cderi_s": 0.1184575,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 3.056986,
+     "median_t_cderi_s": 0.11781050000000001,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 2.064228,
+     "median_t_cderi_s": 0.1191365,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.9558577807620168e-12,
+     "max_dg_vs_R": 1.1861445159411232e-10
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 0.0,
+     "max_dg_vs_R": 3.3908196890308773e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 0.0,
+     "max_dg_vs_R": 3.2433193375425162e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "adenine_b3lyp_def2-svp",
+   "molecule": "adenine",
+   "method": "b3lyp",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 2.6319305,
+     "median_t_cderi_s": 0.15390500000000001,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 1.567608,
+     "median_t_cderi_s": 0.10725799999999999,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 2.3530575000000002,
+     "median_t_cderi_s": 0.10716049999999999,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 1.5696335000000001,
+     "median_t_cderi_s": 0.10594300000000001,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 5.684341886080801e-13,
+     "max_dg_vs_R": 3.0912197246379947e-09
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.1368683772161603e-13,
+     "max_dg_vs_R": 5.422008740652018e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.1368683772161603e-13,
+     "max_dg_vs_R": 5.422008680255885e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "adenine_m062x_def2-svp",
+   "molecule": "adenine",
+   "method": "m062x",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 3.513417,
+     "median_t_cderi_s": 0.1539725,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 1.9775684999999998,
+     "median_t_cderi_s": 0.107346,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 3.220675,
+     "median_t_cderi_s": 0.10796449999999999,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 2.1049094999999998,
+     "median_t_cderi_s": 0.10840849999999999,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 3.410605131648481e-13,
+     "max_dg_vs_R": 3.5836444922665578e-09
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.1368683772161603e-13,
+     "max_dg_vs_R": 5.116314895303731e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.1368683772161603e-13,
+     "max_dg_vs_R": 5.1163149201727265e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "adenine_wb97mv_def2-svp",
+   "molecule": "adenine",
+   "method": "wb97mv",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 24.4555985,
+     "median_t_cderi_s": 0.1557705,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 4.3863225,
+     "median_t_cderi_s": 0.1053025,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 24.1862965,
+     "median_t_cderi_s": 0.1052315,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 4.4085295,
+     "median_t_cderi_s": 0.1072365,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 5.684341886080801e-13,
+     "max_dg_vs_R": 1.4237951706519425e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.7178081179736182e-10,
+     "max_dg_vs_R": 4.839421084312789e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.7178081179736182e-10,
+     "max_dg_vs_R": 4.839421087865503e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "adenine_r2scan3c_def2-mtzvpp",
+   "molecule": "adenine",
+   "method": "r2scan3c",
+   "basis": "def2-mtzvpp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 3.720103,
+     "median_t_cderi_s": 0.205735,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 2.281732,
+     "median_t_cderi_s": 0.1486325,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 3.620083,
+     "median_t_cderi_s": 0.1495225,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 2.255966,
+     "median_t_cderi_s": 0.149472,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 3.410605131648481e-13,
+     "max_dg_vs_R": 6.679101716144942e-13
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 0.0,
+     "max_dg_vs_R": 2.5899999638312465e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 0.0,
+     "max_dg_vs_R": 2.6277285716247434e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "guanosine_b3lyp_def2-svp",
+   "molecule": "guanosine",
+   "method": "b3lyp",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 7.9664575,
+     "median_t_cderi_s": 0.48110600000000003,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 5.040665000000001,
+     "median_t_cderi_s": 0.44581,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 7.7498955,
+     "median_t_cderi_s": 0.450872,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 4.873853,
+     "median_t_cderi_s": 0.44762650000000004,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.094947017729282e-13,
+     "max_dg_vs_R": 1.358233525650121e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 0.0,
+     "max_dg_vs_R": 1.1792534820642686e-05
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.3642420526593924e-12,
+     "max_dg_vs_R": 1.0609995928945182e-05
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "guanosine_m062x_def2-svp",
+   "molecule": "guanosine",
+   "method": "m062x",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 10.487651,
+     "median_t_cderi_s": 0.479738,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 6.1313379999999995,
+     "median_t_cderi_s": 0.4470825,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 10.219810500000001,
+     "median_t_cderi_s": 0.4501265,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 5.6072665,
+     "median_t_cderi_s": 0.447044,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.3642420526593924e-12,
+     "max_dg_vs_R": 1.678001737559498e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.094947017729282e-13,
+     "max_dg_vs_R": 9.321465766376491e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 3.637978807091713e-12,
+     "max_dg_vs_R": 9.346020588552051e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "guanosine_wb97mv_def2-svp",
+   "molecule": "guanosine",
+   "method": "wb97mv",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 101.195735,
+     "median_t_cderi_s": 0.476417,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 14.5881,
+     "median_t_cderi_s": 0.447096,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 100.9538315,
+     "median_t_cderi_s": 0.4465935,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 14.156030999999999,
+     "median_t_cderi_s": 0.4465025,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.094947017729282e-13,
+     "max_dg_vs_R": 2.6316410384197297e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.6420821086503565e-10,
+     "max_dg_vs_R": 8.855545491570638e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.382876118645072e-10,
+     "max_dg_vs_R": 8.723308351221704e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "guanosine_r2scan3c_def2-mtzvpp",
+   "molecule": "guanosine",
+   "method": "r2scan3c",
+   "basis": "def2-mtzvpp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 12.776901500000001,
+     "median_t_cderi_s": 0.8676595,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 7.764165500000001,
+     "median_t_cderi_s": 0.8451150000000001,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 12.653237,
+     "median_t_cderi_s": 0.8478410000000001,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 8.280134,
+     "median_t_cderi_s": 0.8445935,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.094947017729282e-13,
+     "max_dg_vs_R": 1.3891110484109959e-12
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.094947017729282e-13,
+     "max_dg_vs_R": 6.512182867624006e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-12,
+     "max_dg_vs_R": 6.783373716956476e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "phenacetin_b3lyp_def2-svp",
+   "molecule": "phenacetin",
+   "method": "b3lyp",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 3.8155785,
+     "median_t_cderi_s": 0.22454200000000002,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 2.4592245,
+     "median_t_cderi_s": 0.18502200000000002,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 3.5489610000000003,
+     "median_t_cderi_s": 0.18407400000000002,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 2.3361235000000002,
+     "median_t_cderi_s": 0.1843045,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.094947017729282e-13,
+     "max_dg_vs_R": 9.392270072794418e-09
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 0.0,
+     "max_dg_vs_R": 1.1978238099175087e-05
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 0.0,
+     "max_dg_vs_R": 1.1978238109833228e-05
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "phenacetin_m062x_def2-svp",
+   "molecule": "phenacetin",
+   "method": "m062x",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 5.572165,
+     "median_t_cderi_s": 0.2279875,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 3.004541,
+     "median_t_cderi_s": 0.18504700000000002,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 5.314737,
+     "median_t_cderi_s": 0.1855145,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 3.1306125,
+     "median_t_cderi_s": 0.1840515,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 6.821210263296962e-13,
+     "max_dg_vs_R": 6.8493335447783465e-09
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 0.0,
+     "max_dg_vs_R": 1.0319042399231648e-05
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 0.0,
+     "max_dg_vs_R": 1.031904242054793e-05
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "phenacetin_wb97mv_def2-svp",
+   "molecule": "phenacetin",
+   "method": "wb97mv",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 52.9855175,
+     "median_t_cderi_s": 0.222606,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 7.8645905,
+     "median_t_cderi_s": 0.1838375,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 52.7409945,
+     "median_t_cderi_s": 0.1831775,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 7.9057975,
+     "median_t_cderi_s": 0.183435,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 2.2617363981680683e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.7284841053187847e-12,
+     "max_dg_vs_R": 1.1743971835898037e-05
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.7284841053187847e-12,
+     "max_dg_vs_R": 1.1743971786160046e-05
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "gated_fallback_fp64"
+  },
+  {
+   "tag": "phenacetin_r2scan3c_def2-mtzvpp",
+   "molecule": "phenacetin",
+   "method": "r2scan3c",
+   "basis": "def2-mtzvpp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 5.9129545,
+     "median_t_cderi_s": 0.32482449999999996,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 3.3390105,
+     "median_t_cderi_s": 0.276493,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 5.6671325,
+     "median_t_cderi_s": 0.2764545,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 3.735847,
+     "median_t_cderi_s": 0.2743895,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 8.562039965909207e-13
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.094947017729282e-13,
+     "max_dg_vs_R": 8.56389182501971e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.5011104298755527e-11,
+     "max_dg_vs_R": 9.138403203934331e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "ibuprofen_b3lyp_def2-svp",
+   "molecule": "ibuprofen",
+   "method": "b3lyp",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 5.205707,
+     "median_t_cderi_s": 0.321619,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 3.0461225,
+     "median_t_cderi_s": 0.2861435,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 5.013724,
+     "median_t_cderi_s": 0.2888105,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 3.0323205,
+     "median_t_cderi_s": 0.2855815,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 6.821210263296962e-13,
+     "max_dg_vs_R": 2.70110156463943e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 6.821210263296962e-13,
+     "max_dg_vs_R": 5.931646347878683e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.092726157978177e-12,
+     "max_dg_vs_R": 6.2502568480837795e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "ibuprofen_m062x_def2-svp",
+   "molecule": "ibuprofen",
+   "method": "m062x",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 7.8207655,
+     "median_t_cderi_s": 0.323032,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 4.3717435,
+     "median_t_cderi_s": 0.2869045,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 7.649094,
+     "median_t_cderi_s": 0.2872845,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 4.2828535,
+     "median_t_cderi_s": 0.2859265,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 2.1368597558080182e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 0.0,
+     "max_dg_vs_R": 4.633103018569784e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 4.600157419876183e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "ibuprofen_wb97mv_def2-svp",
+   "molecule": "ibuprofen",
+   "method": "wb97mv",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 79.8703265,
+     "median_t_cderi_s": 0.322186,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 11.635535,
+     "median_t_cderi_s": 0.286858,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 79.50365199999999,
+     "median_t_cderi_s": 0.28696449999999996,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 11.679682,
+     "median_t_cderi_s": 0.286629,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.094947017729282e-13,
+     "max_dg_vs_R": 1.8906948895391906e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.617071004351601e-10,
+     "max_dg_vs_R": 4.453652426406052e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.4510882212780416e-10,
+     "max_dg_vs_R": 4.596791363553621e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "ibuprofen_r2scan3c_def2-mtzvpp",
+   "molecule": "ibuprofen",
+   "method": "r2scan3c",
+   "basis": "def2-mtzvpp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 8.5092135,
+     "median_t_cderi_s": 0.4766815,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 4.7369959999999995,
+     "median_t_cderi_s": 0.4350605,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 8.285681499999999,
+     "median_t_cderi_s": 0.436892,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 4.9867805,
+     "median_t_cderi_s": 0.434788,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 1.4870327191829347e-12
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.2737367544323206e-13,
+     "max_dg_vs_R": 4.66354412864689e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 4.490147343716444e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "naproxen_b3lyp_def2-svp",
+   "molecule": "naproxen",
+   "method": "b3lyp",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 5.8549865,
+     "median_t_cderi_s": 0.34386300000000003,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 3.5942239999999996,
+     "median_t_cderi_s": 0.307008,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 5.5862295,
+     "median_t_cderi_s": 0.310479,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 3.361701,
+     "median_t_cderi_s": 0.311162,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.1368683772161603e-12,
+     "max_dg_vs_R": 3.510406010320821e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.1368683772161603e-12,
+     "max_dg_vs_R": 1.058390366459605e-05
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.094947017729282e-13,
+     "max_dg_vs_R": 1.0339602402709147e-05
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "naproxen_m062x_def2-svp",
+   "molecule": "naproxen",
+   "method": "m062x",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 8.108489500000001,
+     "median_t_cderi_s": 0.34268,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 4.5264895,
+     "median_t_cderi_s": 0.306372,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 7.5756575,
+     "median_t_cderi_s": 0.30723449999999997,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 4.329644,
+     "median_t_cderi_s": 0.3066735,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.5916157281026244e-12,
+     "max_dg_vs_R": 3.132613279888119e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.094947017729282e-13,
+     "max_dg_vs_R": 7.602143339724421e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.094947017729282e-13,
+     "max_dg_vs_R": 7.95413135357137e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "naproxen_wb97mv_def2-svp",
+   "molecule": "naproxen",
+   "method": "wb97mv",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 80.130237,
+     "median_t_cderi_s": 0.341563,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 11.707462,
+     "median_t_cderi_s": 0.3064615,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 79.921879,
+     "median_t_cderi_s": 0.3054175,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 11.642839500000001,
+     "median_t_cderi_s": 0.303815,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.1368683772161603e-12,
+     "max_dg_vs_R": 3.3981518043901815e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.128217602148652e-10,
+     "max_dg_vs_R": 9.25468129242546e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.135038812411949e-10,
+     "max_dg_vs_R": 9.398565509854961e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "naproxen_r2scan3c_def2-mtzvpp",
+   "molecule": "naproxen",
+   "method": "r2scan3c",
+   "basis": "def2-mtzvpp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 8.7946515,
+     "median_t_cderi_s": 0.5306675,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 5.152889,
+     "median_t_cderi_s": 0.494007,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 8.460212,
+     "median_t_cderi_s": 0.4955085,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 5.900850999999999,
+     "median_t_cderi_s": 0.4947155,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.2737367544323206e-13,
+     "max_dg_vs_R": 1.9415580254644738e-12
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.2737367544323206e-12,
+     "max_dg_vs_R": 7.757860982948728e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.0463630789890885e-11,
+     "max_dg_vs_R": 7.734793692648623e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "propranolol_b3lyp_def2-svp",
+   "molecule": "propranolol",
+   "method": "b3lyp",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 7.9285250000000005,
+     "median_t_cderi_s": 0.5684165,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 4.9427924999999995,
+     "median_t_cderi_s": 0.545418,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 7.7420405,
+     "median_t_cderi_s": 0.5427345,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 4.433984000000001,
+     "median_t_cderi_s": 0.540199,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 3.933479852946675e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 0.0,
+     "max_dg_vs_R": 6.819214497966186e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 3.637978807091713e-12,
+     "max_dg_vs_R": 6.288298465051412e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "propranolol_m062x_def2-svp",
+   "molecule": "propranolol",
+   "method": "m062x",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 12.042534,
+     "median_t_cderi_s": 0.5682465000000001,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 6.8877225,
+     "median_t_cderi_s": 0.541056,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 11.835454,
+     "median_t_cderi_s": 0.5416635000000001,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 6.3546355000000005,
+     "median_t_cderi_s": 0.5403165,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.094947017729282e-13,
+     "max_dg_vs_R": 3.537537729414453e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 4.269066689488454e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.094947017729282e-13,
+     "max_dg_vs_R": 4.962755767223825e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "propranolol_wb97mv_def2-svp",
+   "molecule": "propranolol",
+   "method": "wb97mv",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 116.1072085,
+     "median_t_cderi_s": 0.569593,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 16.469276,
+     "median_t_cderi_s": 0.542992,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 115.80379049999999,
+     "median_t_cderi_s": 0.5447770000000001,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 15.8407795,
+     "median_t_cderi_s": 0.5366085,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.094947017729282e-13,
+     "max_dg_vs_R": 1.8149308278481158e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.4519765651784837e-10,
+     "max_dg_vs_R": 7.204458615461817e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.43833414465189e-10,
+     "max_dg_vs_R": 7.220446352818044e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "propranolol_r2scan3c_def2-mtzvpp",
+   "molecule": "propranolol",
+   "method": "r2scan3c",
+   "basis": "def2-mtzvpp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 12.0830415,
+     "median_t_cderi_s": 0.8886185,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 7.180566499999999,
+     "median_t_cderi_s": 0.8653615,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 11.890337500000001,
+     "median_t_cderi_s": 0.8743745,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 7.669665,
+     "median_t_cderi_s": 0.8636765,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 1.6351364706679306e-12
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.094947017729282e-13,
+     "max_dg_vs_R": 5.9925639810387565e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-12,
+     "max_dg_vs_R": 5.596888382086718e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "carbamazepine_b3lyp_def2-svp",
+   "molecule": "carbamazepine",
+   "method": "b3lyp",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 6.236644999999999,
+     "median_t_cderi_s": 0.395519,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 3.608588,
+     "median_t_cderi_s": 0.3619435,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 5.947566999999999,
+     "median_t_cderi_s": 0.362305,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 3.393192,
+     "median_t_cderi_s": 0.36347949999999996,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 6.821210263296962e-13,
+     "max_dg_vs_R": 2.15377884416057e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 6.821210263296962e-13,
+     "max_dg_vs_R": 1.5390233812695442e-05
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 7.275957614183426e-12,
+     "max_dg_vs_R": 1.4449537644622978e-05
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "carbamazepine_m062x_def2-svp",
+   "molecule": "carbamazepine",
+   "method": "m062x",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 8.969071,
+     "median_t_cderi_s": 0.396709,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 4.7488554999999995,
+     "median_t_cderi_s": 0.359207,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 8.602894,
+     "median_t_cderi_s": 0.361215,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 4.6149575,
+     "median_t_cderi_s": 0.3593965,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 6.821210263296962e-13,
+     "max_dg_vs_R": 3.6526031088612854e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 1.4299449240695594e-05
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.2737367544323206e-13,
+     "max_dg_vs_R": 1.4559042266881761e-05
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "carbamazepine_wb97mv_def2-svp",
+   "molecule": "carbamazepine",
+   "method": "wb97mv",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 80.2688125,
+     "median_t_cderi_s": 0.394111,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 12.105388999999999,
+     "median_t_cderi_s": 0.3586355,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 79.905677,
+     "median_t_cderi_s": 0.3594285,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 11.8896135,
+     "median_t_cderi_s": 0.358553,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.094947017729282e-13,
+     "max_dg_vs_R": 2.050446390455818e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.367795428261161e-11,
+     "max_dg_vs_R": 1.4828065314276273e-05
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.208633855450898e-11,
+     "max_dg_vs_R": 1.4625044645555363e-05
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "carbamazepine_r2scan3c_def2-mtzvpp",
+   "molecule": "carbamazepine",
+   "method": "r2scan3c",
+   "basis": "def2-mtzvpp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 9.917359999999999,
+     "median_t_cderi_s": 0.6153365,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 5.457298,
+     "median_t_cderi_s": 0.5773595,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 9.4864155,
+     "median_t_cderi_s": 0.578152,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 6.483264999999999,
+     "median_t_cderi_s": 0.5814360000000001,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 1.667110893777135e-12
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 1.3572049251564522e-05
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.5920599000528455e-11,
+     "max_dg_vs_R": 1.284902022646861e-05
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "warfarin_b3lyp_def2-svp",
+   "molecule": "warfarin",
+   "method": "b3lyp",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 10.8876125,
+     "median_t_cderi_s": 0.734478,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 6.830342,
+     "median_t_cderi_s": 0.7076815000000001,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 10.720383,
+     "median_t_cderi_s": 0.708226,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 6.1155105,
+     "median_t_cderi_s": 0.7075405,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.8189894035458565e-12,
+     "max_dg_vs_R": 5.53339303266398e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 0.0,
+     "max_dg_vs_R": 1.3065879869600394e-05
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.5006662579253316e-11,
+     "max_dg_vs_R": 1.4808802916377317e-05
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "warfarin_m062x_def2-svp",
+   "molecule": "warfarin",
+   "method": "m062x",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 14.648503,
+     "median_t_cderi_s": 0.732688,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 8.671457,
+     "median_t_cderi_s": 0.70707,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 14.5532195,
+     "median_t_cderi_s": 0.706105,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 8.280331,
+     "median_t_cderi_s": 0.7076264999999999,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.3642420526593924e-12,
+     "max_dg_vs_R": 4.876382408980362e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 1.0101995634670402e-05
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.5006662579253316e-11,
+     "max_dg_vs_R": 1.0647474148584024e-05
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "warfarin_wb97mv_def2-svp",
+   "molecule": "warfarin",
+   "method": "wb97mv",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 140.47681999999998,
+     "median_t_cderi_s": 0.731365,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 22.2336345,
+     "median_t_cderi_s": 0.7080025000000001,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 140.0911275,
+     "median_t_cderi_s": 0.7059815,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 20.053942,
+     "median_t_cderi_s": 0.705756,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.3642420526593924e-12,
+     "max_dg_vs_R": 6.028092514043237e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.7143975128419697e-10,
+     "max_dg_vs_R": 1.5717217657140736e-05
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.9736035028472543e-10,
+     "max_dg_vs_R": 1.488709604302585e-05
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "warfarin_r2scan3c_def2-mtzvpp",
+   "molecule": "warfarin",
+   "method": "r2scan3c",
+   "basis": "def2-mtzvpp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 15.6640805,
+     "median_t_cderi_s": 1.221358,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 9.1184195,
+     "median_t_cderi_s": 1.210482,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 15.429302,
+     "median_t_cderi_s": 1.2067195000000002,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 10.203576,
+     "median_t_cderi_s": 1.2057815,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 1.5268675213064853e-11
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.2737367544323206e-11,
+     "max_dg_vs_R": 8.330723442639965e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.549694368615746e-12,
+     "max_dg_vs_R": 8.093014915999674e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "estradiol_b3lyp_def2-svp",
+   "molecule": "estradiol",
+   "method": "b3lyp",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 9.747741999999999,
+     "median_t_cderi_s": 0.703716,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 6.100892,
+     "median_t_cderi_s": 0.6807369999999999,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 9.490753999999999,
+     "median_t_cderi_s": 0.6795445,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 5.4046265,
+     "median_t_cderi_s": 0.680943,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.094947017729282e-13,
+     "max_dg_vs_R": 2.340711136028517e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 0.0,
+     "max_dg_vs_R": 9.624713933398255e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 1.0593150805426887e-05
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "estradiol_m062x_def2-svp",
+   "molecule": "estradiol",
+   "method": "m062x",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 13.984596,
+     "median_t_cderi_s": 0.7062805000000001,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 7.7347,
+     "median_t_cderi_s": 0.6790780000000001,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 13.567286,
+     "median_t_cderi_s": 0.6819390000000001,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 6.944724,
+     "median_t_cderi_s": 0.6813309999999999,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.094947017729282e-13,
+     "max_dg_vs_R": 3.742579490761955e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.8189894035458565e-12,
+     "max_dg_vs_R": 8.549226996557024e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 7.87989285111479e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "estradiol_wb97mv_def2-svp",
+   "molecule": "estradiol",
+   "method": "wb97mv",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 127.467621,
+     "median_t_cderi_s": 0.703356,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 18.135579,
+     "median_t_cderi_s": 0.679477,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 127.3762495,
+     "median_t_cderi_s": 0.6807035,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 17.2966655,
+     "median_t_cderi_s": 0.6762965,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.094947017729282e-13,
+     "max_dg_vs_R": 3.451244268148912e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 6.375557859428227e-10,
+     "max_dg_vs_R": 9.293591262782286e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 6.584741640836e-10,
+     "max_dg_vs_R": 8.876448920780433e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "estradiol_r2scan3c_def2-mtzvpp",
+   "molecule": "estradiol",
+   "method": "r2scan3c",
+   "basis": "def2-mtzvpp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 13.871089,
+     "median_t_cderi_s": 1.072269,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 8.264987000000001,
+     "median_t_cderi_s": 1.052353,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 13.911558,
+     "median_t_cderi_s": 1.057273,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 8.346309999999999,
+     "median_t_cderi_s": 1.057234,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 0.0,
+     "max_dg_vs_R": 2.034816759532987e-12
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.094947017729282e-13,
+     "max_dg_vs_R": 7.721008348227087e-06
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.1823431123048067e-11,
+     "max_dg_vs_R": 7.406386011155064e-06
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "testosterone_b3lyp_def2-svp",
+   "molecule": "testosterone",
+   "method": "b3lyp",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 11.780542,
+     "median_t_cderi_s": 0.9059299999999999,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 7.368304,
+     "median_t_cderi_s": 0.889595,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 11.612196,
+     "median_t_cderi_s": 0.89561,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 6.1416695,
+     "median_t_cderi_s": 0.891275,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 9.094947017729282e-13,
+     "max_dg_vs_R": 4.722678870194841e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 1.4519001673818366e-05
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 8.640199666842818e-12,
+     "max_dg_vs_R": 1.410960532055583e-05
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "testosterone_m062x_def2-svp",
+   "molecule": "testosterone",
+   "method": "m062x",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 17.3797045,
+     "median_t_cderi_s": 0.906812,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 10.179048,
+     "median_t_cderi_s": 0.8892774999999999,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 17.424408,
+     "median_t_cderi_s": 0.894864,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 9.1571695,
+     "median_t_cderi_s": 0.88904,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 2.558006295672044e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 1.5499190769929783e-05
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 0.0,
+     "max_dg_vs_R": 1.4818867182242457e-05
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "testosterone_wb97mv_def2-svp",
+   "molecule": "testosterone",
+   "method": "wb97mv",
+   "basis": "def2-svp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 164.17564,
+     "median_t_cderi_s": 0.9057949999999999,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 23.622994499999997,
+     "median_t_cderi_s": 0.8897785,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 164.0971065,
+     "median_t_cderi_s": 0.8882745000000001,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 23.962248000000002,
+     "median_t_cderi_s": 0.8910735000000001,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 4.847297985222099e-08
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 7.098606147337705e-10,
+     "max_dg_vs_R": 1.3612522934636218e-05
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 6.925802154000849e-10,
+     "max_dg_vs_R": 1.3891523618525525e-05
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  },
+  {
+   "tag": "testosterone_r2scan3c_def2-mtzvpp",
+   "molecule": "testosterone",
+   "method": "r2scan3c",
+   "basis": "def2-mtzvpp",
+   "roles": {
+    "O": {
+     "status": "ok",
+     "median_sample_s": 17.1779185,
+     "median_t_cderi_s": 1.3521755,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "B": {
+     "status": "ok",
+     "median_sample_s": 9.67535,
+     "median_t_cderi_s": 1.3444289999999999,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "R": {
+     "status": "ok",
+     "median_sample_s": 16.8643925,
+     "median_t_cderi_s": 1.3436395,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": false
+    },
+    "C": {
+     "status": "ok",
+     "median_sample_s": 12.642897999999999,
+     "median_t_cderi_s": 1.34273,
+     "n_repeats": 8,
+     "all_converged": true,
+     "scf_fp32_actual": true
+    }
+   },
+   "gates": {
+    "O": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 4.547473508864641e-13,
+     "max_dg_vs_R": 2.3314683517128287e-12
+    },
+    "B": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 2.2737367544323206e-12,
+     "max_dg_vs_R": 1.7288294817063843e-05
+    },
+    "R": {
+     "pass": true,
+     "reason": null
+    },
+    "C": {
+     "pass": true,
+     "reason": null,
+     "max_dE_vs_R": 1.3642420526593924e-12,
+     "max_dg_vs_R": 1.6328920139585534e-05
+    }
+   },
+   "gate_pass": true,
+   "auto_class": "actual_scf_fp32"
+  }
+ ],
+ "vs_official_stats": {
+  "path": "/data/results/gpu4pyscf-agent/tasks/issue-9/2026-10-30-benchv1-exec/benchv1-obcr-stats.json",
+  "official_generated_at": "2026-10-30T20:06:12Z",
+  "disagreements": [],
+  "verdict": "AGREE"
+ },
+ "verdict": "OK"
+}

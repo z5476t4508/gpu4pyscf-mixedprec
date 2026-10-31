@@ -1,0 +1,52 @@
+{
+ "schema": "benchv1-snt2-firstview-record-v1",
+ "written_at_utc": "2026-10-30T22:00:00Z",
+ "first_view_utc": "2026-10-30T21:58:45Z",
+ "session": "20261030T210359087602Z",
+ "preregistration": {
+  "path": "/data/work/gpu4pyscf-agent/state/long-chain/roadmap-3q-20261030-work/sentinel-preregistration.json",
+  "sha256": "0e64677a7687b56ea6889d2b59de52bb3c28f4f09a4d9bd675a66b5a9341668d",
+  "written_at_utc": "2026-10-30T06:56:53Z",
+  "rule_applied_verbatim": "max |g_FD - g_auto| <= 3e-4 Eh/Bohr (3x the ~1e-4 FD cancellation floor); both steps 0.001/0.002 Bohr reported; fail-closed on missing/non-ok runs; no band re-decision at first view",
+  "no_fd_output_existed_at_prereg": true
+ },
+ "result_file": {
+  "path": "/data/results/gpu4pyscf-agent/tasks/issue-9/2026-10-30-benchv1-sentinels/snt2/fd-results.json",
+  "sha256": "105de9090e6844de9d6b275b182f59e88bbf1cd4e7c55a9d33c8430fca1030b8",
+  "created_utc": "2026-10-30T21:56:15Z"
+ },
+ "harness": {
+  "path": "mixedprec/benchmark/rtx4090/benchv1_snt2_fd.py",
+  "sha256": "dda1cd3143209e0fcae74d6ab471fef6c53385da523350a98fa102dcf2edaa5a",
+  "sha_matches_prereg_pin": true
+ },
+ "inputs": {
+  "cytosine_b3lyp_def2-svp": {"atoms": [8, 12], "geometry_sha256": "c59e23e40a22173b252f37811f94c35e59bf3ae24852575a323c17b37e521b98", "atom12_choice_norms": {"11": 0.003953244503444574, "12": 0.006322687486651249}},
+  "acetaminophen_wb97mv_def2-svp": {"atoms": [19, 2], "geometry_sha256": "170e60b75fc510557cf3d8d97b4d8df00f3753f7641ea7f4c9bc4016d20d1c96"},
+  "settings": "schedule-v2 scientific settings verbatim (conv_tol 1e-10, max_cycle 50, minao, direct_scf_tol 1e-14, grids 3, nlcgrids 3, def2-universal-jkfit); lane auto, samples 3, 48/48 runs rc=0 (run.log), one bounded infra retry allowed per run, none needed"
+ },
+ "verdict": {
+  "cytosine_b3lyp_def2-svp": {
+   "step_0.0010_max_abs_delta": 1.2173625158845569e-05,
+   "step_0.0020_max_abs_delta": 1.2233921815402171e-05,
+   "threshold": 0.0003,
+   "within_preregistered_band": true
+  },
+  "acetaminophen_wb97mv_def2-svp": {
+   "step_0.0010_max_abs_delta": 2.367693424165651e-05,
+   "step_0.0020_max_abs_delta": 2.3680714329010755e-05,
+   "threshold": 0.0003,
+   "within_preregistered_band": true
+  },
+  "all_cell_steps_within_band": true,
+  "worst_component": "acetaminophen #19(H) x-axis, |delta| 2.368e-05 Eh/Bohr at both steps"
+ },
+ "observations_nonnormative": [
+  "measured_noise_floor 0.0 at every cell-step: all 3 repeats per run returned bitwise-identical e_tot, so repeat scatter sets no floor; the preregistered nominal 1e-4 floor remains the band basis (no re-derivation made)",
+  "step-consistency: per-component deltas at 0.001 and 0.002 Bohr are nearly equal (worst 1.2174e-5 vs 1.2234e-5; 2.3677e-5 vs 2.3681e-5) instead of scaling ~h^2 (truncation) or scattering (cancellation noise); the FD-vs-analytic difference is dominated by a small systematic component common to both steps. Recorded as an interpretation note; root cause is NOT claimed here",
+  "the worst deltas (~2.4e-5) are below but of the order of the 3e-5 matching-R gradient gate; per prereg semantics this FD diagnostic can neither pass nor fail that gate and confers no acceptance"
+ ],
+ "semantics": "diagnostic only; never the 3e-5 Eh/Bohr mixed-precision gate; not independent acceptance; independent acceptance stays pending (M4); review_pending=true",
+ "exposure_statement": "preregistration (bands, atom indices, interpretation rules) was written 2026-10-30T06:56:53Z when no FD output existed; fd-results.json was first read by this live session at 2026-10-30T21:58:45Z, immediately after the chain compare stage wrote it (21:56:15Z) and before any other session viewed it; the chain log explicitly deferred the first-view band decision to a live session",
+ "chain_continuity": "S batch launched by the orchestrator at 2026-10-30T21:56:15Z after HEAD gate PASS (d898e96dcf86517c44fe78b9761a371e9f24b35c); this record did not interrupt, pause or modify the chain"
+}

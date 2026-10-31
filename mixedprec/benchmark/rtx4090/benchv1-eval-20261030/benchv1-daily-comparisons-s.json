@@ -1,0 +1,20 @@
+{
+ "schema": "benchv1-daily-comparisons-s-v1",
+ "generated_at_utc": "2026-10-31T11:40:11Z",
+ "arms_source_commit": "8d144edf6ff16211147cb149ffe6dfdc38478e0f",
+ "schedule_sha256": "f3be99507378cd3430b413036dbe9a494b44feb105b81c7317ba2d9397488229",
+ "stats_generated_at_utc": "2026-10-31T11:40:10Z",
+ "stats_tool_commit": "d898e96",
+ "counts": {
+  "planned": 64,
+  "certified_ok": 64,
+  "failed_or_missing": 0
+ },
+ "b_to_s": {
+  "n": 64,
+  "primary_geomean": 0.36001270143760766,
+  "median_ratio": 0.44926878010112353,
+  "total_time_ratio": 0.23645296361296053
+ },
+ "note": "S 成本含其自身验证/匹配/回退开销，绝不借用 C 加速；比值<1 表示认证路线比纯优化 FP64 更贵（诚实方向）；仅证书齐全的个案进入 B_to_S 子集，缺失/未认证个案保持可见，绝不以子集替代全集"
+}
