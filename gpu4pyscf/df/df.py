@@ -15,6 +15,8 @@
 
 import ctypes
 import contextlib
+import os
+import warnings
 import cupy
 import numpy as np
 import cupy as cp
@@ -39,6 +41,50 @@ MIN_BLK_SIZE = 256
 ALIGNED = getattr(__config__, 'ao_aligned', 32)
 
 LINEAR_DEP_THR = incore.LINEAR_DEP_THR
+
+# SP-28 (2026-10-26): a persistent float32 mirror of the CDERI serves
+# repeated fp32 get_jk calls (the 'auto' SCF policy runs its fp32 head
+# cycles against a float64 CDERI, re-casting the unchanged tensor on
+# every cycle otherwise).  The mirror is bitwise-identical to the
+# per-call astype; size-guarded and fail-closed to the per-call path.
+# Default ON; kill-switch GPU4PYSCF_CDERI_F32_CACHE=0; byte cap
+# GPU4PYSCF_CDERI_F32_CACHE_MAX_BYTES (default 2 GiB).
+_CDERI_F32_CACHE = None       # cached env value; None = not yet read
+_CDERI_F32_CACHE_MAX_BYTES = None
+_CDERI_F32_CACHE_DEFAULT_BYTES = 2 * 1024**3
+
+
+def _f32_cache_enabled():
+    global _CDERI_F32_CACHE
+    if _CDERI_F32_CACHE is None:
+        raw = os.environ.get('GPU4PYSCF_CDERI_F32_CACHE', '')
+        if raw in ('', '1'):
+            _CDERI_F32_CACHE = True
+        elif raw == '0':
+            _CDERI_F32_CACHE = False
+        else:
+            warnings.warn(f'GPU4PYSCF_CDERI_F32_CACHE={raw!r} ignored; '
+                          'expected 1 (fp32 cderi mirror, the default) or '
+                          '0 (per-call cast path)')
+            _CDERI_F32_CACHE = True
+    return _CDERI_F32_CACHE
+
+
+def _f32_cache_max_bytes():
+    global _CDERI_F32_CACHE_MAX_BYTES
+    if _CDERI_F32_CACHE_MAX_BYTES is None:
+        raw = os.environ.get('GPU4PYSCF_CDERI_F32_CACHE_MAX_BYTES', '')
+        try:
+            value = int(raw) if raw else _CDERI_F32_CACHE_DEFAULT_BYTES
+            if value <= 0:
+                raise ValueError(raw)
+        except ValueError:
+            warnings.warn(f'GPU4PYSCF_CDERI_F32_CACHE_MAX_BYTES={raw!r} '
+                          'ignored; expected a positive integer of bytes')
+            value = _CDERI_F32_CACHE_DEFAULT_BYTES
+        _CDERI_F32_CACHE_MAX_BYTES = value
+    return _CDERI_F32_CACHE_MAX_BYTES
+
 
 class DF(lib.StreamObject):
 
@@ -66,13 +112,14 @@ class DF(lib.StreamObject):
 
         self.auxmol = None
         self._cderi = None
+        self._cderi_f32 = None
         self._cderi_idx = None
         self._cd_j2c = None
         self._rsh_df = {}
         self._rsh_parameters = None
 
     __getstate__, __setstate__ = lib.generate_pickle_methods(
-        excludes=('intopt', '_cderi'))
+        excludes=('intopt', '_cderi', '_cderi_f32'))
 
     @property
     def auxbasis(self):
@@ -93,6 +140,8 @@ class DF(lib.StreamObject):
     def build(self, *, direct_scf_tol=None,
               omega=None, lr_factor=None, sr_factor=None,
               build_cderi=True):
+        # a rebuilt tensor must never be served by a stale fp32 mirror
+        self._cderi_f32 = None
         mol = self.mol
         auxmol = self.auxmol
         log = logger.new_logger(mol, mol.verbose)
@@ -110,6 +159,11 @@ class DF(lib.StreamObject):
             self._cderi, self._cderi_idx = _cholesky_eri(
                 intopt, omega=omega, lr_factor=lr_factor, sr_factor=sr_factor,
                 use_gpu_memory=self.use_gpu_memory)
+            n_canon = _canonicalize_duplicate_pair_columns(
+                self._cderi, self._cderi_idx[0], mol.nao)
+            if n_canon > 0:
+                log.debug1('canonicalized %d duplicate AO-pair cderi columns',
+                           n_canon)
             log.timer_debug1('cholesky_eri', *t0)
         return self
 
@@ -283,6 +337,93 @@ class DF(lib.StreamObject):
                                          out=work[:,:,:p1-p0])
                     yield out.transpose(2,0,1), cderi_blk
 
+    def _get_cderi_f32_blocks(self, blksize):
+        '''Persistent per-block float32 copies of self._cderi serving
+        repeated fp32 get_jk calls (the 'auto' SCF policy's fp32 head
+        cycles otherwise re-cast the unchanged tensor on every cycle).
+        Each cached block is exactly the array the per-call
+        ``_cast_cderi`` produced (the order='K' astype of the F-ordered
+        tril slice), and the K-side unpack from it is a pure scatter, so
+        serving fp32 contractions from the cache cannot change any SCF
+        trajectory bitwise.  Fail-closed: the kill-switch env, a
+        total-bytes cap and a free-memory check each fall back to the
+        per-call cast path, as does a second distinct blksize on the
+        same device (one cached partition per device, no rebuild churn).
+        Invalidated by build()/reset().
+        '''
+        if self._cderi is None or self._cderi_idx is None:
+            return None
+        if not _f32_cache_enabled():
+            return None
+        device_id = cp.cuda.Device().id
+        key = (device_id, int(blksize))
+        cache = self._cderi_f32
+        if cache is not None:
+            if key in cache:
+                return cache[key]
+            for dev, _bs in cache:
+                if dev == device_id:
+                    return None    # a different partition is already live
+        total_bytes = 4 * sum(c.size for c in self._cderi)
+        if total_bytes > _f32_cache_max_bytes():
+            logger.debug1(self.mol, 'fp32 cderi mirror not cached: '
+                          f'{total_bytes/2**30:.2f} GiB above the cap')
+            return None
+        avail = get_avail_mem()
+        if total_bytes > avail * 0.5:
+            logger.debug1(self.mol, 'fp32 cderi mirror not cached: '
+                          f'{total_bytes/2**30:.2f} GiB above half of '
+                          f'the {avail/2**30:.2f} GiB available')
+            return None
+        c = self._cderi[device_id]
+        if not isinstance(c, cp.ndarray):
+            # host-resident CDERI (use_gpu_memory=False, or automatic
+            # host placement): the astype product stays a NumPy array
+            # while loop_f32()/fill_symmetric() need device pointers.
+            # Keep serving this device from the original loop() host
+            # upload path with its per-call casts (review 2026-10-27 F1)
+            logger.debug1(self.mol, 'fp32 cderi mirror not cached: '
+                          'host-resident cderi on device %d' % device_id)
+            return None
+        blocks = [c[p0:p1].astype(cp.float32)
+                  for p0, p1 in lib.prange(0, c.shape[0], blksize)]
+        if cache is None:
+            cache = self._cderi_f32 = {}
+        cache[key] = blocks
+        return blocks
+
+    def loop_f32(self, blksize=None, unpack=True):
+        '''fp32 counterpart of loop() over the cached per-block float32
+        cderi copies: the J side yields the cached blocks directly and
+        the K side unpacks with fill_symmetric into a reusable float32
+        work buffer, replacing the per-call _cast_cderi pass on both
+        sides.  Requires _get_cderi_f32_blocks() to have admitted the
+        cache; yields the same (unpacked (L,nao,nao) view, tril
+        (L,npairs) block) pairs as loop().
+        '''
+        blocks = self._get_cderi_f32_blocks(blksize)
+        assert blocks is not None
+        nao = self.nao
+        pair_idx = cp.asarray(self._cderi_idx[0], dtype=np.int32)
+        block_size = blocks[0].shape[0]
+        if unpack:
+            work = cp.zeros((nao, nao, block_size), dtype=cp.float32)
+        for i, cderi_blk in enumerate(blocks):
+            if not unpack:
+                yield None, cderi_blk
+            else:
+                out = fill_symmetric(cderi_blk.T, pair_idx, nao, 0,
+                                     cderi_blk.shape[0],
+                                     out=work[:,:,:cderi_blk.shape[0]])
+                blk = out.transpose(2,0,1)
+                if cderi_blk.shape[0] < block_size:
+                    # tail block: mirror the per-call cast's fallback
+                    # layout (plain astype on the strided view) so the
+                    # downstream contracts see the identical stride
+                    # pattern they would with _cast_cderi
+                    blk = blk.astype(cp.float32)
+                yield blk, cderi_blk
+
     def reset(self, mol=None):
         '''Reset mol and clean up relevant attributes for scanner mode'''
         if mol is not None:
@@ -291,6 +432,7 @@ class DF(lib.StreamObject):
             self.intopt = None
             self.j_engine = None
         self._cderi = None
+        self._cderi_f32 = None
         self._cderi_idx = None
         self._cd_j2c = None
         self._rsh_df = {}
@@ -690,6 +832,54 @@ def _cholesky_eri(intopt, *, omega=None, lr_factor=None, sr_factor=None,
 
         cderi = multi_gpu.run(proc, non_blocking=True)
     return cderi, cderi_idx
+
+def _canonicalize_duplicate_pair_columns(cderi, pair_addresses, nao):
+    '''Bitwise-equalize the duplicate AO-pair columns of the CDERI.
+
+    pair_and_diag_indices enumerates the full AO rectangle inside diagonal
+    shell-pair blocks, so the CDERI stores both (i,j) and (j,i) columns for
+    the cross AO pairs of one shell. The two columns hold the same integrals
+    but reach their values through different cart2sph/solve contraction
+    orders, so they can differ at the last bits. fill_symmetric writes both
+    symmetric cells from every column; when the duplicate columns are not
+    bitwise equal, the racing stores make the unpacked CDERI (and the DF
+    exchange matrix) vary between launches. The J path is unaffected (the
+    duplicate pairs carry the diagonal-block dm_sparse halving). Copying the
+    first-occurrence column onto its duplicates restores the intended
+    bitwise (ij|P) == (ji|P) symmetry, which makes the racing writes
+    harmless and the DF exchange build deterministic.
+
+    Returns the number of overwritten duplicate columns.
+    '''
+    if isinstance(pair_addresses, cp.ndarray):
+        pair_np = cp.asnumpy(pair_addresses)
+    else:
+        pair_np = np.asarray(pair_addresses)
+    pair_np = pair_np.astype(np.int64, copy=False).ravel()
+    i, j = np.divmod(pair_np, nao)
+    key = np.minimum(i * nao + j, j * nao + i)
+    order = np.argsort(key, kind='stable')
+    keys = key[order]
+    bounds = np.flatnonzero(np.concatenate(([True], keys[1:] != keys[:-1],
+                                             [True])))
+    src_cols = []
+    dst_cols = []
+    for b0, b1 in zip(bounds[:-1], bounds[1:]):
+        if b1 - b0 > 1:
+            group = order[b0:b1]
+            src_cols.extend([group[0]] * (b1 - b0 - 1))
+            dst_cols.extend(group[1:].tolist())
+    if not dst_cols:
+        return 0
+    src_np = np.asarray(src_cols)
+    dst_np = np.asarray(dst_cols)
+    arrays = cderi.values() if isinstance(cderi, dict) else cderi
+    for arr in arrays:
+        if isinstance(arr, cp.ndarray):
+            arr[:, cp.asarray(dst_np)] = arr[:, cp.asarray(src_np)]
+        else:
+            arr[:, dst_np] = arr[:, src_np]
+    return len(dst_cols)
 
 def _decompose_j2c(auxmol, aux_sorting=None,
                    omega=None, lr_factor=None, sr_factor=None):

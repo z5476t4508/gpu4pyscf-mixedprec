@@ -15,6 +15,9 @@
 import ctypes
 import itertools
 import contextlib
+import os
+import weakref
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import cupy
@@ -42,6 +45,241 @@ AO_ALIGNMENT = getattr(__config__, 'ao_aligned', 16)
 AO_THRESHOLD = 1e-10
 GB = 1024*1024*1024
 NLC_REMOVE_ZERO_RHO_GRID_THRESHOLD = 1e-10
+
+# LC-11: opt-in larger grid-block partition for the SCF-side XC loops.
+# GPU4PYSCF_XC_GRID_BLOCKSIZE=<positive multiple of MIN_BLK_SIZE> re-partitions
+# the grid blocks of _nr_rks_task/_nr_uks_task/nr_nlc_vxc only; the gradient
+# and Hessian callers keep MIN_BLK_SIZE blocks because their scratch buffers
+# are sized to their own module constants.  Measured on RTX 4090
+# (43-222 AO, 61k-128k grid points): the per-block GEMM/launch train is
+# launch-bound, so 8k-64k blocks cut nr_rks wall time 1.27-3.76x across the
+# ladder (best per cell 1.57-3.76x) at fp64 with per-call excsum/nelec
+# differences <= 5e-14 Ha (reduction-order noise) and <= 60 MiB extra peak
+# memory.  Whole-SCF invariance claim CORRECTED (MR1, mainline repair
+# 2026-10-21): the LC-11 ladder cells measured converged energies within
+# 2.3e-13 Ha, but epinephrine/b3lyp/def2-svp (247 AO, 26 atoms, 310k points)
+# shifted -1.932e-06 Ha at 16384 -- the coarse block evaluates the UNION of
+# the covered default blocks' shell sets, a different screened physics
+# (single-knob cause of the epinephrine energy-gate failure, A4 isolation).
+# _block_loop now zeroes the AO rows each covered fine block's own screen
+# dropped (grids.get_partition_fix), restoring the default partition's
+# per-point screening at any block size; only GEMM batching and reduction
+# order differ (floor ~1e-14).
+_XC_GRID_BLKSIZE = None   # cached env value; None = not yet read
+# MR1 (mainline repair 2026-10-21): while a stability_verify strict
+# fp64-reference sibling SCF runs, the SCF XC loops are forced to the DEFAULT
+# grid partition and the reference VV10 UWE kernel regardless of the opt-in
+# process-env knobs (the reference must be the solution the plain default
+# lane reaches; arming GPU4PYSCF_XC_GRID_BLOCKSIZE or
+# the VV10 UWE kernel env knob in the candidate process must not leak
+# into it).
+_strict_fp64_reference_active = False
+
+# SP-30 (scf-priority 2026-10-26): persistent float32 AO-block twins.
+# The grid AO blocks yielded by _block_loop depend only on (mol, grids,
+# screening, blksize) -- all fixed across the SCF cycles -- yet every
+# fp32-mode veff call re-runs ao.astype(float32) on every block: the
+# rho side (_eval_rho2, hit by _nr_rks_task/_nr_uks_task loop-1 and
+# nr_nlc_vxc loop-1) and the Fock side (_nr_rks_task/_nr_uks_task
+# loop-2, which also fires on pure-fp64 lanes through the
+# GPU4PYSCF_SCF_VMAT_F32 knob).  The twin below IS that cast output
+# (values, shape, dtype AND strides -- every downstream GEMM sees
+# identical operands), produced once per (grids, device, blksize,
+# block) instead of per call: bitwise-identical arithmetic, wall-only.
+# Guards mirror the SP-28 cderi-f32 cache: kill-switch
+# GPU4PYSCF_AO_F32_CACHE=0 restores the per-call cast bitwise (default
+# off since the SP-30 paired REJECT; =1 opts in); per-grids admission
+# estimate <= GPU4PYSCF_AO_F32_CACHE_MAX_BYTES
+# (default 2.5 GiB) and <= half of free memory; a per-process total
+# twin budget GPU4PYSCF_AO_F32_CACHE_TOTAL_BYTES (default 4 GiB)
+# enforced on the RESERVED admission estimates, not the partially
+# stored bytes (review 2026-10-27 F2); any
+# rejection fails closed to the per-call cast.  grids._ao_f32_twins:
+# None = untouched, False = rejected (this grids/blksize), dict =
+# admitted partition {device, blksize, stamp, blocks}.  gen_grid drops
+# it wherever _non0ao_idx is dropped.
+_AO_F32_CACHE = None            # cached env; None = not yet read
+_AO_F32_CACHE_MAX_BYTES = None  # cached env; None = not yet read
+_AO_F32_CACHE_TOTAL_BYTES = None    # cached env; None = not yet read
+# live twin accounting: a per-SCF-sample grids object is discarded with
+# its twins, so the process budget must count only LIVE partitions
+# (the first batch run measured the naive cumulative counter rejecting
+# every sample after warmup+sample-1 -- dead grids bytes never released)
+_AO_F32_LIVE_GRIDS = weakref.WeakSet()
+
+
+def _ao_f32_live_stored():
+    total = 0
+    for g in _AO_F32_LIVE_GRIDS:
+        cache = getattr(g, '_ao_f32_twins', None)
+        if isinstance(cache, dict):
+            total += cache.get('stored_bytes', 0)
+    return total
+
+
+def _ao_f32_live_reserved():
+    '''Total budget reserved by LIVE admitted partitions -- their full
+    admission estimates, not their partially-stored bytes.  Admission
+    must reserve the whole partition up front: counting only stored
+    bytes lets a second grids object be admitted while the first is
+    partially filled, and the interleaved lazy per-block population of
+    both then exceeds GPU4PYSCF_AO_F32_CACHE_TOTAL_BYTES (review
+    2026-10-27 F2).  stored <= bytes_est per partition (comp =
+    ao.shape[0] >= 1 at every call site), so reserved bounds actual
+    occupancy; release stays automatic via the live-grids WeakSet and
+    the gen_grid reset hooks.'''
+    total = 0
+    for g in _AO_F32_LIVE_GRIDS:
+        cache = getattr(g, '_ao_f32_twins', None)
+        if isinstance(cache, dict):
+            total += cache.get('bytes_est', 0)
+    return total
+
+
+def _ao_f32_cache_enabled():
+    global _AO_F32_CACHE
+    if _AO_F32_CACHE is None:
+        # SP-30 paired verdict (prereg 2ba5ab9a revert_clause): the
+        # twin cache measured bitwise-clean everywhere but WON only on
+        # benzene-qzvp+NLC (t_scf 0.9553) while REGRESSING the smaller
+        # svp cells 1.2-1.8% (persistent live VRAM + per-sample rebuild
+        # beat the cast savings there; vitamin-924 failed closed under
+        # the caps) -- default OFF, opt-in with GPU4PYSCF_AO_F32_CACHE=1
+        _AO_F32_CACHE = getattr(__config__, 'ao_f32_cache', False)
+        env = os.environ.get('GPU4PYSCF_AO_F32_CACHE')
+        if env is not None:
+            _AO_F32_CACHE = env not in ('0', 'false', 'False')
+    return _AO_F32_CACHE
+
+
+def _ao_f32_max_bytes():
+    global _AO_F32_CACHE_MAX_BYTES
+    if _AO_F32_CACHE_MAX_BYTES is None:
+        _AO_F32_CACHE_MAX_BYTES = int(getattr(
+            __config__, 'ao_f32_cache_max_bytes', 2.5 * GB))
+        env = os.environ.get('GPU4PYSCF_AO_F32_CACHE_MAX_BYTES')
+        if env is not None:
+            _AO_F32_CACHE_MAX_BYTES = int(env)
+    return _AO_F32_CACHE_MAX_BYTES
+
+
+def _ao_f32_total_budget():
+    global _AO_F32_CACHE_TOTAL_BYTES
+    if _AO_F32_CACHE_TOTAL_BYTES is None:
+        _AO_F32_CACHE_TOTAL_BYTES = int(getattr(
+            __config__, 'ao_f32_cache_total_bytes', 4 * GB))
+        env = os.environ.get('GPU4PYSCF_AO_F32_CACHE_TOTAL_BYTES')
+        if env is not None:
+            _AO_F32_CACHE_TOTAL_BYTES = int(env)
+    return _AO_F32_CACHE_TOTAL_BYTES
+
+
+def _ao_f32_cast(ao):
+    '''The fresh fp64->fp32 AO-block cast (named so the twin mechanism
+    and its instrumentation can count it; bitwise-identical output to
+    the historical inline ao.astype(cupy.float32)).'''
+    return ao.astype(cupy.float32)
+
+
+def _ao_f32(ao, grids, opt, loop_blksize, block_id, comp):
+    '''The float32 twin of one unchanged grid-AO block, served from a
+    per-grids cache.  The twin is exactly _ao_f32_cast(ao) produced
+    once; on any guard rejection or partition mismatch the caller gets
+    a fresh cast (today's per-call path, bitwise-identical).'''
+    if not _ao_f32_cache_enabled():
+        return _ao_f32_cast(ao)
+    device = cupy.cuda.Device().id
+    cache = getattr(grids, '_ao_f32_twins', None)
+    if cache is None:
+        # first request on this grids: full-or-none admission from the
+        # screened block shapes (the sparsity cache block_loop uses)
+        try:
+            non0ao_idx = grids.get_non0ao_idx(opt, blksize=loop_blksize)
+            ngrids = grids.coords.shape[0]
+            est = 0
+            for blk, entry in enumerate(non0ao_idx):
+                npts = min(loop_blksize, ngrids - blk * loop_blksize)
+                if npts <= 0:
+                    break
+                est += comp * len(entry[1]) * npts * 4
+        except Exception:
+            est = 1 << 62      # cannot estimate -> fail closed
+        free = get_avail_mem(exclude_memory_pool=True)
+        if (est > _ao_f32_max_bytes() or est > free // 2 or
+                est > _ao_f32_total_budget() - _ao_f32_live_reserved()):
+            grids._ao_f32_twins = False
+            return _ao_f32_cast(ao)
+        cache = grids._ao_f32_twins = {
+            'device': device, 'blksize': loop_blksize,
+            'stamp': id(opt._sorted_mol), 'blocks': {},
+            'bytes_est': est, 'stored_bytes': 0}
+        _AO_F32_LIVE_GRIDS.add(grids)
+    if (cache is False or cache['device'] != device or
+            cache['blksize'] != loop_blksize or
+            cache['stamp'] != id(opt._sorted_mol)):
+        return _ao_f32_cast(ao)
+    twin = cache['blocks'].get(block_id)
+    if twin is not None and twin.shape == ao.shape:
+        return twin
+    twin = _ao_f32_cast(ao)
+    cache['blocks'][block_id] = twin
+    cache['stored_bytes'] = cache.get('stored_bytes', 0) + twin.nbytes
+    return twin
+
+
+def _ao_f32_for_rho(ao, grids, opt, loop_blksize, block_id, comp):
+    '''The rho-side wrapper: serve the twin only when _eval_rho2's
+    internal cast would fire (fp32 mode with the fp32 rho lane);
+    otherwise hand back the fp64 block untouched (the fp64 contraction
+    and the SP-27 opt-in rho-fp64 head are bitwise unaffected).'''
+    if precision.get_precision() == 'fp32' and not _scf_rho_f64_lane:
+        return _ao_f32(ao, grids, opt, loop_blksize, block_id, comp)
+    return ao
+
+def _scf_grid_blksize():
+    '''Effective grid-block size for the SCF XC tasks (opt-in, cached).
+
+    Unset/empty keeps the module default.  A value that is not a positive
+    multiple of MIN_BLK_SIZE falls back to the default with a warning:
+    grid_range boundaries produced by gen_grid_range are MIN_BLK_SIZE
+    aligned, and only multiples of it can be checked with a single modulo.
+    '''
+    if _strict_fp64_reference_active:
+        return MIN_BLK_SIZE
+    global _XC_GRID_BLKSIZE
+    if _XC_GRID_BLKSIZE is None:
+        raw = os.environ.get('GPU4PYSCF_XC_GRID_BLOCKSIZE', '')
+        if raw:
+            try:
+                val = int(raw)
+            except ValueError:
+                val = None
+            if val is None or val <= 0 or val % MIN_BLK_SIZE != 0:
+                warnings.warn(f'GPU4PYSCF_XC_GRID_BLOCKSIZE={raw!r} ignored; '
+                              f'expected a positive multiple of {MIN_BLK_SIZE}')
+                val = MIN_BLK_SIZE
+            _XC_GRID_BLKSIZE = val
+        else:
+            _XC_GRID_BLKSIZE = MIN_BLK_SIZE
+    return _XC_GRID_BLKSIZE
+
+def _effective_scf_blksize(blksize, grid_start, grid_end, ngrids):
+    '''Clamp an SCF loop block size to the device's grid range.
+
+    _block_loop partitions [grid_start, grid_end) in equal blocks and
+    trusts grid_start to be block-aligned; a non-last device range ends at
+    a MIN_BLK_SIZE (not blksize) boundary, so a block could straddle the
+    boundary and double-count points with the next device.  Fall back to
+    MIN_BLK_SIZE unless the range boundaries are blksize-aligned (always
+    true on device 0, the single-GPU case).
+    '''
+    if blksize == MIN_BLK_SIZE:
+        return blksize
+    if grid_start % blksize != 0:
+        return MIN_BLK_SIZE
+    if grid_end != ngrids and grid_end % blksize != 0:
+        return MIN_BLK_SIZE
+    return blksize
 
 # Should we release the cupy cache?
 FREE_CUPY_CACHE = False
@@ -201,15 +439,28 @@ def _eval_rho2(ao, cpos, xctype, with_lapl=False, buf=None, rho=None):
 
     # The AO/MO contractions below are the bulk of the grid work and carry
     # almost no cancellation (rho is a sum of like-signed terms, measured
-    # sum|term|/|result| ~1.6), so float32 keeps ~1e-7 relative accuracy --
-    # well under the quadrature error of the grid itself -- while running
-    # ~25x faster on a consumer GPU. rho itself stays float64 for libxc.
-    if precision.get_precision() == 'fp32':
+    # sum|term|/result| ~1.6), so float32 keeps ~1e-7 relative accuracy --
+    # well under the quadrature error of the grid itself.  rho itself stays
+    # float64 for libxc.  Measured on RTX 4090: per CALL the casts plus
+    # the fp32 contraction cost more than the fp32 math saves on the
+    # profiled cells (SP-26 P5; confirmed per-call by SP-27's paired
+    # batch), BUT the paired whole-SCF measurement REJECTED the fp64 head
+    # as the default (SP-27: winner cells regress 2-3.5% via cycle-
+    # structure coupling -- the more precise rho head switches one cycle
+    # early, trading a cheap fp32 head cycle for an expensive fp64 tail
+    # cycle); the opt-in keeps it available behind
+    # GPU4PYSCF_AUTO_RHO_F64=1 (_scf_rho_f64_lane, armed by scf.hf._kernel
+    # for auto-family kernels only).
+    if precision.get_precision() == 'fp32' and not _scf_rho_f64_lane:
         if ao.dtype != cupy.float32:
             ao = ao.astype(cupy.float32)
         if cpos.dtype != cupy.float32:
             cpos = cpos.astype(cupy.float32)
         buf = None      # the caller's buffer is sized for float64 views
+    elif _scf_rho_f64_lane and cpos.dtype != cupy.float64:
+        # keep the contraction well-defined if a caller hands fp32
+        # coefficients (mixed-dtype dot is version-dependent)
+        cpos = cpos.astype(cupy.float64)
 
     nmo = cpos.shape[1]
     buf = ndarray((nvar,nmo,ngrids), dtype=cpos.dtype, buffer=buf)
@@ -489,6 +740,201 @@ def _f64(a):
     return a.astype(cupy.float64)
 
 
+_SCF_VMAT_F32 = None     # cached env value; None = not yet read;
+                         # False | True ('1') | 'headtail' (LC-115)
+# Set by scf.hf._kernel for the duration of a kernel on a pure-fp64 lane
+# (precision_mode None/'fp64') when the env knob below is on.  The cast
+# condition in _nr_rks_task/_nr_uks_task reads this flag instead of the
+# env directly because the auto policy's fp64 tail also resolves
+# precision.get_precision()=='fp64' and must stay bitwise fp64 (measured
+# e_tot shift 3.5e-11 when the cast is ungated, LC-105 part 3), and the
+# stability-verify strict fp64-reference siblings must never feel the
+# knob (hf._kernel checks mf._strict_fp64_reference).  Standalone
+# nr_rks/nr_uks calls outside an SCF kernel keep the flag's default.
+# In 'headtail' mode (LC-115) scf.hf._kernel_body flips this flag back to
+# False (single trigger) at the first SCF cycle whose end-of-cycle |dE|
+# falls below the auto policy's switch tolerance, so the convergence tail
+# runs on the exact fp64 contraction map.
+_scf_vmat_f32_lane = False
+
+
+# SP-27 (scf-priority-20261025 item 3): the auto-family SCF head CAN keep
+# the numint rho-build contraction (_eval_rho2) in float64 behind
+# GPU4PYSCF_AUTO_RHO_F64=1.  The paired 4-block measurement (SP-27,
+# 2026-10-26, prereg 931605f5) REJECTED it as the default: the per-call
+# fp64 contraction is faster everywhere (head eval-rho wall -10..-33%,
+# confirming SP-26 P5 per-call), but the whole-SCF paired ratio
+# regressed the winner cells 2-3.5% -- the more precise rho head
+# switches one cycle early on lidocaine (6 vs 7), trading a cheap fp32
+# head cycle for an expensive fp64 tail cycle, and vitamin-924's head
+# cycle wall regresses +1.5% despite the component gain; only benzene
+# (the switch-immune loss class) gained (t_scf ratio 0.988).  DEFAULT
+# OFF = the pre-SP-27 fp32-cast head bitwise; the flag stays armed by
+# scf.hf._kernel for auto-family kernels only, so standalone fp32
+# contexts and every other lane are unaffected, and the auto policy's
+# fp64 tail is bitwise unchanged either way.
+_scf_rho_f64_lane = False
+_AUTO_RHO_F64 = None       # cached env value; None = not yet read
+
+
+# SP-31 (scf-priority-20261025 item 3): the auto-family fp32 head CAN
+# skip the NLC/VV10 term of the SCF veff entirely behind
+# GPU4PYSCF_AUTO_HEAD_NLC_SKIP=1 (the head-avoidance mechanism class;
+# DEFAULT OFF).  The head then converges the functional's
+# semilocal(+hybrid) part only; the one-time NLC energy/potential is
+# reintroduced at the first fp64 tail cycle, and the CONVERGED result
+# is the full method's fixed point (the tail runs the exact fp64 map)
+# -- only the SCF path changes, the SP-27 lane-flag discipline: armed
+# by scf.hf._kernel for auto-family kernels only, so the fp64 tail,
+# every pure-fp64/strict lane, standalone nr_nlc_vxc callers and the
+# default (knob absent, bitwise the pre-SP-31 lanes) are unaffected.
+# The counter increments exactly when a suppression fires (never on
+# default lanes) -- the mechanism-served evidence of the SP-31 screen.
+_scf_head_nlc_skip_lane = False
+_AUTO_HEAD_NLC_SKIP = None     # cached env value; None = not yet read
+_head_nlc_skip_count = 0
+
+
+def _auto_head_nlc_skip():
+    '''Whether the auto-family fp32 head skips the NLC/VV10 veff term
+    (opt-in GPU4PYSCF_AUTO_HEAD_NLC_SKIP=1; default off = the head
+    evaluates the full functional, the pre-SP-31 behavior bitwise).'''
+    global _AUTO_HEAD_NLC_SKIP
+    if _AUTO_HEAD_NLC_SKIP is None:
+        raw = os.environ.get('GPU4PYSCF_AUTO_HEAD_NLC_SKIP', '')
+        if raw == '1':
+            _AUTO_HEAD_NLC_SKIP = True
+        elif raw in ('', '0'):
+            _AUTO_HEAD_NLC_SKIP = False
+        else:
+            warnings.warn(f'GPU4PYSCF_AUTO_HEAD_NLC_SKIP={raw!r} ignored; '
+                          'expected 1 (skip the NLC term in the auto fp32 '
+                          'head, opt-in) or 0 (full functional head, the '
+                          'default)')
+            _AUTO_HEAD_NLC_SKIP = False
+    return _AUTO_HEAD_NLC_SKIP
+
+
+def _scf_head_nlc_suppressed():
+    '''True iff this veff call must skip its NLC term: the auto-family
+    head-avoidance lane flag is armed AND the ambient precision is the
+    policy's fp32 head.  Increments _head_nlc_skip_count exactly when
+    it suppresses (the SP-31 mechanism-served counter).'''
+    global _head_nlc_skip_count
+    if _scf_head_nlc_skip_lane and precision.get_precision() == 'fp32':
+        _head_nlc_skip_count += 1
+        return True
+    return False
+
+
+def _auto_rho_f64():
+    '''Whether the auto-family head keeps the rho contraction in float64
+    (opt-in GPU4PYSCF_AUTO_RHO_F64=1; default off = the fp32-cast head,
+    the SP-27 REJECT measurement).'''
+    global _AUTO_RHO_F64
+    if _AUTO_RHO_F64 is None:
+        raw = os.environ.get('GPU4PYSCF_AUTO_RHO_F64', '')
+        if raw == '1':
+            _AUTO_RHO_F64 = True
+        elif raw in ('', '0'):
+            _AUTO_RHO_F64 = False
+        else:
+            warnings.warn(f'GPU4PYSCF_AUTO_RHO_F64={raw!r} ignored; '
+                          'expected 1 (float64 rho head, opt-in) or 0 '
+                          '(fp32-cast head, the default)')
+            _AUTO_RHO_F64 = False
+    return _AUTO_RHO_F64
+
+
+def _scf_vmat_f32():
+    '''Whether to run the SCF-side XC vmat grid contractions in float32
+    on pure-fp64 SCF lanes (opt-in precision-policy knob, LC-105).
+
+    GPU4PYSCF_SCF_VMAT_F32=1 casts the block AO to float32 for the vmat
+    contraction loop of _nr_rks_task/_nr_uks_task only.  The discipline
+    is the existing fp32_grid path of the auto policy's fp32 head: the
+    density (rho_tot) and the excsum/nelec accumulators keep their fp64
+    AO (bitwise-identical; both passes precede the loop), the
+    _scale_ao/_tau_dot/contract helpers run in the operands' float32
+    dtype, and vmat itself accumulates in float64 (add_sparse/_f64).
+    Measured (2026-10-13-lc105, recommended stack, fresh processes):
+    whole-SCF t_scf 1.122x wb97m-v/benzene/tzvp and 1.137x m06-2x
+    (MGGA tau-train cells), honest parity on b3lyp (plain GGA) and a
+    within-noise no-win on the UKS methoxy cell; converged e_tot shifts
+    <= 6.8e-11 Ha (well below the 1e-6 gate, far above the ~1e-13
+    cross-process floor); excsum/nelec bitwise unchanged, max|d vmat|
+    1.9e-6 at identical dm.  Active ONLY on pure-fp64 lanes: the auto
+    family's fp64 tail and stability_verify's strict references are
+    excluded at the scf.hf lane gate.  With the knob on, the fp64-lane
+    SCF is no longer the bitwise strict fp64 reference ((b3)-class
+    precision policy, cf. GPU4PYSCF_DF_IP1_F32/GPU4PYSCF_GRAD_GRID_F32).
+
+    GPU4PYSCF_SCF_VMAT_F32=headtail (LC-115) runs the same fp32
+    contractions in the SCF head only: scf.hf._kernel_body flips the lane
+    flag off (single trigger) at the first cycle-end |dE| below the auto
+    policy's precision-switch tolerance, so the convergence tail uses
+    the exact fp64 contraction map.  Motivation (measured,
+    2026-10-13-lc108/-lc114): the full knob's fp32 tail perturbs the
+    SCF map's fixed point (+7.9e-9 displaced basin, 3/3 non-convergence
+    at the 50-cycle production cap at 687 AO, ~1e-10 knife-edge limit
+    cycle), while the head/tail discipline restores the true fp64 fixed
+    point at ANY size: 687 AO 3/3 converged in 14 cycles (identical to
+    knob-off) at t_scf 1.510x, +1.09e-11; 420 AO 1.428x, +6.8e-13;
+    222 AO 1.284x, +3.6e-11 (each vs the same-session knob-off lane;
+    the full knob measures 2.56x/2.29x and 1.43x/1.30x there).  The
+    knob-on-lane is still not the bitwise strict fp64 reference (the
+    head's trajectory differs); strict adjudication keeps knob-off
+    records.
+    '''
+    global _SCF_VMAT_F32
+    if _SCF_VMAT_F32 is None:
+        raw = os.environ.get('GPU4PYSCF_SCF_VMAT_F32', '')
+        if raw == '1':
+            _SCF_VMAT_F32 = True
+        elif raw == 'headtail':
+            _SCF_VMAT_F32 = 'headtail'
+        elif raw:
+            warnings.warn(f'GPU4PYSCF_SCF_VMAT_F32={raw!r} ignored; '
+                          'expected 1 (fp32 vmat contractions) or '
+                          'headtail (fp32 head, exact-fp64 tail) on '
+                          'pure-fp64 lanes')
+            _SCF_VMAT_F32 = False
+        else:
+            _SCF_VMAT_F32 = False
+    return _SCF_VMAT_F32
+
+
+@contextlib.contextmanager
+def strict_fp64_reference_ctx():
+    '''MR1 (mainline repair 2026-10-21): run the body under the DEFAULT
+    numerics for every opt-in process-global SCF knob this module controls.
+
+    Used by stability_verify around its strict fp64-reference sibling
+    trajectories (both the 'auto+verify' and 'auto+strict' policies): the
+    sibling must reproduce the solution the plain DEFAULT lane reaches, so
+    an armed GPU4PYSCF_XC_GRID_BLOCKSIZE (whose coarse-block GEMM
+    re-partition, before MR1's partition fix, evaluated the union of the
+    covered default blocks' shell sets -- a different screened physics) or
+    the fp32 VV10 UWE kernel (the UWE env knob at 'fp32', a
+    process-lifetime C-side kernel selection) must not leak into it.
+    Restores everything on exit, including on exception.
+    '''
+    global _strict_fp64_reference_active
+    saved = _strict_fp64_reference_active
+    _strict_fp64_reference_active = True
+    # the VV10 UWE kernel selection is a process-lifetime C-side decision
+    # (env-cached); force the reference kernel for the body and restore
+    # exactly (saved -1 = follow the env-cached selection)
+    libgdft.VV10_uwe_kernel_set_override.restype = ctypes.c_int
+    libgdft.VV10_uwe_kernel_set_override.argtypes = [ctypes.c_int]
+    saved_uwe = int(libgdft.VV10_uwe_kernel_set_override(0))
+    try:
+        yield
+    finally:
+        _strict_fp64_reference_active = saved
+        libgdft.VV10_uwe_kernel_set_override(saved_uwe)
+
+
 def _nr_rks_task(ni, mol, grids, xc_code, dm, mo_coeff, mo_occ,
                  verbose=None, with_lapl=False, device_id=0, hermi=1):
     ''' nr_rks task on given device
@@ -518,6 +964,8 @@ def _nr_rks_task(ni, mol, grids, xc_code, dm, mo_coeff, mo_occ,
         log.debug1(f"{ngrids_local} grids on Device {device_id}")
         if ngrids_local <= 0:
             return cupy.zeros((nao, nao)), 0, 0
+        loop_blksize = _effective_scf_blksize(
+            _scf_grid_blksize(), grid_start, grid_end, ngrids_glob)
 
         weights = cupy.empty([ngrids_local])
         if xctype == 'LDA':
@@ -528,19 +976,19 @@ def _nr_rks_task(ni, mol, grids, xc_code, dm, mo_coeff, mo_occ,
             rho_tot = cupy.empty([5,ngrids_local])
 
         if mo_coeff is None:
-            buf = cupy.empty(MIN_BLK_SIZE * nao)
+            buf = cupy.empty(loop_blksize * nao)
             dm_mask_buf = cupy.empty(nao*nao)
         else:
             mo_coeff = cupy.asarray(mo_coeff[:,mo_occ>0], order='C')
             mo_coeff *= mo_occ[mo_occ>0]**.5
             nocc = mo_coeff.shape[1]
             mo_buf = cupy.empty(nao*nocc)
-            buf = cupy.empty(MIN_BLK_SIZE * max(2*nocc, nao))
+            buf = cupy.empty(loop_blksize * max(2*nocc, nao))
 
         p0 = p1 = 0
         for ao_mask, idx, weight, _ in ni.block_loop(
                 _sorted_mol, grids, nao, ao_deriv, max_memory=None,
-                grid_range=(grid_start, grid_end)):
+                grid_range=(grid_start, grid_end), loop_blksize=loop_blksize):
             p0, p1 = p1, p1 + weight.size
             nao_sub = len(idx)
             #TODO: If AO is sparse enough, use density matrix to calculate rho
@@ -554,7 +1002,11 @@ def _nr_rks_task(ni, mol, grids, xc_code, dm, mo_coeff, mo_occ,
                 assert hermi == 1
                 cpos = mo_buf[:nao_sub*nocc].reshape(nao_sub,nocc)
                 cpos = cupy.take(mo_coeff, idx, axis=0, out=cpos)
-                rho_tot[:,p0:p1] = _eval_rho2(ao_mask, cpos, xctype, with_lapl, buf=buf)
+                ao_arg = _ao_f32_for_rho(
+                    ao_mask, grids, opt, loop_blksize,
+                    grid_start // loop_blksize + p0 // loop_blksize,
+                    ao_mask.shape[0])
+                rho_tot[:,p0:p1] = _eval_rho2(ao_arg, cpos, xctype, with_lapl, buf=buf)
         t0 = log.timer_debug1(f'eval rho on Device {device_id}', *t0)
         dm_mask_buf = mo_buf = mo_coeff = None
 
@@ -583,14 +1035,21 @@ def _nr_rks_task(ni, mol, grids, xc_code, dm, mo_coeff, mo_occ,
         # The Fock-side contraction ao @ (ao*w)^T is the single largest GEMM of
         # the grid work and, like the density side, carries no cancellation.
         # In fp32 it runs ~28x faster on a consumer GPU; vmat stays float64.
+        # LC-105: contr_f32 extends the fp32-grid discipline to pure-fp64
+        # SCF lanes behind the opt-in GPU4PYSCF_SCF_VMAT_F32 knob; rho
+        # (built above from the fp64 AO) and excsum/nelec are unchanged.
         fp32_grid = precision.get_precision() == 'fp32'
+        contr_f32 = fp32_grid or _scf_vmat_f32_lane
         for ao_mask, idx, weight, _ in ni.block_loop(
                 _sorted_mol, grids, nao, ao_deriv, max_memory=None,
-                grid_range=(grid_start, grid_end)):
+                grid_range=(grid_start, grid_end), loop_blksize=loop_blksize):
             p1 = p0 + weight.size
             nao_sub = len(idx)
-            if fp32_grid:
-                ao_mask = ao_mask.astype(cupy.float32)
+            if contr_f32:
+                ao_mask = _ao_f32(
+                    ao_mask, grids, opt, loop_blksize,
+                    grid_start // loop_blksize + p0 // loop_blksize,
+                    ao_mask.shape[0])
                 vtmp = None
                 scale_buf = None
             else:
@@ -939,6 +1398,8 @@ def _nr_uks_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
         log.debug(f"{ngrids_local} grids on Device {device_id}")
         if ngrids_local <= 0:
             return np.zeros((2,1)), np.zeros(1), cupy.zeros((2, nset, nao, nao))
+        loop_blksize = _effective_scf_blksize(
+            _scf_grid_blksize(), grid_start, grid_end, ngrids_glob)
 
         weights = cupy.empty([ngrids_local])
         if xctype == 'LDA':
@@ -949,7 +1410,7 @@ def _nr_uks_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
             rho_tot = cupy.empty([2, nset, 5, ngrids_local])
 
         if mo_coeff is None:
-            buf = cupy.empty(MIN_BLK_SIZE * nao)
+            buf = cupy.empty(loop_blksize * nao)
             dm_mask_buf = cupy.empty(nao*nao)
         else:
             mo_coeff_alpha = cupy.asarray(mo_coeff[0][:, mo_occ[0]>0], order='C')
@@ -959,12 +1420,13 @@ def _nr_uks_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
             nocc_alpha = mo_coeff_alpha.shape[1]
             nocc_beta = mo_coeff_beta.shape[1]
             mo_buf = cupy.empty(nao*max(nocc_alpha, nocc_beta))
-            buf= cupy.empty(MIN_BLK_SIZE * max(2*nocc_alpha, 2*nocc_beta, nao))
+            buf= cupy.empty(loop_blksize * max(2*nocc_alpha, 2*nocc_beta, nao))
 
         p0 = p1 = 0
         for ao_mask, idx, weight, _ in ni.block_loop(_sorted_mol, grids, nao, ao_deriv,
                                                      max_memory=None,
-                                                     grid_range=(grid_start, grid_end)):
+                                                     grid_range=(grid_start, grid_end),
+                                                     loop_blksize=loop_blksize):
             p0, p1 = p1, p1 + weight.size
             nao_sub = len(idx)
             for i in range(nset):
@@ -981,12 +1443,16 @@ def _nr_uks_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
                                      with_lapl=with_lapl, buf=buf)
                 else:
                     assert hermi == 1
+                    ao_arg = _ao_f32_for_rho(
+                        ao_mask, grids, opt, loop_blksize,
+                        grid_start // loop_blksize + p0 // loop_blksize,
+                        ao_mask.shape[0])
                     cpos_alpha = cupy.ndarray((nao_sub, nocc_alpha) , memptr=mo_buf.data)
                     cpos_alpha = cupy.take(mo_coeff_alpha, idx, axis=0, out=cpos_alpha)
-                    _eval_rho2(ao_mask, cpos_alpha, xctype, with_lapl, buf=buf, rho=rho_tot[0, i, :, p0:p1])
+                    _eval_rho2(ao_arg, cpos_alpha, xctype, with_lapl, buf=buf, rho=rho_tot[0, i, :, p0:p1])
                     cpos_beta = cupy.ndarray((nao_sub, nocc_beta) , memptr=mo_buf.data)
                     cpos_beta = cupy.take(mo_coeff_beta, idx, axis=0, out=cpos_beta)
-                    _eval_rho2(ao_mask, cpos_beta, xctype, with_lapl, buf=buf, rho=rho_tot[1, i, :, p0:p1])
+                    _eval_rho2(ao_arg, cpos_beta, xctype, with_lapl, buf=buf, rho=rho_tot[1, i, :, p0:p1])
         t0 = log.timer_debug1(f'eval rho on Device {device_id}', *t0)
         dm_mask_buf = mo_buf = mo_coeff = None
         weights = cupy.asarray(grids.weights[grid_start:grid_end])
@@ -1018,14 +1484,21 @@ def _nr_uks_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
         p0 = p1 = 0
         # see _nr_rks_task: the grid contractions do not cancel, so float32
         # keeps ~1e-7 here while vmat stays float64
+        # LC-105: contr_f32 extends the fp32-grid discipline to pure-fp64
+        # SCF lanes behind the opt-in GPU4PYSCF_SCF_VMAT_F32 knob.
         fp32_grid = precision.get_precision() == 'fp32'
+        contr_f32 = fp32_grid or _scf_vmat_f32_lane
         for ao_mask, idx, weight, _ in ni.block_loop(_sorted_mol, grids, nao, ao_deriv,
                                                      max_memory=None,
-                                                     grid_range=(grid_start, grid_end)):
+                                                     grid_range=(grid_start, grid_end),
+                                                     loop_blksize=loop_blksize):
             p0, p1 = p1, p1 + weight.size
             nao_sub = len(idx)
-            if fp32_grid:
-                ao_mask = ao_mask.astype(cupy.float32)
+            if contr_f32:
+                ao_mask = _ao_f32(
+                    ao_mask, grids, opt, loop_blksize,
+                    grid_start // loop_blksize + p0 // loop_blksize,
+                    ao_mask.shape[0])
                 vtmp = None
                 scale_buf = None
             else:
@@ -1756,16 +2229,34 @@ def nr_nlc_vxc(ni, mol, grids, xc_code, dms, relativity=0, hermi=1,
 
     ao_deriv = 1
     vvrho = []
+    # grids may still be unbuilt here; _block_loop builds them lazily
+    # (numint._block_loop coords-None path), so read ngrids only after
+    # that.  A None ngrids_glob means "derive the block size inside the
+    # loop from the first block's coords" -- the single-GPU grid range is
+    # always (0, ngrids), so device-0 alignment holds for any blksize.
+    ngrids_glob = None if grids.coords is None else grids.coords.shape[0]
+    if ngrids_glob is None:
+        loop_blksize = _scf_grid_blksize()
+    else:
+        loop_blksize = _effective_scf_blksize(_scf_grid_blksize(), 0,
+                                              ngrids_glob, ngrids_glob)
+    p0 = 0
     for ao, idx, weight, coords \
-            in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, max_memory=max_memory):
+            in ni.block_loop(_sorted_mol, grids, nao, ao_deriv,
+                             max_memory=max_memory,
+                             loop_blksize=loop_blksize):
         if mo_coeff is None:
             rho = eval_rho(_sorted_mol, ao, dms[idx[:,None],idx], xctype='GGA', hermi=1)
-        elif mo_coeff.ndim == 2:
-            rho = eval_rho2(_sorted_mol, ao, mo_coeff[idx,:], mo_occ, None, 'GGA')
         else:
-            rho  = eval_rho2(_sorted_mol, ao, mo_coeff[0,idx,:], mo_occ[0], None, 'GGA')
-            rho += eval_rho2(_sorted_mol, ao, mo_coeff[1,idx,:], mo_occ[1], None, 'GGA')
+            ao_arg = _ao_f32_for_rho(ao, grids, opt, loop_blksize,
+                                     p0 // loop_blksize, ao.shape[0])
+            if mo_coeff.ndim == 2:
+                rho = eval_rho2(_sorted_mol, ao_arg, mo_coeff[idx,:], mo_occ, None, 'GGA')
+            else:
+                rho  = eval_rho2(_sorted_mol, ao_arg, mo_coeff[0,idx,:], mo_occ[0], None, 'GGA')
+                rho += eval_rho2(_sorted_mol, ao_arg, mo_coeff[1,idx,:], mo_occ[1], None, 'GGA')
         vvrho.append(rho)
+        p0 += weight.size
 
     rho = cupy.hstack(vvrho)
     t1 = log.timer_debug1('eval rho', *t0)
@@ -1787,7 +2278,9 @@ def nr_nlc_vxc(ni, mol, grids, xc_code, dms, relativity=0, hermi=1,
     vmat = cupy.zeros((nao,nao))
     p1 = 0
     for ao, mask, weight, coords \
-            in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, max_memory=max_memory):
+            in ni.block_loop(_sorted_mol, grids, nao, ao_deriv,
+                             max_memory=max_memory,
+                             loop_blksize=loop_blksize):
         p0, p1 = p1, p1 + weight.size
         wv = vv_vxc[:,p0:p1] * weight
         wv[0] *= .5
@@ -2073,7 +2566,8 @@ def _sparse_index(mol, coords, l_ctr_offsets, ao_loc, opt=None):
     return pad, idx, non0shl_idx, ctr_offsets_slice, ao_loc_slice
 
 def _block_loop(ni, mol, grids, nao=None, deriv=0, max_memory=2000,
-                non0tab=None, blksize=None, buf=None, extra=0, grid_range=None, strict_grid_order=False):
+                non0tab=None, blksize=None, buf=None, extra=0, grid_range=None, strict_grid_order=False,
+                loop_blksize=None):
     '''
     Generator loops over grids block-by-block.
     Kwargs:
@@ -2084,6 +2578,11 @@ def _block_loop(ni, mol, grids, nao=None, deriv=0, max_memory=2000,
         buf: dummy argument for compatibility with PySCF
         grid_range: loop [grid_start, grid_end] in grids only. Both values has to be multiple of MIN_BLK_SIZE.
         strict_grid_order: if True, no grids will be skipped, even if ao dimension is zero.
+        loop_blksize: internal block partition size for this loop only.
+            Must be a multiple of MIN_BLK_SIZE (the grid_range alignment
+            unit, see _effective_scf_blksize).  None keeps MIN_BLK_SIZE.
+            The per-block AO-sparsity cache on `grids` is keyed by this
+            size, so different sizes can coexist on the same grids object.
     '''
     log = logger.new_logger(mol)
     if grids.coords is None:
@@ -2092,6 +2591,9 @@ def _block_loop(ni, mol, grids, nao=None, deriv=0, max_memory=2000,
         nao = mol.nao
     if blksize is not None:
         assert blksize == MIN_BLK_SIZE
+    if loop_blksize is None:
+        loop_blksize = MIN_BLK_SIZE
+    assert loop_blksize % MIN_BLK_SIZE == 0
 
     ngrids = grids.size
     if grid_range is None:
@@ -2102,8 +2604,8 @@ def _block_loop(ni, mol, grids, nao=None, deriv=0, max_memory=2000,
         return
 
     assert grid_start % MIN_BLK_SIZE == 0
-    block_start = grid_start // MIN_BLK_SIZE
-    block_end = (grid_end + MIN_BLK_SIZE - 1) // MIN_BLK_SIZE
+    block_start = grid_start // loop_blksize
+    block_end = (grid_end + loop_blksize - 1) // loop_blksize
 
     device_id = cupy.cuda.Device().id
     log.debug1(f'{grid_start} - {grid_end} grids are calculated on Device {device_id}.')
@@ -2123,16 +2625,31 @@ def _block_loop(ni, mol, grids, nao=None, deriv=0, max_memory=2000,
         opt = ni.gdftopt
     _sorted_mol = opt._sorted_mol
 
-    non0ao_idx = grids.get_non0ao_idx(opt)
+    non0ao_idx = grids.get_non0ao_idx(opt, blksize=loop_blksize)
     nao_max = max(len(x[1]) for x in non0ao_idx[block_start:block_end])
-    buf = cupy.empty((comp, nao_max, MIN_BLK_SIZE), order='C')
+    buf = cupy.empty((comp, nao_max, loop_blksize), order='C')
+    # MR1 (mainline repair 2026-10-21): a loop block larger than
+    # MIN_BLK_SIZE must not change the screened physics.  The coarse
+    # screening cache evaluates the UNION of the covered fine blocks'
+    # shell sets on every point of the coarse block, silently keeping tail
+    # contributions the default partition drops (measured on
+    # epinephrine/b3lyp/def2-svp: converged e_tot shifted -1.932e-06 Ha,
+    # fixed-dm excsum -1.9e-06 / max|dvmat| 1.1e-04 / dnelec +7.9e-6 --
+    # the A4 single-knob cause of the epinephrine energy-gate failure).
+    # Zero the AO rows each covered fine (default) block's own screen
+    # dropped, inside that fine block's point range: every (shell, grid
+    # point) pair then contributes iff the DEFAULT partition evaluates
+    # it, so loop_blksize changes only the GEMM batching and reduction
+    # order (measured floor ~1e-14), never the physics.  The default
+    # path (loop_blksize == MIN_BLK_SIZE) is untouched.
+    partition_fix = grids.get_partition_fix(opt, blksize=loop_blksize)
 
     for block_id in range(block_start, block_end):
         pad, idx, non0shl_idx, ctr_offsets_slice, ao_loc_slice = non0ao_idx[block_id]
         nao_sub = len(idx)
 
-        ip0 = block_id * MIN_BLK_SIZE
-        ip1 = min(ip0 + MIN_BLK_SIZE, ngrids)
+        ip0 = block_id * loop_blksize
+        ip1 = min(ip0 + loop_blksize, ngrids)
         coords = cupy.asarray(grids.coords[ip0:ip1])
         weight = cupy.asarray(grids.weights[ip0:ip1])
 
@@ -2157,6 +2674,16 @@ def _block_loop(ni, mol, grids, nao=None, deriv=0, max_memory=2000,
                 ao_mask[-pad:,:] = 0.0
             else:
                 ao_mask[:,-pad:,:] = 0.0
+        if partition_fix is not None:
+            for fine_off, drop_pos in partition_fix[block_id]:
+                col0 = fine_off
+                col1 = min(fine_off + MIN_BLK_SIZE, ip1 - ip0)
+                if col0 >= col1 or drop_pos.size == 0:
+                    continue
+                if ao_mask.ndim == 3:
+                    ao_mask[:, drop_pos, col0:col1] = 0.0
+                else:
+                    ao_mask[drop_pos, col0:col1] = 0.0
         yield ao_mask, idx, weight, coords
 
 def _grouped_block_loop(ni, mol, grids, nao=None, deriv=0, max_memory=2000,
