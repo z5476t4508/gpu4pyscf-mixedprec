@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import threading
+
 import numpy as np
 import cupy
 from gpu4pyscf.lib import logger
@@ -32,6 +35,24 @@ except (ImportError, AttributeError):
     OP_IDENTITY = None
     JIT_MODE_NONE = None
     WORKSPACE_RECOMMENDED = None
+
+# cuTensorHandleCreate costs ~3 s of host-side time on the first call
+# (measured RTX 4090, cuTensor 2.x; constant across processes).  With the
+# lazy handle this lands inside the first SCF cycle (first _tau_dot for
+# MGGA, first DF get_jk for hybrids), i.e. 44-73% of measured whole-SCF
+# time at consumer sizes.  cupyx._get_handle()'s lazy global is not
+# thread-safe (two racing first calls return different handles), so all
+# gpu4pyscf access is serialized through this lock and one daemon thread
+# (started at the end of this module, once the engine choice is known)
+# warms the handle behind the ~1.8 s gpu4pyscf import chain.  Opt out
+# with GPU4PYSCF_CUTENSOR_WARM=0.
+_handle_lock = threading.Lock()
+
+def _get_handle_locked():
+    if cutensor is None:
+        return None
+    with _handle_lock:
+        return cutensor._get_handle()
 
 def _auto_create_mode(array, mode):
     if not isinstance(mode, cutensor.Mode):
@@ -116,7 +137,7 @@ def contraction(
         compute_desc)
     plan_pref = cutensor.create_plan_preference(algo=algo, jit_mode=jit_mode)
     ws_size = cutensor_backend.estimateWorkspaceSize(
-        cutensor._get_handle().ptr, operator.ptr, plan_pref.ptr, ws_pref)
+        _get_handle_locked().ptr, operator.ptr, plan_pref.ptr, ws_pref)
     plan = cutensor.create_plan(operator, plan_pref, ws_limit=ws_size)
     ws = cupy.empty(ws_size, dtype=np.int8)
     out = c
@@ -124,14 +145,13 @@ def contraction(
     alpha = np.asarray(alpha, dtype=dtype)
     beta = np.asarray(beta, dtype=dtype)
 
-    handler = cutensor._get_handle()
+    handler = _get_handle_locked()
     cutensor_backend.contract(handler.ptr, plan.ptr,
                              alpha.ctypes.data, a.data.ptr, b.data.ptr,
                              beta.ctypes.data, c.data.ptr, out.data.ptr,
                              ws.data.ptr, ws_size)
     return out
 
-import os
 contract_engine = None
 if cutensor is None:
     contract_engine = 'cupy'  # default contraction engine
@@ -166,3 +186,24 @@ else:
         pattern has to be a standard einsum notation
         '''
         return contraction(pattern, a, b, alpha, beta, out=out)
+
+    # cutensor is the active engine: warm its handle now (see comment at
+    # _handle_lock).  Daemon thread so it never blocks a running program.
+    # It MUST be joined at interpreter exit though: CPython does not join
+    # daemon threads, so without this the thread can be frozen mid
+    # cutensorCreate while cupy's own atexit cleanup (registered earlier,
+    # hence running later in LIFO order) tears down the CUDA context --
+    # measured as a rare teardown SIGSEGV/SIGABRT (~2-7% of short-lived
+    # processes that import the library and exit; 0/60 with the warm
+    # thread disabled, 0/50 with bare cupyx handle creation, LC-60).
+    # The atexit join runs BEFORE cupy's cleanup (registered later than
+    # cupy's own handlers), so the handle is fully created before any
+    # teardown handler touches CUDA.
+    if os.environ.get('GPU4PYSCF_CUTENSOR_WARM', '1') not in \
+            ('0', 'false', 'False'):
+        _warm_thread = threading.Thread(
+            target=_get_handle_locked, name='gpu4pyscf-cutensor-warm',
+            daemon=True)
+        _warm_thread.start()
+        import atexit
+        atexit.register(_warm_thread.join, 30.0)
