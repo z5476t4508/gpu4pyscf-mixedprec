@@ -44,6 +44,21 @@ overlap_zero_eigenvalue_threshold = getattr(__config__, 'scf_hf_overlap_zero_eig
 # Threshold on |E_n - E_{n-1}| for switching fp32 -> fp64 in the 'auto'
 # mixed-precision policy
 _PRECISION_SWITCH_TOL = getattr(__config__, 'scf_hf_precision_switch_tol', 1e-4)
+# SP-14 (scf-priority-20261025 card): below this AO count the auto
+# policy's fp32 head is a measured net LOSS, not a win -- the per-cycle
+# SCF excess is launch-bound at small shapes (SP-12 envelope: C/B t_scf
+# median 1.111 below 100 AO / 1.068 at 100-250, vs 0.978-1.008 at 250+;
+# SP-13: the excess is FLAT 1.10-1.13 across 0-150 AO and carried by the
+# head cycles, head-wall ratios 1.24-2.31x on every probed loss cell,
+# melatonin-318 0.741 = the size-sign flip; CDERI share exactly 0).
+# Below the threshold the plain 'auto' lane therefore degenerates to the
+# exact fp64 lane (see the _kernel gate): fp64 from cycle 0, _mixed_auto
+# False so the switch has no fp32 phase to leave and the vmat-knob lane
+# eligibility is identical to an explicit fp64 request -- the SCF
+# trajectory is bitwise the fp64 lane's.  The verify/strict variants are
+# not gated.  At/above the threshold nothing changes: the head is a
+# measured win from ~270 AO up.
+_AUTO_HEAD_MIN_AO = getattr(__config__, 'scf_hf_auto_head_min_ao', 250)
 
 # Divergence guard for the 'auto' policy: on large exact-exchange systems
 # (measured: ~1877 AO, def2-tzvp, Azadirachtin) the fp32 phase can oscillate
@@ -239,16 +254,115 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
     #   'auto'  - early iterations in fp32; once the energy change drops
     #             below _PRECISION_SWITCH_TOL, switch to fp64 for the tail
     #             iterations and the final energy (restores full accuracy).
+    #             (SP-14) below _AUTO_HEAD_MIN_AO basis functions the head
+    #             never engages: the run is bitwise the fp64 lane (the
+    #             head is a measured net loss at small shapes).
+    #   'auto+verify' - the auto policy plus the opt-in UKS solution-
+    #             stability verification (gpu4pyscf.scf.stability_verify):
+    #             after the SCF converges, one strict-fp64 reference SCF
+    #             from the same init guess is run; if the two trajectories
+    #             converge to different densities, a bounded fp64
+    #             refinement from the auto density decides whether that is
+    #             an fp32 fixed-point displacement (same solution; the
+    #             stationary point is adopted) or a genuine branch split
+    #             (the lower stationary solution is kept; see
+    #             stability_verify's docstring for the measured motivation).
+    #   'auto+strict' - the auto policy plus the strict fp64-reference
+    #             matching route (stability_verify.verify_reference_match,
+    #             LC-76): the fp64-lane solution is returned (reference
+    #             adopted unconditionally on a distinct result) or the
+    #             route fails closed with the exact reason -- the contract
+    #             is matching the identical-settings FP64 trajectory, not
+    #             selecting the lower stationary solution.
     _mode = getattr(mf, 'precision_mode', None)
-    if _mode is not None and _mode not in ('fp64', 'fp32', 'auto'):
+    if _mode is not None and _mode not in ('fp64', 'fp32', 'auto',
+                                           'auto+verify', 'auto+strict'):
         raise ValueError(
-            f"precision_mode must be None, 'fp64', 'fp32' or 'auto', got {_mode!r}")
+            f"precision_mode must be None, 'fp64', 'fp32', 'auto', "
+            f"'auto+verify' or 'auto+strict', got {_mode!r}")
     _precision_saved = precision.get_precision()
-    if _mode in ('auto', 'fp32'):
+    _mixed_auto = _mode in ('auto', 'auto+verify', 'auto+strict')
+    # SP-14 size gate: on small molecules the fp32 head is a measured net
+    # loss (see _AUTO_HEAD_MIN_AO), so the plain 'auto' lane rides the
+    # exact fp64 lane there -- _mixed_auto False means fp64 from cycle 0,
+    # no switch phase to leave, and vmat-knob lane eligibility identical
+    # to an explicit fp64 request (bitwise the fp64 trajectory).  The
+    # verify/strict variants are NOT gated: their main lane keeps today's
+    # head at every size, so the verifier's displacement scenarios and
+    # the measured strict-route composition stay untouched.
+    if _mode == 'auto' and mf.mol.nao < _AUTO_HEAD_MIN_AO:
+        _mixed_auto = False
+    if _mode == 'fp32' or _mixed_auto:
         precision.set_precision('fp32')
     else:
         precision.set_precision('fp64')
-    _mixed_auto = _mode == 'auto'
+    # LC-105: the opt-in GPU4PYSCF_SCF_VMAT_F32 knob runs the XC vmat
+    # grid contractions in fp32 on PURE-fp64 lanes only.  The auto
+    # family's fp64 tail resolves get_precision()=='fp64' but must stay
+    # bitwise fp64 (measured e_tot shift 3.5e-11 when the cast is
+    # ungated, 2026-10-13-lc105 part 3), and stability_verify's strict
+    # fp64-reference siblings (marked _strict_fp64_reference) must never
+    # feel the knob.  Outside an SCF kernel the lane flag stays False:
+    # standalone nr_rks/nr_uks contractions are unchanged.
+    from gpu4pyscf.dft import numint as _numint_mod
+    _vmat_f32_saved = _numint_mod._scf_vmat_f32_lane
+    _numint_mod._scf_vmat_f32_lane = (
+        _numint_mod._scf_vmat_f32()
+        and not _mixed_auto
+        and not getattr(mf, '_strict_fp64_reference', False))
+    # RHO-F32-LANE-B-01: the opt-in GPU4PYSCF_SCF_RHO_F32 knob runs the
+    # rho-build contractions in fp32 on the SCF head of PURE-fp64 lanes
+    # (numint._scf_rho_f32_lane; DEFAULT OFF, same lane gating as the
+    # vmat knob above -- the auto family's fp32 head already runs the
+    # cast and its fp64 tail must stay bitwise fp64, and the strict
+    # fp64-reference siblings never feel the knob).  'headtail' flips
+    # the lane off at the same in-cycle trigger in _kernel_body.
+    _rho_f32_saved = _numint_mod._scf_rho_f32_lane
+    _numint_mod._scf_rho_f32_lane = (
+        _numint_mod._scf_rho_f32()
+        and not _mixed_auto
+        and not getattr(mf, '_strict_fp64_reference', False))
+    # SCFJK-KBUILD-IMPL-01: the opt-in GPU4PYSCF_SCF_JK_F32 knob runs
+    # the DF K-transform contractions of df_jk.get_jk in fp32 on the
+    # SCF head of PURE-fp64 lanes (df_jk._scf_jk_f32_lane; DEFAULT OFF,
+    # same lane gating as the vmat/rho knobs above -- the auto family's
+    # fp32 head already runs the fp32 branch and its fp64 tail must
+    # stay bitwise fp64, and the strict fp64-reference siblings never
+    # feel the knob).  'headtail' flips the lane off at the same
+    # in-cycle trigger in _kernel_body.
+    from gpu4pyscf.df import df_jk as _df_jk_mod
+    _jk_f32_saved = _df_jk_mod._scf_jk_f32_lane
+    # SCFJK-WINDOW-01: the opt-in GPU4PYSCF_SCF_JK_F32_ARM_AFTER=N
+    # companion (defined for the headtail value only, warn+ignore
+    # otherwise) keeps the jk lane off at kernel entry through cycle N
+    # (the fp64 prefix is bitwise the knob-off trajectory);
+    # _kernel_body arms the lane once at that cycle-end latch.  0 (the
+    # default) arms at entry -- the SCFJK-KBUILD-IMPL-01 semantics
+    # unchanged.
+    _jk_f32_arm_after = _df_jk_mod._scf_jk_f32_arm_after()
+    _df_jk_mod._scf_jk_f32_lane = (
+        _df_jk_mod._scf_jk_f32()
+        and not _mixed_auto
+        and not getattr(mf, '_strict_fp64_reference', False)
+        and _jk_f32_arm_after == 0)
+    # SP-27: the auto-family head CAN keep the rho-build contraction in
+    # float64 (numint._scf_rho_f64_lane; opt-in GPU4PYSCF_AUTO_RHO_F64=1,
+    # default off since the SP-27 paired REJECT measurement); every other
+    # lane, the auto policy's fp64 tail and standalone fp32 contexts are
+    # unchanged either way
+    _rho_f64_saved = _numint_mod._scf_rho_f64_lane
+    _numint_mod._scf_rho_f64_lane = (
+        _mixed_auto and _numint_mod._auto_rho_f64())
+    # SP-31: the auto-family fp32 head CAN skip the NLC/VV10 term of
+    # the SCF veff entirely (opt-in GPU4PYSCF_AUTO_HEAD_NLC_SKIP=1,
+    # default off; numint._scf_head_nlc_skip_lane).  The converged
+    # result stays the full method's fixed point -- the fp64 tail runs
+    # the exact fp64 map; only the head path changes.  Armed for
+    # auto-family kernels only: pure-fp64/strict lanes and standalone
+    # contexts never feel the knob (the SP-27 lane-flag pattern).
+    _head_nlc_saved = _numint_mod._scf_head_nlc_skip_lane
+    _numint_mod._scf_head_nlc_skip_lane = (
+        _mixed_auto and _numint_mod._auto_head_nlc_skip())
     try:
         return _kernel_body(mf, conv_tol, conv_tol_grad, dump_chk, dm0, callback,
                             conv_check, _mixed_auto, log, t0, t1, **kwargs)
@@ -256,6 +370,11 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         # the policy above mutates process-global state; leaving it set would
         # silently contaminate the next calculation if this one raised
         precision.set_precision(_precision_saved)
+        _numint_mod._scf_vmat_f32_lane = _vmat_f32_saved
+        _numint_mod._scf_rho_f32_lane = _rho_f32_saved
+        _numint_mod._scf_rho_f64_lane = _rho_f64_saved
+        _numint_mod._scf_head_nlc_skip_lane = _head_nlc_saved
+        _df_jk_mod._scf_jk_f32_lane = _jk_f32_saved
 
 
 def _kernel_body(mf, conv_tol, conv_tol_grad, dump_chk, dm0, callback,
@@ -263,6 +382,43 @@ def _kernel_body(mf, conv_tol, conv_tol_grad, dump_chk, dm0, callback,
     conv_tol = mf.conv_tol
     mol = mf.mol
     conv_tol_grad = conv_tol_grad if conv_tol_grad is not None else conv_tol**.5
+    # LC-115: 'headtail' value of GPU4PYSCF_SCF_VMAT_F32 -- the fp32 vmat
+    # contractions run in the SCF head only, and the lane flag set by
+    # _kernel is flipped back off (single trigger, below) at the first
+    # cycle-end |dE| below the auto policy's switch tolerance, so the
+    # convergence tail uses the exact fp64 contraction map.  The full
+    # knob's fp32 tail displaces the SCF fixed point and breaks
+    # convergence at large AO (687 AO: 3/3 non-convergent, +7.9e-9,
+    # LC-108); the head/tail discipline restores the true fixed point at
+    # any size at ~60-90% of the gain (LC-114).
+    from gpu4pyscf.dft import numint as _numint_mod
+    _vmat_f32_headtail = (_numint_mod._scf_vmat_f32() == 'headtail')
+    # RHO-F32-LANE-B-01: the rho knob's head/tail value flips at the
+    # SAME single trigger as the vmat knob below (same tolerance, same
+    # end-of-cycle point), so both lanes share one head/tail boundary
+    # and the convergence tail runs the exact bitwise-fp64 rho map
+    # (LC-115 fixed-point restoration argument verbatim)
+    _rho_f32_headtail = (_numint_mod._scf_rho_f32() == 'headtail')
+    # SCFJK-KBUILD-IMPL-01: the jk knob's head/tail value flips at the
+    # SAME single trigger as the vmat/rho knobs below (same tolerance,
+    # same end-of-cycle point), so all three lanes share one head/tail
+    # boundary and the convergence tail runs the exact fp64 K-transform
+    # map (LC-115 fixed-point restoration argument verbatim)
+    from gpu4pyscf.df import df_jk as _df_jk_mod
+    _jk_f32_headtail = (_df_jk_mod._scf_jk_f32() == 'headtail')
+    # SCFJK-WINDOW-01 delayed-arm window state: _jk_f32_arm_lane
+    # mirrors the _kernel arming gate (the auto family and strict
+    # references never arm the lane, whatever the delay);
+    # _jk_f32_window_open is the single-latch window state (waiting ->
+    # armed -> closed; closed by the arm itself, by the tail flip, or
+    # by an e_diff already below the switch tolerance at the arm
+    # point).  0 (the default) leaves the entry-armed semantics of
+    # SCFJK-KBUILD-IMPL-01 fully in charge and these latches inert.
+    _jk_f32_arm_after = _df_jk_mod._scf_jk_f32_arm_after()
+    _jk_f32_arm_lane = (_jk_f32_headtail
+                        and not _mixed_auto
+                        and not getattr(mf, '_strict_fp64_reference', False))
+    _jk_f32_window_open = _jk_f32_arm_after > 0
 
     if dm0 is None:
         dm0 = mf.get_init_guess(mol, mf.init_guess)
@@ -302,7 +458,13 @@ def _kernel_body(mf, conv_tol, conv_tol_grad, dump_chk, dm0, callback,
         mf_diis = mf.diis
     elif mf.diis:
         assert issubclass(mf.DIIS, lib.diis.DIIS)
-        mf_diis = mf.DIIS(mf, mf.diis_file)
+        if diis._adiis_head_tail_armed(mf):
+            # ADIAS-HEAD-01 opt-in (GPU4PYSCF_DIIS_MODE=adiis, default
+            # off): ADIIS head-phase extrapolation + CDIIS tail handover;
+            # inert under the strict fp64 reference lane.
+            mf_diis = diis.ADIISHeadTail(mf, mf.diis_file)
+        else:
+            mf_diis = mf.DIIS(mf, mf.diis_file)
         mf_diis.space = mf.diis_space
         mf_diis.rollback = mf.diis_space_rollback
         # CDIIS just require a C that's orthonormal (C.T@S@C==I), and X satisfies that.
@@ -378,6 +540,52 @@ def _kernel_body(mf, conv_tol, conv_tol_grad, dump_chk, dm0, callback,
                              _PRECISION_SWITCH_CHAOS_TOL, chaos_streak)
                     precision.set_precision('fp64')
         e_diff = abs(e_tot-last_hf_e)
+        if (_vmat_f32_headtail and _numint_mod._scf_vmat_f32_lane
+                and e_diff < _PRECISION_SWITCH_TOL):
+            # LC-115 head/tail single trigger, mirroring the auto policy's
+            # fp32->fp64 switch above (same tolerance, same end-of-cycle
+            # point).  The lane-flag term is the single-trigger latch: the
+            # auto family and strict references never enter (their lane
+            # flag stays False at the _kernel gate), and on pure-fp64
+            # lanes the flag is re-armed by _kernel at the next kernel
+            # call.  No DIIS reset: the stale head entries ride the exact
+            # fp64 map fine (LC-114 measured; the reset hypothesis is a
+            # separately falsified family).
+            _numint_mod._scf_vmat_f32_lane = False
+        if (_rho_f32_headtail and _numint_mod._scf_rho_f32_lane
+                and e_diff < _PRECISION_SWITCH_TOL):
+            # RHO-F32-LANE-B-01 head/tail single trigger, mirroring the
+            # vmat flip above (same gate shape and latch semantics: the
+            # auto family and strict references never arm the lane, and
+            # a pure-fp64 lane re-arms at the next _kernel call)
+            _numint_mod._scf_rho_f32_lane = False
+        if (_jk_f32_headtail and _df_jk_mod._scf_jk_f32_lane
+                and e_diff < _PRECISION_SWITCH_TOL):
+            # SCFJK-KBUILD-IMPL-01 head/tail single trigger, mirroring
+            # the vmat/rho flips above (same gate shape and latch
+            # semantics: the auto family and strict references never
+            # arm the lane, and a pure-fp64 lane re-arms at the next
+            # _kernel call)
+            _df_jk_mod._scf_jk_f32_lane = False
+        if (_jk_f32_headtail and e_diff < _PRECISION_SWITCH_TOL):
+            # SCFJK-WINDOW-01: the tail boundary also closes any still
+            # pending delayed window -- an e_diff already below the
+            # switch tolerance means the run is in its exact-fp64 tail
+            # and must not arm the fp32 K map there (the LC-115 tail
+            # discipline).  Idempotent no-op for the entry-armed case.
+            _jk_f32_window_open = False
+        if (_jk_f32_arm_lane and _jk_f32_window_open
+                and not _df_jk_mod._scf_jk_f32_lane
+                and cycle + 1 >= _jk_f32_arm_after):
+            # SCFJK-WINDOW-01 delayed-arm latch: arm the jk lane ONCE
+            # at the end of cycle ARM_AFTER (the first armed get_veff
+            # is cycle ARM_AFTER+1's; the fp64 prefix -- the init call
+            # and cycles 1..ARM_AFTER -- is bitwise the knob-off
+            # trajectory).  Single latch: the window never re-opens
+            # after arming or after the tail flip above; the per-kernel
+            # re-arm discipline stays in _kernel.
+            _df_jk_mod._scf_jk_f32_lane = True
+            _jk_f32_window_open = False
         if(e_diff < conv_tol and norm_gorb < conv_tol_grad):
             scf_conv = True
             break
@@ -456,6 +664,37 @@ def scf(mf, dm0=None, **kwargs):
         mf.e_tot = _kernel(mf, mf.conv_tol, mf.conv_tol_grad,
                             dm0=dm0, callback=mf.callback,
                             conv_check=mf.conv_check, **kwargs)[1]
+
+    # opt-in solution-stability verification (precision_mode='auto+verify'):
+    # one strict-fp64 reference SCF from the same initial density the main
+    # run used (explicit dm0, or the density rebuilt from a previous
+    # wavefunction); keeps the lower converged solution when the auto
+    # policy landed on a different branch (near-degenerate UKS stationary
+    # pairs).  Default policies never enter this branch.  The verifiers
+    # must receive the ACTUAL dm0: restarting them from mf.init_guess
+    # violates the same-starting-point fp64-trajectory contract and can
+    # land the reference on a different UKS branch than the main run.
+    if getattr(mf, 'precision_mode', None) == 'auto+verify':
+        if mf.converged:
+            from gpu4pyscf.scf import stability_verify
+            stability_verify.verify_solution_stability(mf, dm0=dm0)
+        else:
+            mf.scf_summary['stability_verification'] = {
+                'policy': 'auto+verify',
+                'skipped': 'main SCF did not converge',
+            }
+    elif getattr(mf, 'precision_mode', None) == 'auto+strict':
+        # strict fp64-reference matching (LC-76): the fp64-lane solution
+        # or fail-closed -- see stability_verify.verify_reference_match
+        # (same actual-dm0 carry as auto+verify above)
+        if mf.converged:
+            from gpu4pyscf.scf import stability_verify
+            stability_verify.verify_reference_match(mf, dm0=dm0)
+        else:
+            mf.scf_summary['stability_verification'] = {
+                'policy': 'auto+strict',
+                'skipped': 'main SCF did not converge',
+            }
 
     logger.timer(mf, 'SCF', *cput0)
     mf._finalize()
@@ -787,8 +1026,12 @@ class SCF(pyscf_lib.StreamObject):
 
     # Mixed-precision policy for the SCF iterations. None/'fp64' runs
     # everything in float64; 'fp32' runs every iteration with float32
-    # contractions; 'auto' starts in float32 and finishes in float64. See
-    # gpu4pyscf.lib.precision.
+    # contractions; 'auto' starts in float32 and finishes in float64;
+    # 'auto+verify' additionally runs the opt-in UKS solution-stability
+    # verification pass after convergence (see
+    # gpu4pyscf.scf.stability_verify); 'auto+strict' runs the strict
+    # fp64-reference matching route (the fp64-lane solution or fail
+    # closed; stability_verify.verify_reference_match).
     precision_mode = None
 
     # Adaptive SCF convergence threshold for geometry optimization: 'auto'
