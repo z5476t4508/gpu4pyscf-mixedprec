@@ -82,7 +82,7 @@ class KnownValues(unittest.TestCase):
         '''meta-GGA: the fp32 grid must stay far inside the quadrature error'''
         mf = dft.RKS(mol, xc='r2scan').density_fit()
         mf.conv_tol = 1e-10
-        e_ref = mf.kernel()
+        mf.kernel()
         dm = mf.make_rdm1()
         ni = mf._numint
         n0, exc0, v0 = ni.nr_rks(mol, mf.grids, 'r2scan', dm)
