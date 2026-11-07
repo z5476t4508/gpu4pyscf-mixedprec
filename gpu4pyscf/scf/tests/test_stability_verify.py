@@ -85,7 +85,7 @@ class KnownValues(unittest.TestCase):
         mf = dft.UKS(mol_uks, xc='b3lyp').density_fit()
         mf.conv_tol = 1e-10
         mf.precision_mode = 'auto+verify'
-        e_v = mf.kernel()
+        mf.kernel()
         rec = mf.scf_summary['stability_verification']
         self.assertEqual(rec['policy'], 'auto+verify')
         self.assertIn(rec['selected'], ('main', 'reference'))
