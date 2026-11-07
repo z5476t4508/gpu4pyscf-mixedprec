@@ -96,7 +96,9 @@ def get_veff(ks, mol=None, dm=None, dm_last=None, vhf_last=None, hermi=1):
         n, exc, vxc = 0, 0, 0
     else:
         n, exc, vxc = ni.nr_rks(mol, ks.grids, ks.xc, dm)
-        if ks.do_nlc():
+        # SP-31: the opt-in auto-head NLC skip (numint lane flag armed
+        # by scf.hf._kernel; default off = this block unchanged bitwise)
+        if ks.do_nlc() and not numint._scf_head_nlc_suppressed():
             if ni.libxc.is_nlc(ks.xc):
                 xc = ks.xc
             else:

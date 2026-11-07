@@ -16,6 +16,9 @@
 # Modified by Xiaojie Wu <wxj6000@gmail.com>
 
 import copy
+import os
+import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 import cupy
 import numpy
@@ -24,6 +27,7 @@ from cupyx.scipy.linalg import solve_triangular
 from pyscf import lib
 from pyscf.scf import dhf
 from gpu4pyscf.lib import logger
+from gpu4pyscf.lib import cutensor as _cutensor
 from gpu4pyscf.lib.cupy_helper import (
     contract, transpose_sum, tag_array, CPArrayWithTag, cholesky)
 from gpu4pyscf.dft import rks, uks, numint, gks
@@ -303,7 +307,7 @@ class _DFHF:
                     rks.initialize_grids(self, mol, dm[0]+dm[1])
                 n, exc, vxc = ni.nr_uks(mol, self.grids, self.xc, dm)
                 log.debug('nelec by numeric integration = %s', n)
-                if self.do_nlc():
+                if self.do_nlc() and not numint._scf_head_nlc_suppressed():
                     if ni.libxc.is_nlc(self.xc):
                         xc = self.xc
                     else:
@@ -336,7 +340,7 @@ class _DFHF:
                 rks.initialize_grids(self, mol, dm)
                 n, exc, vxc = ni.nr_rks(mol, self.grids, self.xc, dm)
                 log.debug('nelec by numeric integration = %s', n)
-                if self.do_nlc():
+                if self.do_nlc() and not numint._scf_head_nlc_suppressed():
                     if ni.libxc.is_nlc(self.xc):
                         xc = self.xc
                     else:
@@ -381,7 +385,7 @@ class _DFHF:
                     log.debug('nelec by numeric integration = %s', n)
                     t0 = log.timer('vxc', *t0)
                     
-                    if self.do_nlc():
+                    if self.do_nlc() and not numint._scf_head_nlc_suppressed():
                         if ni.libxc.is_nlc(self.xc):
                             xc = self.xc
                         else:
@@ -452,6 +456,273 @@ class _DFHF:
             obj.spin_samples = self.spin_samples
         return obj
 
+def _eager_plan_warmup(dfobj, dm_sparse, factor_l, vj, vk, blksize,
+                       nao, nocc, n_dm, nspin, buf, buf_dtype,
+                       dm_batch_size, scope='all'):
+    '''WARMUP-PRELOAD-01 M1 (opt-in GPU4PYSCF_DFJK_EAGER_PLAN_WARMUP,
+    default off): populate the contraction plan cache at the EXACT
+    per-block shapes/strides/dtypes the upcoming first block loop will
+    contract, before the first real contraction.  The cold cutensor
+    descriptor/plan host build measured inside the first jk_j_build
+    calls (23.6/6.4% clean t_scf, entry 331) then happens here, in an
+    explicitly-timed step, and every first-call contraction is served
+    from a warmed entry (same plan object -> bitwise results).
+
+    No contraction executes here: plan construction is host-side
+    metadata only, and the tril block views come from
+    loop(blksize, unpack=False) (pure slicing -- no fill_symmetric, no
+    device compute paid twice).  The K-side unpacked operand is
+    reproduced from one dummy (nao, nao, blksize) work buffer (the
+    real work buffer's transposed view strides), and rhok/vk from the
+    real buf/vk views.  Latched once per DF object per device;
+    fail-closed on any error (per-call build path untouched, never
+    retried, never raised).
+
+    WARMUP-PRELOAD-02 scope='jbuild' (knob value 'jbuild'): warm ONLY
+    the j_build family ('np,Lp->nL') -- the entry-332 per-family
+    cold-cost table's single expensive family (629/653 ms vs 1-4 ms
+    for j_accum/k_build/k_accum, whose warm cost over-paid and failed
+    the v1 t_scf gate).  No j_accum operand is allocated and the K
+    side is not touched at all in that scope.
+    '''
+    t0 = time.perf_counter()
+    device_id = None
+    done = getattr(dfobj, '_plan_warmup_devices', None)
+    if done is None:
+        done = dfobj._plan_warmup_devices = set()
+    try:
+        device_id = cp.cuda.Device().id
+        if device_id in done:
+            return
+        cderi_sparse = dfobj._cderi[device_id]
+        if not isinstance(cderi_sparse, cp.ndarray):
+            # host-resident cderi: loop(unpack=False) would drive the
+            # prefetch host->device copies; v1 stays inert there
+            logger.debug1(dfobj.mol, 'eager plan warmup skipped: '
+                          'host-resident cderi (device %d)', device_id)
+            return
+        tril_blocks = [blk for _, blk in
+                       dfobj.loop(blksize=blksize, unpack=False)]
+        if dm_sparse is not None and (scope == 'jbuild' or vj is not None):
+            # J side at the real tril views
+            dtype_j = numpy.result_type(dm_sparse.dtype, cderi_sparse.dtype)
+            for cderi_tril in tril_blocks:
+                L = cderi_tril.shape[0]
+                _cutensor.warm_contraction('np,Lp->nL', dm_sparse,
+                                           cderi_tril)
+                if scope == 'jbuild':
+                    # scoped: the j_accum family's cold cost is ~1-4 ms
+                    # (entry 332); warming it over-pays -- stop here
+                    continue
+                auxvec = cp.empty((dm_sparse.shape[0], L), dtype=dtype_j)
+                _cutensor.warm_contraction('nL,Lp->np', auxvec, cderi_tril,
+                                           out=vj)
+        if (scope != 'jbuild' and factor_l is not None
+                and vk is not None and buf is not None):
+            # K side (dm_factor_mode 0): reproduce the unpacked
+            # work-buffer view and the first dm-batch rhok/vk views
+            work = cp.empty((nao, nao, blksize), dtype=cderi_sparse.dtype)
+            i0, i1 = next(iter(lib.prange(0, n_dm, dm_batch_size)))
+            for s in range(nspin):
+                fac = factor_l[s, i0:i1]
+                vacc = vk[s, i0:i1]
+                for cderi_tril in tril_blocks:
+                    L = cderi_tril.shape[0]
+                    cderi_view = work[:, :, :L].transpose(2, 0, 1)
+                    rhok = ndarray((i1-i0, nao, nocc, L), dtype=buf_dtype,
+                                   buffer=buf)
+                    _cutensor.warm_contraction('Lij,njk->nikL', cderi_view,
+                                               fac, out=rhok)
+                    _cutensor.warm_contraction('nikL,njkL->nij', rhok, rhok,
+                                               out=vacc)
+        done.add(device_id)
+    except Exception:
+        if device_id is not None:
+            done.add(device_id)   # fail-closed once; never retry, never raise
+        _cutensor._warmup_stats['failures'] += 1
+        logger.debug(dfobj.mol, 'eager plan warmup failed (fail-closed)')
+    finally:
+        _cutensor._warmup_stats['host_ms'] += \
+            (time.perf_counter() - t0) * 1e3
+
+
+# SCFJK-KBUILD-IMPL-01 (2026-11-05): the DF K-transform response GEMMs
+# of get_jk ('Lij,njk->nikL' jk_k_build + 'nikL,njkL->nij' jk_k_accum)
+# carry 0.4225/0.4712 of the jk wall at 819/1042 AO (entry 370) -- the
+# largest named interior mechanism above 819 on the SCF side; the same
+# GEMM family the delivered grad-side GPU4PYSCF_DFGRAD_RESP_F32 knob
+# addresses per-grad-call.  The opt-in GPU4PYSCF_SCF_JK_F32 knob
+# (DEFAULT OFF, parse mirroring GPU4PYSCF_SCF_VMAT_F32 /
+# GPU4PYSCF_SCF_RHO_F32) arms the EXISTING fp32 branch of get_jk below
+# (the exact discipline the auto policy's fp32 head runs: fp32 MO
+# factors, fp32 cderi per-block casts or the SP-28 capped mirror, fp32
+# rhok buffer and K accumulation, fp64 upcast on return) on the SCF
+# head of PURE-fp64 lanes.  'headtail' flips the lane off (single
+# trigger) at the same cycle-end |dE| tolerance in scf.hf._kernel_body
+# the vmat/rho knobs use, so the convergence tail keeps the exact fp64
+# K map (the LC-115 fixed-point restoration argument: an fp32 tail
+# displaces the SCF fixed point at large AO; the head/tail split
+# preserves it).  '1' parses for parity (lane armed the whole kernel)
+# but is NOT the adoption candidate.  Armed by scf.hf._kernel on
+# pure-fp64 lanes only (not the auto family, whose fp32 head already
+# runs this branch and whose fp64 tail must stay bitwise fp64), never
+# on stability_verify's strict fp64-reference siblings; standalone
+# get_jk callers (TDDFT/hessian/grad) keep the flag's default False.
+# _scf_jk_f32_head_calls counts lane-armed engagements only (knob-off,
+# auto-lane and strict deltas are exactly 0).
+# SCFJK-WINDOW-01 (2026-11-06): the opt-in companion
+# GPU4PYSCF_SCF_JK_F32_ARM_AFTER=N (DEFAULT 0 = arm at kernel entry,
+# the SCFJK-KBUILD-IMPL-01 semantics; N >= 1 = the jk lane stays off
+# through cycle N so the fp64 prefix is bitwise the knob-off
+# trajectory, and scf.hf._kernel_body arms it once at that cycle-end
+# latch; the e_diff < switch-tol tail flip is UNCHANGED) tests whether
+# the +1-cycle penalty of the entry-armed knob (entry 372: per-cycle
+# win -4.7/-7.2% but +1 SCF cycle) originates in the early
+# DIIS-building cycles.  Defined for the 'headtail' knob value only
+# (warn + 0 otherwise); the vmat/rho knobs keep arm-at-entry.
+# Cached env value: None (unread), False, True ('1'), or 'headtail'.
+_SCF_JK_F32 = None
+_SCF_JK_F32_ARM_AFTER = None   # cached; None = not yet read; int >= 0
+_scf_jk_f32_lane = False
+_scf_jk_f32_head_calls = 0
+
+
+def _scf_jk_f32():
+    '''Whether to run the DF K-transform contractions of get_jk in
+    float32 on the SCF head of pure-fp64 SCF lanes (opt-in
+    precision-policy knob, SCFJK-KBUILD-IMPL-01; parse mirrors
+    _scf_vmat_f32/_scf_rho_f32).
+
+    GPU4PYSCF_SCF_JK_F32=headtail: the existing fp32 branch of get_jk
+    (fp32 MO factors and cderi operands, fp32 K accumulation, fp64
+    upcast on return) serves the SCF head cycles only; the tail flips
+    back to the exact fp64 K map at the same scf.hf trigger as
+    GPU4PYSCF_SCF_VMAT_F32=headtail.  With the knob on, the fp64-lane
+    SCF is no longer the bitwise strict fp64 reference (its head
+    trajectory differs); strict adjudication keeps knob-off records.'''
+    global _SCF_JK_F32
+    if _SCF_JK_F32 is None:
+        raw = os.environ.get('GPU4PYSCF_SCF_JK_F32', '')
+        if raw == '1':
+            _SCF_JK_F32 = True
+        elif raw == 'headtail':
+            _SCF_JK_F32 = 'headtail'
+        elif raw in ('', '0'):
+            _SCF_JK_F32 = False
+        else:
+            warnings.warn(f'GPU4PYSCF_SCF_JK_F32={raw!r} ignored; '
+                          'expected headtail (fp32 K-transform head, '
+                          'exact-fp64 tail) or 1 on pure-fp64 lanes, or '
+                          '0 (fp64 everywhere, the default)')
+            _SCF_JK_F32 = False
+    return _SCF_JK_F32
+
+
+def _scf_jk_f32_arm_after():
+    '''Delayed-arming cycle count for the GPU4PYSCF_SCF_JK_F32=headtail
+    knob (SCFJK-WINDOW-01, opt-in precision-policy companion, DEFAULT
+    0 = arm at kernel entry).
+
+    GPU4PYSCF_SCF_JK_F32_ARM_AFTER=N (N >= 1) keeps the jk lane off
+    through cycle N (the fp64 prefix is bitwise the knob-off
+    trajectory) and arms it once at that cycle-end latch in
+    scf.hf._kernel_body; the e_diff < switch-tol tail flip is
+    unchanged.  Defined for the 'headtail' knob value only: any other
+    value (including '1') warns and ignores the delay (arm at entry).
+    Non-integer or negative values warn and parse as 0.
+    '''
+    global _SCF_JK_F32_ARM_AFTER
+    if _SCF_JK_F32_ARM_AFTER is None:
+        raw = os.environ.get('GPU4PYSCF_SCF_JK_F32_ARM_AFTER', '')
+        try:
+            value = int(raw) if raw else 0
+            if value < 0:
+                raise ValueError(raw)
+        except ValueError:
+            warnings.warn(f'GPU4PYSCF_SCF_JK_F32_ARM_AFTER={raw!r} '
+                          'ignored; expected a non-negative integer '
+                          'cycle count (0 = arm at kernel entry)')
+            value = 0
+        if value and _scf_jk_f32() != 'headtail':
+            warnings.warn('GPU4PYSCF_SCF_JK_F32_ARM_AFTER is defined '
+                          'only for GPU4PYSCF_SCF_JK_F32=headtail; '
+                          'ignoring the delayed arming')
+            value = 0
+        _SCF_JK_F32_ARM_AFTER = value
+    return _SCF_JK_F32_ARM_AFTER
+
+
+# SCFJK-KACC-SYRK-IMPL-01 (2026-11-06): the k_accum back-transform
+# contract('nikL,njkL->nij', rhok, rhok, beta=1, out=vk) assembles the
+# symmetric Gram K = rhok . rhok over the DENSE (nao,nao) output, so
+# every off-diagonal duplicates its mirror's MACs (~2x waste; tril
+# fraction 0.5006/0.5005 at 819/1042 AO; k_accum = 0.3564/0.3790 of
+# the jk wall, entry 370).  BENCH-02 (entry 377) measured the fix at
+# the deployed shapes: replacing the dense contraction with a cuBLAS
+# dsyrk tril beta-accumulation per block plus ONE mirror fill runs the
+# chain 1.3351x/1.5300x faster at 819/1042 while the dense dgemm
+# engine control stays engine-neutral (1.0035/1.0019) -- the win is
+# purely the symmetry MAC cut -- at reassociation-level numerics
+# (max_rel 6.1e-15/5.5e-15; the fp64 contraction-reorder class entry
+# 329 measured cycle-preserving at 1.14e-12/4.55e-13 Ha).  The opt-in
+# GPU4PYSCF_SCF_JK_KACC_SYRK knob (DEFAULT OFF) engages that form on
+# the SCF single-DM lane only: fp64 operands (never the global-fp32
+# mode or the armed SCFJK-KBUILD fp32 lane), dm_factor_mode 0 and
+# n_dm == 1 (per-spin), dense contract fallback everywhere else; the
+# strict fp64-reference context forces it inert.  The returned K is
+# mirrored to exact symmetry (the deployed dense output is itself
+# bitwise symmetric at the band cells, entry 377 informative);
+# _scf_jk_kacc_syrk_calls counts armed engagements only (knob-off and
+# inert deltas are exactly 0).  Adoption/manual-decision gates: paired
+# FULL-SCF t_scf + cycle-count equality at the band cells (Phase B of
+# the card); this knob is NOT a default.
+_SCF_JK_KACC_SYRK = None       # cached env value; None = not yet read
+_SCF_JK_KACC_SYRK_CALLS = 0    # armed k_accum-syrk engagements
+
+
+def _scf_jk_kacc_syrk():
+    '''Whether to accumulate the DF K back-transform with cuBLAS dsyrk
+    on the symmetric K triangle plus a mirror fill (opt-in structural
+    knob, SCFJK-KACC-SYRK-IMPL-01; BENCH-02 basis, entry 377).
+
+    GPU4PYSCF_SCF_JK_KACC_SYRK=1 swaps the per-block
+    contract('nikL,njkL->nij', rhok, rhok, beta=1, out=vk) for
+    cupy.cublas.syrk('N', rhok2d, out=vk, lower=True, beta=1) on the
+    fp64 single-DM lane (n_dm == 1, dm_factor_mode 0, any nspin) and
+    mirrors the accumulated triangle once after the block loop --
+    identical values up to fp64 reduction-order reassociation, ~2x
+    fewer MACs.  Inert on the global-fp32 mode, the armed fp32
+    K-transform lane, multi-DM calls (TDDFT/hessian), other
+    dm_factor_modes, and the strict fp64-reference context; the
+    deployed contract path is unchanged in all of those.
+    '''
+    global _SCF_JK_KACC_SYRK
+    if _SCF_JK_KACC_SYRK is None:
+        raw = os.environ.get('GPU4PYSCF_SCF_JK_KACC_SYRK', '')
+        if raw == '1':
+            _SCF_JK_KACC_SYRK = True
+        elif raw in ('', '0'):
+            _SCF_JK_KACC_SYRK = False
+        else:
+            warnings.warn(f'GPU4PYSCF_SCF_JK_KACC_SYRK={raw!r} ignored; '
+                          'expected 1 to enable the symmetric-triangle '
+                          'K accumulation, or 0 (the dense contract, '
+                          'the default)')
+            _SCF_JK_KACC_SYRK = False
+    return _SCF_JK_KACC_SYRK
+
+
+def _dfjk_strict_fp64_reference_active():
+    '''Whether the current call runs under the strict fp64-reference
+    context (dft.numint.strict_fp64_reference_ctx, armed by
+    stability_verify around its exact-fp64 sibling trajectories).  The
+    k_accum-syrk knob stays inert there: the sibling must reproduce
+    the plain DEFAULT-lane solution.  Lazy import so df.df_jk does not
+    pay the dft import at module load; attribute read at call time.'''
+    from gpu4pyscf.dft import numint as _numint
+    return bool(_numint._strict_fp64_reference_active)
+
+
 def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True,
            omega=None, lr_factor=None, sr_factor=None):
     '''
@@ -465,6 +736,15 @@ def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True,
         t1 = log.timer_debug1('init jk', *t0)
 
     fp32 = precision.get_precision() == 'fp32'
+    # SCFJK-KBUILD-IMPL-01: the opt-in lane flag arms the SAME fp32
+    # branch below on pure-fp64 SCF lanes (armed/cleared by scf.hf only;
+    # default False everywhere else -- standalone callers, the auto
+    # family's fp64 tail and strict references are bitwise unchanged).
+    # The counter records the lane-armed engagement itself.
+    if _scf_jk_f32_lane:
+        global _scf_jk_f32_head_calls
+        _scf_jk_f32_head_calls += 1
+        fp32 = True
     out_cupy = isinstance(dms, cp.ndarray)
     dm_factor_l, dm_factor_r = factorize_dm(dms, hermi)
     symmetrize = getattr(dms, 'symmetrize', 0)
@@ -543,15 +823,56 @@ def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True,
                 buf = cp.empty((dm_batch_size+1, blksize * nao*nocc), dtype=buf_dtype)
                 buf1 = buf[-1]
 
-        for cderi, cderi_tril in dfobj.loop(blksize=blksize, unpack=with_k):
-            if fp32 and cderi_tril is not None:
+        # SCFJK-KACC-SYRK-IMPL-01: opt-in symmetric-triangle K
+        # accumulation (see the knob block above): fp64 single-DM
+        # unsymmetrized lane only; the dense contract stays everywhere
+        # else.  syrk_armed records actual engagements (>= 1 block).
+        use_syrk_acc = (not fp32 and dm_factor_mode == 0 and n_dm == 1
+                        and symmetrize == 0 and _scf_jk_kacc_syrk()
+                        and not _dfjk_strict_fp64_reference_active())
+        syrk_armed = False
+        if use_syrk_acc:
+            import cupy.cublas as _cp_cublas
+            iu = cp.triu_indices(nao, k=1)
+
+        # SP-28: with the persistent fp32 cderi block cache admitted,
+        # iterate its blocks (fp32 tril blocks for J, fp32-unpacked views
+        # for K) and skip the per-block casts; bitwise-identical to the
+        # per-call _cast_cderi path, fail-closed to it otherwise
+        if fp32 and dfobj._get_cderi_f32_blocks(blksize) is not None:
+            blocks = dfobj.loop_f32(blksize=blksize, unpack=with_k)
+            cast_blocks = False
+        else:
+            blocks = dfobj.loop(blksize=blksize, unpack=with_k)
+            cast_blocks = fp32
+
+        # WARMUP-PRELOAD-01 M1 (opt-in, default off; fp64 clean path,
+        # dm_factor_mode 0 only): warm the plan cache at the real
+        # first-call shapes before the first real contraction.
+        # WARMUP-PRELOAD-02: knob value 'jbuild' restricts the warm to
+        # the j_build family (scope), any other enabled value warms all
+        # four families.
+        if (not fp32 and dm_factor_mode == 0
+                and _cutensor._eager_warmup_enabled()):
+            _eager_plan_warmup(
+                dfobj,
+                _dm_sparse if with_j else None,
+                factor_l,
+                vj if with_j else None,
+                vk if with_k else None,
+                blksize, nao, nocc, n_dm, nspin,
+                buf if with_k else None, buf_dtype, dm_batch_size,
+                scope=_cutensor._eager_warmup_scope())
+
+        for cderi, cderi_tril in blocks:
+            if cast_blocks and cderi_tril is not None:
                 cderi_tril = _cast_cderi(cderi_tril)
             if with_j:
                 auxvec = contract('np,Lp->nL', _dm_sparse, cderi_tril)
                 contract('nL,Lp->np', auxvec, cderi_tril, beta=1, out=vj)
 
             if with_k:
-                if fp32 and cderi is not None:
+                if cast_blocks and cderi is not None:
                     cderi = _cast_cderi(cderi)
                 nL = len(cderi)
                 for s in range(nspin):
@@ -559,7 +880,20 @@ def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True,
                         for i0, i1 in lib.prange(0, n_dm, dm_batch_size):
                             rhok = ndarray((i1-i0,nao,nocc,nL), dtype=buf_dtype, buffer=buf)
                             contract('Lij,njk->nikL', cderi, factor_l[s,i0:i1], out=rhok)
-                            contract('nikL,njkL->nij', rhok, rhok, beta=1, out=vk[s,i0:i1])
+                            if use_syrk_acc:
+                                # BENCH-02 form (entry 377): accumulate
+                                # the symmetric K triangle via cuBLAS
+                                # dsyrk on the 2-D views (row-major
+                                # lower incl. diagonal; beta=1 across
+                                # blocks); the mirror fill runs once
+                                # after the block loop below.
+                                _cp_cublas.syrk(
+                                    'N', rhok[0].reshape(nao, nocc*nL),
+                                    out=vk[s,0], alpha=1.0, beta=1.0,
+                                    lower=True)
+                                syrk_armed = True
+                            else:
+                                contract('nikL,njkL->nij', rhok, rhok, beta=1, out=vk[s,i0:i1])
                     elif dm_factor_mode == 1:
                         for i0, i1 in lib.prange(0, n_dm, dm_batch_size):
                             rhok, rhok1 = ndarray((2,i1-i0,nao,nocc,nL), dtype=buf_dtype, buffer=buf)
@@ -581,6 +915,15 @@ def get_jk(dfobj, dms, hermi=0, with_j=True, with_k=True,
                             contract('Lij,njk->nikL', cderi, factor_l[s,i0:i1], out=rhok)
                             contract('nikL,jkL->nij', rhok, rhok1, beta=1, out=vk[s,i0:i1])
                 rhok1 = rhok = None
+        if syrk_armed:
+            # the ONE mirror fill per armed spin plane (upper <- the
+            # accumulated lower triangle); index the 2-D view -- the
+            # 3-D fancy-index form is the smoke-caught defect class
+            # (entry 377 repairs[])
+            for s in range(nspin):
+                vk[s,0][iu[0], iu[1]] = vk[s,0][iu[1], iu[0]]
+            global _SCF_JK_KACC_SYRK_CALLS
+            _SCF_JK_KACC_SYRK_CALLS += 1
         return vj, vk
 
     results = multi_gpu.run(proc, non_blocking=True)
