@@ -580,8 +580,8 @@ def _eager_plan_warmup(dfobj, dm_sparse, factor_l, vj, vk, blksize,
 # win -4.7/-7.2% but +1 SCF cycle) originates in the early
 # DIIS-building cycles.  Defined for the 'headtail' knob value only
 # (warn + 0 otherwise); the vmat/rho knobs keep arm-at-entry.
-_SCF_JK_F32 = None       # cached env value; None = not yet read;
-                         # False | True ('1') | 'headtail'
+# Cached env value: None (unread), False, True ('1'), or 'headtail'.
+_SCF_JK_F32 = None
 _SCF_JK_F32_ARM_AFTER = None   # cached; None = not yet read; int >= 0
 _scf_jk_f32_lane = False
 _scf_jk_f32_head_calls = 0

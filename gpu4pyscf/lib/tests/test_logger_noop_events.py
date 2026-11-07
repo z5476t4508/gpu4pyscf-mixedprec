@@ -156,7 +156,7 @@ class TestTimerNoopEvents(_EventPatchMixin, unittest.TestCase):
     def test_timer_debug2_identity_at_level(self):
         rec = _rec(DEBUG2)
         cpu0, wall0, seed = _fake_gpu_chain()
-        t = glogger.timer_debug2(rec, 'msg', cpu0, wall0, seed)
+        glogger.timer_debug2(rec, 'msg', cpu0, wall0, seed)
         self.assertEqual(CountingEvent.creations, 1)
         self.assertEqual(CountingEvent.synchronizes, 1)
         self.assertIn('GPU time %9.2f ms' % FAKE_ELAPSED_MS, rec.stdout.getvalue())
@@ -164,7 +164,7 @@ class TestTimerNoopEvents(_EventPatchMixin, unittest.TestCase):
     def test_timer_debug1_identity_at_level(self):
         rec = _rec(DEBUG1)
         cpu0, wall0, seed = _fake_gpu_chain()
-        t = glogger.timer_debug1(rec, 'msg', cpu0, wall0, seed)
+        glogger.timer_debug1(rec, 'msg', cpu0, wall0, seed)
         self.assertEqual(CountingEvent.creations, 1)
         self.assertEqual(CountingEvent.synchronizes, 1)
         self.assertIn('GPU time %9.2f ms' % FAKE_ELAPSED_MS, rec.stdout.getvalue())

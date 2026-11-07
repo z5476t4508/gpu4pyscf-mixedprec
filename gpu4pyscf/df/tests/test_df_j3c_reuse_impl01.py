@@ -214,7 +214,6 @@ class TestCaptureFailClosed(_KnobState):
         return SimpleNamespace(with_df=wdf, mol=mol_sph)
 
     def _good_pack(self):
-        nao = mol_sph.nao
         nF, npair, naux = 3, 5, 4
         pair = cp.arange(npair, dtype=cp.int32)
         cderi = cp.zeros((nF, npair))
@@ -238,10 +237,12 @@ class TestCaptureFailClosed(_KnobState):
             SimpleNamespace(mol=mol_sph), None))
         wdf, cderi, pair, aux_coef = self._good_pack()
         # cderi missing
-        w = SimpleNamespace(**vars(wdf)); w._cderi = None
+        w = SimpleNamespace(**vars(wdf))
+        w._cderi = None
         self.assertIsNone(df_rhf_grad._capture_grad_j3c_reuse(self._mf(w), None))
         # aux_coef missing (pre-change DF objects)
-        w = SimpleNamespace(**vars(wdf)); w._cderi_aux_coef = None
+        w = SimpleNamespace(**vars(wdf))
+        w._cderi_aux_coef = None
         self.assertIsNone(df_rhf_grad._capture_grad_j3c_reuse(self._mf(w), None))
         # host-resident cderi
         w = SimpleNamespace(**vars(wdf))

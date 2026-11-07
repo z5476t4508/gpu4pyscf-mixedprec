@@ -217,7 +217,6 @@ class KnownValues(unittest.TestCase):
         self.assertGreaterEqual(len(blocks), 3)
         tail_pts = blocks[-1][2].size
         self.assertNotEqual(tail_pts, 4096)
-        nao = ni.gdftopt._sorted_mol.nao
         rng = np.random.default_rng(20261026)
         nocc = 13
         try:
