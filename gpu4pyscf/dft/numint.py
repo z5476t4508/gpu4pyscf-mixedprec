@@ -718,8 +718,8 @@ def _f64(a):
     return a.astype(cupy.float64)
 
 
-_SCF_VMAT_F32 = None     # cached env value; None = not yet read;
-                         # False | True ('1') | 'headtail' (LC-115)
+# Cached env value: None = not yet read; False | True ('1') | 'headtail' (LC-115)
+_SCF_VMAT_F32 = None
 # Set by scf.hf._kernel for the duration of a kernel on a pure-fp64 lane
 # (precision_mode None/'fp64') when the env knob below is on.  The cast
 # condition in _nr_rks_task/_nr_uks_task reads this flag instead of the
