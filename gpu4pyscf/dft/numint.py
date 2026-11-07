@@ -906,8 +906,8 @@ def _f64(a):
     return a.astype(cupy.float64)
 
 
-_SCF_VMAT_F32 = None     # cached env value; None = not yet read;
-                         # False | True ('1') | 'headtail' (LC-115)
+# Cached env value: None (unread), False, True ('1'), or 'headtail' (LC-115).
+_SCF_VMAT_F32 = None
 # Set by scf.hf._kernel for the duration of a kernel on a pure-fp64 lane
 # (precision_mode None/'fp64') when the env knob below is on.  The cast
 # condition in _nr_rks_task/_nr_uks_task reads this flag instead of the
@@ -1099,8 +1099,8 @@ def _scf_vmat_f32():
 # callers keep the flag's default False.  _rho_f32_head_blocks counts
 # lane-B twin servings only (engagement evidence; knob-off and
 # auto-lane deltas are exactly 0).
-_SCF_RHO_F32 = None     # cached env value; None = not yet read;
-                        # False | True ('1') | 'headtail'
+# Cached env value: None (unread), False, True ('1'), or 'headtail'.
+_SCF_RHO_F32 = None
 _scf_rho_f32_lane = False
 _rho_f32_head_blocks = 0
 

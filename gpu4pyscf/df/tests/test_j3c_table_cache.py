@@ -128,7 +128,7 @@ def test_j3c_table_cache_get_j_and_scf():
     from gpu4pyscf.dft import RKS
     mol = pyscf.M(atom=FIXTURES['water_def2svp']['atom'],
                   basis='def2-svp', verbose=0)
-    dm = pyscf.scf.RHF(mol).init_guess_by_minao()
+    pyscf.scf.RHF(mol).init_guess_by_minao()
 
     def run(knob):
         os.environ.pop('GPU4PYSCF_DF_J_3C_CACHE', None)
