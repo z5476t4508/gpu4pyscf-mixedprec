@@ -239,7 +239,6 @@ def energy_elec(mf, dm=None, h1e=None, vhf=None):
 def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
            dump_chk=True, dm0=None, callback=None, conv_check=True, **kwargs):
     conv_tol = mf.conv_tol
-    mol = mf.mol
     verbose = mf.verbose
     log = logger.new_logger(mf, verbose)
     t0 = t1 = log.init_timer()
