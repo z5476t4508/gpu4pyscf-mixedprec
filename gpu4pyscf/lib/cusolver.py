@@ -16,13 +16,72 @@
 import numpy as np
 import cupy
 import ctypes
+import re
 from ctypes.util import find_library
 from cupy_backends.cuda.libs import cusolver
 from cupy_backends.cuda.libs import cublas
 from cupy.cuda import device
 
-libcusolver = find_library('cusolver')
-libcusolver = ctypes.CDLL(libcusolver)
+
+def _load_libcusolver():
+    '''ctypes handle to the SAME libcusolver cupy has mapped into this process.
+
+    find_library('cusolver') returns a bare SONAME and leaves the final
+    resolution to the loader; on hosts with several CUDA toolchains
+    installed the loader may bind it to a DIFFERENT toolkit's libcusolver
+    than the one cupy loaded.  eigh() below passes cupy's solver handle
+    into this module's library, and a handle created by one library
+    version is not valid for another -- measured on a CUDA 12.8 + 13.0
+    host (cupy loads 12.8's libcusolver.so.11.7.3.90 while find_library
+    resolves libcusolver.so.12 to 13.0's library): generalized
+    sygvd/zhegvd segfaults outside narrow n windows (17<=n<=64 real,
+    13<=n<=64 complex; see the LC-54 evidence in
+    tasks/issue-9/2026-10-07-lc54-upstream-test-sweep-2).  Loading the
+    library cupy already mapped makes the handle/library pairing correct
+    by construction; cupy's own mapping is visible in /proc/self/maps and
+    cusolver._getVersion() identifies which mapped library is cupy's.
+    '''
+    try:
+        with open('/proc/self/maps') as f:
+            mapped = sorted(set(
+                re.findall(r'(/\S*libcusolver\.so\S*)', f.read())))
+    except OSError:
+        mapped = []
+    want = None
+    try:
+        # version of the library cupy itself loaded, e.g. (11, 7, 3)
+        want = cusolver._getVersion()
+    except Exception:
+        pass
+    for path in mapped:
+        try:
+            lib = ctypes.CDLL(path)  # already mapped: no second load
+        except OSError:
+            continue
+        if not hasattr(lib, 'cusolverDnDsygvd_bufferSize'):
+            continue
+        if want is None:
+            return lib, path
+        ver = ctypes.c_int(0)
+        try:
+            if lib.cusolverGetVersion(ctypes.byref(ver)) != 0:
+                continue
+        except AttributeError:
+            # library too old to report a version: accept it only when
+            # it is the sole candidate (the usual single-toolkit host)
+            if len(mapped) == 1:
+                return lib, path
+            continue
+        if ver.value == want[0]*1000 + want[1]*100 + want[2]:
+            return lib, path
+    # no mapped library identified (e.g. no /proc): historical lookup
+    name = find_library('cusolver')
+    if name is None:
+        raise ImportError('libcusolver not found')
+    return ctypes.CDLL(name), name
+
+
+libcusolver, _libcusolver_path = _load_libcusolver()
 
 # workspace size (lwork) provided by the cusolver*_bufferSize is an 32-bit
 # integer. For arrays above this dimension, the workspace size would overflow.

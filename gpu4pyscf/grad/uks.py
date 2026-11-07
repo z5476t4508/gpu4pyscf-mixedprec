@@ -131,6 +131,13 @@ def _get_exc_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
         ngrids_local = grid_end - grid_start
         log.debug(f"{ngrids_local} grids on Device {device_id}")
 
+        # LC-22: opt-in larger grid blocks for the gradient XC loops (same
+        # knob and guard as the SCF side, dft.numint LC-11).  Probe
+        # (2026-10-06-lc21-grad-blocksize): whole-gradient 1.14x on the
+        # wb97m-v methoxy UKS cell at 16384, dg <= 3e-13 Eh/Bohr.
+        loop_blksize = numint._effective_scf_blksize(
+            numint._scf_grid_blksize(), grid_start, grid_end, ngrids_glob)
+
         exc1 = cupy.zeros((nao, 3))
 
         if xctype == 'LDA':
@@ -139,7 +146,7 @@ def _get_exc_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
             ncomp = 4
         else:
             ncomp = 5
-        rho_buf = cupy.empty(2*ncomp*MIN_BLK_SIZE)
+        rho_buf = cupy.empty(2*ncomp*loop_blksize)
         mo_buf = cupy.empty_like(mo_coeff[0])
         vtmp_buf = cupy.empty((3, nao, nao))
 
@@ -147,9 +154,10 @@ def _get_exc_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
 
         if xctype == 'LDA':
             ao_deriv = 1
-            aow_buf = cupy.empty(MIN_BLK_SIZE * max(nao, 1*nocc))
+            aow_buf = cupy.empty(loop_blksize * max(nao, 1*nocc))
             for ao_mask, idx, weight, _ in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, None,
-                                                         grid_range=(grid_start, grid_end)):
+                                                         grid_range=(grid_start, grid_end),
+                                                         loop_blksize=loop_blksize):
                 blk_size = len(weight)
                 nao_sub = len(idx)
                 rho = ndarray((2, ncomp, blk_size), buffer=rho_buf)
@@ -170,9 +178,10 @@ def _get_exc_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
                 exc1[idx] += cupy.einsum('nij,ij->ni', vtmp, dm_mask).T
         elif xctype == 'GGA':
             ao_deriv = 2
-            aow_buf = cupy.empty(MIN_BLK_SIZE * max(nao * 3, 2*nocc))
+            aow_buf = cupy.empty(loop_blksize * max(nao * 3, 2*nocc))
             for ao_mask, idx, weight, _ in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, None,
-                                                         grid_range=(grid_start, grid_end)):
+                                                         grid_range=(grid_start, grid_end),
+                                                         loop_blksize=loop_blksize):
                 blk_size = len(weight)
                 nao_sub = len(idx)
                 rho = ndarray((2, ncomp, blk_size), buffer=rho_buf)
@@ -197,9 +206,10 @@ def _get_exc_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
 
         elif xctype == 'MGGA':
             ao_deriv = 2
-            aow_buf = cupy.empty(MIN_BLK_SIZE * max(nao * 3, 2*nocc))
+            aow_buf = cupy.empty(loop_blksize * max(nao * 3, 2*nocc))
             for ao_mask, idx, weight, _ in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, None,
-                                                         grid_range=(grid_start, grid_end)):
+                                                         grid_range=(grid_start, grid_end),
+                                                         loop_blksize=loop_blksize):
                 blk_size = len(weight)
                 nao_sub = len(idx)
                 rho = ndarray((2, ncomp, blk_size), buffer=rho_buf)
