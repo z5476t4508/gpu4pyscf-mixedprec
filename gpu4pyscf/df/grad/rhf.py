@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import ctypes
+import os
 import numpy as np
 import cupy as cp
 from cupyx.scipy.linalg import solve_triangular
@@ -31,6 +32,79 @@ from gpu4pyscf.df.df_jk import factorize_dm, _DFHF
 from gpu4pyscf.gto.mole import SortedMole
 
 __all__ = ['Gradients']
+
+# LC-42: opt-in fused launch of the sum_ejk_int3c2e_ip1 kernel on the J+K
+# (hybrid-functional) gradient path.  The default path serializes one
+# kernel launch per aux l-batch (grid (n_shell_pair_blocks, 1), 1 block/SM
+# at ~95 KB shared memory -> 16-28% SM occupancy on the 128-SM RTX 4090;
+# measured 8-12 sequential launches per gradient, 17-40% of the fp64
+# gradient phase at 43-222 AO).  The kernel's launcher has always accepted
+# a 2D grid; the J-only path (_j_energy_per_atom) has used it in
+# production since upstream.  Fusing the existing batch boundaries into
+# one launch does not change any block's arithmetic or memory addressing:
+# each y-block computes exactly what its per-batch launch computed (same
+# shl_pair x, same ksh_offsets slice relative to its own start, same
+# compressed columns, same atomicAdd order per block), so the result
+# differs from the per-batch path only by the atomic interleaving order
+# across blocks (the same nondeterminism class as any occupancy change;
+# the per-batch path itself is not deterministic across runs at the last
+# bits).  Sub-batch y-chunking was rejected by static analysis: the
+# exchange branch indexes the compressed buffer as
+# dm[pair_offset*naux + k0 + k*nksh] with nksh = ksh1-ksh0, i.e. the
+# column layout of the batch is interleaved by y-block shell count --
+# changing block boundaries inside a batch would read wrong columns.
+_IP1_FUSED = None   # cached env value; None = not yet read
+
+def _ip1_fused():
+    '''Whether to fuse the per-batch sum_ejk_int3c2e_ip1 launches (opt-in).
+
+    GPU4PYSCF_DF_IP1_FUSED=1 enables the fused launch when the full-width
+    compressed buffer fits the memory guard; anything else keeps the
+    upstream per-batch path byte-for-byte.
+    '''
+    global _IP1_FUSED
+    if _IP1_FUSED is None:
+        raw = os.environ.get('GPU4PYSCF_DF_IP1_FUSED', '')
+        if raw == '1':
+            _IP1_FUSED = True
+        elif raw:
+            import warnings
+            warnings.warn(f'GPU4PYSCF_DF_IP1_FUSED={raw!r} ignored; '
+                          'expected 1 to enable the fused ip1 launch')
+            _IP1_FUSED = False
+        else:
+            _IP1_FUSED = False
+    return _IP1_FUSED
+
+_IP1_F32 = None     # cached env value; None = not yet read
+
+def _ip1_f32():
+    '''Whether to run the ip1 integral kernel in float32 on the fp64 lane
+    (opt-in precision-policy prototype, LC-86).
+
+    GPU4PYSCF_DF_IP1_F32=1 selects sum_ejk_int3c2e_ip1_f32 for the DF
+    gradient ip1 kernel regardless of the global precision mode.  The
+    existing fp32 discipline is preserved exactly: only the integral
+    kernel and its pseudo-DM/dm+auxvec inputs go float32; the j3c@dm
+    contractions, the j2c metric solve and the atomic ejk/ejk_aux
+    accumulation targets stay float64 (the metric solve amplifies
+    float32 relative error by the auxiliary-basis condition number
+    straight into the gradient).  On lanes that already run the gradient
+    in fp32 (the resolved 'auto' policy) this is a no-op.
+    '''
+    global _IP1_F32
+    if _IP1_F32 is None:
+        raw = os.environ.get('GPU4PYSCF_DF_IP1_F32', '')
+        if raw == '1':
+            _IP1_F32 = True
+        elif raw:
+            import warnings
+            warnings.warn(f'GPU4PYSCF_DF_IP1_F32={raw!r} ignored; '
+                          'expected 1 to enable the fp32 ip1 kernel')
+            _IP1_F32 = False
+        else:
+            _IP1_F32 = False
+    return _IP1_F32
 
 def _gen_metric_solver(int2c, decompose_j2c='CD', lindep=df.LINEAR_DEP_THR):
     ''' generate a solver to solve Ax = b, RHS must be in (n,....) '''
@@ -168,23 +242,43 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, hermi=0,
         dm = dm_factor_l.dot(dm_factor_r.T)
 
     int3c2e_envs = int3c2e_opt.int3c2e_envs
-    fp32 = precision.get_precision() == 'fp32'
+    # LC-86: the opt-in ip1-f32 prototype selects the fp32 kernel on the
+    # fp64 lane too; the fp32 discipline (fp64 pre-contractions and metric
+    # solve, fp32 kernel + pseudo-DM) is the one the global fp32 mode
+    # already uses -- see _ip1_f32().
+    fp32 = precision.get_precision() == 'fp32' or _ip1_f32()
     if fp32:
         kern = libvhf_rys.sum_ejk_int3c2e_ip1_f32
     else:
         kern = libvhf_rys.sum_ejk_int3c2e_ip1
     assert lr_factor is None and sr_factor is None
+    # LC-42: fused-launch guard.  The per-batch path allocates
+    # nao_pair*batch_size and reuses it batch by batch; the fused path
+    # needs the full nao_pair*naux compressed matrix resident at once.
+    # Require it to fit in 25% of the currently available device memory,
+    # else keep the upstream per-batch behavior exactly.
+    fused = _ip1_fused() and aux_batches > 1 and \
+        nao_pair*naux*(4 if fp32 else 8) < get_avail_mem()*0.25
     aux0 = aux1 = 0
-    buf = cp.empty((nao_pair*batch_size), dtype=cp.float32 if fp32 else cp.float64)
+    if fused:
+        buf = cp.empty((nao_pair*naux), dtype=cp.float32 if fp32 else cp.float64)
+    else:
+        buf = cp.empty((nao_pair*batch_size), dtype=cp.float32 if fp32 else cp.float64)
     buf1 = cp.empty((blksize, nao, nao))
     buf2 = cp.empty((blksize, nocc, nao))
     ejk = cp.zeros((mol.natm, 3))
     ejk_aux = cp.zeros((mol.natm, 3))
-    for kbatch in range(aux_batches):
-        naux_in_batch = aux_offsets[kbatch+1] - aux_offsets[kbatch]
-        aux_ao_offset = aux_loc[ksh_offsets_cpu[kbatch]]
-        compressed = ndarray((nao_pair, naux_in_batch),
-                             dtype=cp.float32 if fp32 else cp.float64, buffer=buf)
+    for kbatch in range(aux_batches if not fused else 1):
+        if fused:
+            naux_in_batch = naux
+            aux_ao_offset = 0
+            compressed = ndarray((nao_pair, naux),
+                                 dtype=cp.float32 if fp32 else cp.float64, buffer=buf)
+        else:
+            naux_in_batch = aux_offsets[kbatch+1] - aux_offsets[kbatch]
+            aux_ao_offset = aux_loc[ksh_offsets_cpu[kbatch]]
+            compressed = ndarray((nao_pair, naux_in_batch),
+                                 dtype=cp.float32 if fp32 else cp.float64, buffer=buf)
         for k0, k1 in lib.prange(0, naux_in_batch, blksize):
             dk = k1 - k0
             aux0, aux1 = aux1, aux1 + dk
@@ -219,10 +313,11 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, hermi=0,
             ctypes.byref(int3c2e_envs),
             ctypes.c_int(shm_size_max),
             ctypes.c_int(len(shl_pair_offsets) - 1),
-            ctypes.c_int(1),
+            ctypes.c_int(len(ksh_offsets_cpu) - 1 if fused else 1),
             ctypes.cast(shl_pair_offsets.data.ptr, ctypes.c_void_p),
             ctypes.cast(bas_ij_idx.data.ptr, ctypes.c_void_p),
-            ctypes.cast(ksh_offsets_gpu[kbatch:].data.ptr, ctypes.c_void_p),
+            ctypes.cast(ksh_offsets_gpu.data.ptr if fused
+                        else ksh_offsets_gpu[kbatch:].data.ptr, ctypes.c_void_p),
             ctypes.cast(gout_stride.data.ptr, ctypes.c_void_p),
             ctypes.cast(ao_pair_loc.data.ptr, ctypes.c_void_p),
             ctypes.c_int(aux_ao_offset),
@@ -298,7 +393,9 @@ def _j_energy_per_atom(int3c2e_opt, dm, hermi=0, auxbasis_response=True, verbose
     # Only the integral kernel runs in float32; the dm contraction and the
     # j2c metric solve above stay in float64 (see the note in
     # _jk_energy_per_atom on the metric solve amplifying float32 error).
-    fp32 = precision.get_precision() == 'fp32'
+    # LC-86: the opt-in ip1-f32 prototype applies the same selection on
+    # the fp64 lane (see _ip1_f32()).
+    fp32 = precision.get_precision() == 'fp32' or _ip1_f32()
     if fp32:
         kern = libvhf_rys.sum_ejk_int3c2e_ip1_f32
         dm_kern = cp.asarray(dm, dtype=cp.float32, order='C')
