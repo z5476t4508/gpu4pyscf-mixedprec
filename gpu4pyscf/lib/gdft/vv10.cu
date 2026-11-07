@@ -27,6 +27,256 @@
 
 #define NG_PER_BLOCK      128
 
+// Block-wide tree reduction of three doubles (used by the multi-warp VV10
+// UWE kernel). blockDim.x is a power of two in every caller, and every
+// thread enters with __syncthreads() balanced, so the barriers below are
+// uniform across the block.
+__device__
+static void _vv10_block_reduce3(double& U, double& W, double& E)
+{
+    __shared__ double s_U[NG_PER_BLOCK];
+    __shared__ double s_W[NG_PER_BLOCK];
+    __shared__ double s_E[NG_PER_BLOCK];
+    s_U[threadIdx.x] = U;
+    s_W[threadIdx.x] = W;
+    s_E[threadIdx.x] = E;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            s_U[threadIdx.x] += s_U[threadIdx.x + stride];
+            s_W[threadIdx.x] += s_W[threadIdx.x + stride];
+            s_E[threadIdx.x] += s_E[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    U = s_U[0];
+    W = s_W[0];
+    E = s_E[0];
+}
+
+// Issue #10 candidate C1 (rework): the REFERENCE kernel below (warp1)
+// assigns one grid point i to each THREAD and one 128-thread block to 128
+// consecutive i points; it stages each 128-point j chunk into shared memory
+// ONCE per block and reuses it for all 128 i points of the block (minimum
+// possible global read amplification: each j element is read once per
+// ngrids/128 blocks). Its limitation is parallelism, not traffic: with one
+// thread per i the kernel exposes only ngrids threads, so small grids
+// (e.g. ~58k points -> 452 blocks) under-occupy the GPU and run the fp64
+// pipes at a fraction of the achievable rate, while large grids already
+// sit near the fp64 roofline.
+//
+// The multi-warp variant (warp4, kept below for continuity) is the opposite
+// trade: one block per i with all 128 threads cooperating on that i's
+// j-loop, which restores parallelism but restages the whole j grid in every
+// block (128x global read amplification) and turns L2 bandwidth into the
+// binding limit at benzene-scale grids.
+//
+// The multi-i tile kernel (this file, selected via GPU4PYSCF_VV10_UWE_KERNEL
+// = tile8/tile16/tile32) interpolates between the two: one block serves
+// I_TILE i points, and the 128 threads are split into groups of
+// 128/I_TILE that cooperatively walk each i's j-loop over the block-shared
+// staged j chunk. Global read amplification becomes 128/I_TILE (16x/8x/4x
+// for tile8/tile16/tile32 respectively, vs warp4's 128x and the reference's
+// 1x) while exposed parallelism becomes ngrids * 128/I_TILE threads. The
+// per-pair fp64
+// arithmetic expression is IDENTICAL to the reference kernel; the result
+// differs from the reference only in fp64 summation order (per-i partials
+// over 128/I_TILE strided j subsets combined by a within-warp shuffle
+// tree reduction instead of one serial chain), the same class of
+// reduction-order noise already probed for warp4 (issue #10 precision
+// probe: <= 4.3e-16 kernel-level, <= 5.7e-14 Ha SCF-level).
+//
+// Boundary handling: I_TILE i points per block means the last block may
+// carry fewer than I_TILE active i points (partial tile) and the last j
+// chunk may be shorter than 128 (tail chunk). No thread ever exits early:
+// inactive i groups keep executing the uniform chunk loop (their loads are
+// skipped and their accumulators stay zero) so every __syncthreads() in the
+// loop is reached by all 128 threads, and staged shared slots beyond the
+// tail are never read because the compute loop bound is the same uniform
+// block_upper_bound used by the reference kernel. Ownership: exactly one
+// thread (group lane 0) writes each active i's U/W/E, so there is no
+// write race between groups.
+//
+// Selected at runtime via GPU4PYSCF_VV10_UWE_KERNEL (unset/empty = warp1
+// reference, the default; 'warp4' = multi-warp; 'tile8'/'tile16'/'tile32'
+// = multi-i tile); the default never changes without that opt-in.
+template <int I_TILE>
+__global__
+static void vv10_fock_eval_UWE_multii_kernel(double* __restrict__ U, double* __restrict__ W, double* __restrict__ E,
+                                             const double* __restrict__ grid_coord, const double* __restrict__ rho_weight,
+                                             const double* __restrict__ omega, const double* __restrict__ kappa,
+                                             const int ngrids)
+{
+    constexpr int THREADS_PER_I = NG_PER_BLOCK / I_TILE;
+    static_assert(THREADS_PER_I >= 4 && THREADS_PER_I <= 32,
+                  "multi-i tile keeps the per-i reduction inside one warp "
+                  "(I_TILE in 4..32; I_TILE=128 is the reference kernel)");
+    const int group = threadIdx.x / THREADS_PER_I;
+    const int lane_in_group = threadIdx.x % THREADS_PER_I;
+    const int i = blockIdx.x * I_TILE + group;
+    const bool active = i < ngrids;
+
+    double omega_i = NAN;
+    double kappa_i = NAN;
+    double3 r_i = { NAN, NAN, NAN };
+    if (active) {
+        omega_i = omega[i];
+        kappa_i = kappa[i];
+        r_i.x = grid_coord[i * 3 + 0];
+        r_i.y = grid_coord[i * 3 + 1];
+        r_i.z = grid_coord[i * 3 + 2];
+    }
+
+    double U_i = 0;
+    double W_i = 0;
+    double E_i = 0;
+
+    __shared__ double3 shared_omega_kappa_rhow_j[NG_PER_BLOCK];
+    __shared__ double3 shared_r_j[NG_PER_BLOCK];
+
+    for (int j_block_offset = 0; j_block_offset < ngrids; j_block_offset += NG_PER_BLOCK) {
+        const int j = j_block_offset + threadIdx.x;
+        if (j < ngrids) {
+            shared_omega_kappa_rhow_j[threadIdx.x].x = omega[j];
+            shared_omega_kappa_rhow_j[threadIdx.x].y = kappa[j];
+            shared_omega_kappa_rhow_j[threadIdx.x].z = rho_weight[j];
+            shared_r_j[threadIdx.x].x = grid_coord[j * 3 + 0];
+            shared_r_j[threadIdx.x].y = grid_coord[j * 3 + 1];
+            shared_r_j[threadIdx.x].z = grid_coord[j * 3 + 2];
+        }
+        __syncthreads();
+
+        const int block_upper_bound = min(NG_PER_BLOCK, ngrids - j_block_offset);
+        // group lanes walk the staged chunk with stride THREADS_PER_I, so
+        // the group's lanes together cover every staged j for their i
+        for (int j_in_block = lane_in_group; j_in_block < block_upper_bound; j_in_block += THREADS_PER_I) {
+            const double omega_j = shared_omega_kappa_rhow_j[j_in_block].x;
+            const double kappa_j = shared_omega_kappa_rhow_j[j_in_block].y;
+            const double3 r_j = shared_r_j[j_in_block];
+            const double rho_weight_j = shared_omega_kappa_rhow_j[j_in_block].z;
+
+            const double r_ij2 = (r_i.x - r_j.x) * (r_i.x - r_j.x) + (r_i.y - r_j.y) * (r_i.y - r_j.y) + (r_i.z - r_j.z) * (r_i.z - r_j.z);
+            const double g_ij = omega_i * r_ij2 + kappa_i;
+            const double g_ji = omega_j * r_ij2 + kappa_j;
+            const double g_sum = g_ij + g_ji;
+            const double g_ij_ji_sum_1 = 1 / (g_ij * g_ji * g_sum);
+            const double Phi_ij = -g_ij_ji_sum_1; // Prefactor of 1.5 is applied later
+
+            const double E_ij = rho_weight_j * Phi_ij;
+            const double U_ij = E_ij * (g_sum + g_ij) * g_ji * g_ij_ji_sum_1;
+            const double W_ij = U_ij * r_ij2;
+
+            U_i += U_ij;
+            W_i += W_ij;
+            E_i += E_ij;
+        }
+        __syncthreads();
+    }
+
+    // per-i reduction inside the owning warp: THREADS_PER_I is 4..32 and
+    // groups are aligned contiguous lane ranges (NG_PER_BLOCK is a
+    // multiple of 32 and THREADS_PER_I divides 32), so a shuffle tree
+    // reduction over THREADS_PER_I lanes needs no shared memory and no
+    // barrier. All threads reach here (no early return above), so the
+    // full-warp sync mask is uniform.
+    #pragma unroll
+    for (int stride = THREADS_PER_I / 2; stride > 0; stride >>= 1) {
+        U_i += __shfl_down_sync(0xffffffffu, U_i, stride);
+        W_i += __shfl_down_sync(0xffffffffu, W_i, stride);
+        E_i += __shfl_down_sync(0xffffffffu, E_i, stride);
+    }
+    if (lane_in_group == 0 && active) {
+        U[i] = -U_i * 1.5;
+        W[i] = -W_i * 1.5;
+        E[i] = E_i * 1.5;
+    }
+}
+
+// The multi-warp variant (issue #10 candidate C1 round 1): one block per
+// grid point i, with all NG_PER_BLOCK threads cooperating on that single
+// i's j-loop (thread t takes every NG_PER_BLOCK-th j; per-i sums via block
+// reduction). Compared with the reference kernel this raises exposed
+// parallelism from ngrids threads to ngrids*128 threads but restages the
+// entire j grid in every block (128x global read amplification), which
+// makes L2 bandwidth the binding limit at benzene-scale grids; measured
+// end-to-end it was 0.944x-1.152x by cell, so it stays opt-in. The fp64
+// arithmetic expression per pair is identical to the reference kernel;
+// only the fp64 summation order differs (block tree reduction of 128
+// partials instead of one serial chain).
+__global__
+static void vv10_fock_eval_UWE_multiwarp_kernel(double* __restrict__ U, double* __restrict__ W, double* __restrict__ E,
+                                                const double* __restrict__ grid_coord, const double* __restrict__ rho_weight,
+                                                const double* __restrict__ omega, const double* __restrict__ kappa,
+                                                const int ngrids)
+{
+    const int i = blockIdx.x;
+    const bool active = i < ngrids;
+
+    double omega_i = NAN;
+    double kappa_i = NAN;
+    double3 r_i = { NAN, NAN, NAN };
+    if (active) {
+        omega_i = omega[i];
+        kappa_i = kappa[i];
+        r_i.x = grid_coord[i * 3 + 0];
+        r_i.y = grid_coord[i * 3 + 1];
+        r_i.z = grid_coord[i * 3 + 2];
+    }
+
+    double U_i = 0;
+    double W_i = 0;
+    double E_i = 0;
+
+    __shared__ double3 shared_omega_kappa_rhow_j[NG_PER_BLOCK];
+    __shared__ double3 shared_r_j[NG_PER_BLOCK];
+
+    for (int j_block_offset = 0; j_block_offset < ngrids; j_block_offset += NG_PER_BLOCK) {
+        const int j = j_block_offset + threadIdx.x;
+        if (j < ngrids) {
+            shared_omega_kappa_rhow_j[threadIdx.x].x = omega[j];
+            shared_omega_kappa_rhow_j[threadIdx.x].y = kappa[j];
+            shared_omega_kappa_rhow_j[threadIdx.x].z = rho_weight[j];
+            shared_r_j[threadIdx.x].x = grid_coord[j * 3 + 0];
+            shared_r_j[threadIdx.x].y = grid_coord[j * 3 + 1];
+            shared_r_j[threadIdx.x].z = grid_coord[j * 3 + 2];
+        }
+        __syncthreads();
+
+        const int block_upper_bound = min(NG_PER_BLOCK, ngrids - j_block_offset);
+        // thread t takes j_in_block = t, t+blockDim.x, ... within this
+        // 128-j chunk: all four warps cooperate on the j-loop
+        for (int j_in_block = threadIdx.x; j_in_block < block_upper_bound; j_in_block += blockDim.x) {
+            const double omega_j = shared_omega_kappa_rhow_j[j_in_block].x;
+            const double kappa_j = shared_omega_kappa_rhow_j[j_in_block].y;
+            const double3 r_j = shared_r_j[j_in_block];
+            const double rho_weight_j = shared_omega_kappa_rhow_j[j_in_block].z;
+
+            const double r_ij2 = (r_i.x - r_j.x) * (r_i.x - r_j.x) + (r_i.y - r_j.y) * (r_i.y - r_j.y) + (r_i.z - r_j.z) * (r_i.z - r_j.z);
+            const double g_ij = omega_i * r_ij2 + kappa_i;
+            const double g_ji = omega_j * r_ij2 + kappa_j;
+            const double g_sum = g_ij + g_ji;
+            const double g_ij_ji_sum_1 = 1 / (g_ij * g_ji * g_sum);
+            const double Phi_ij = -g_ij_ji_sum_1; // Prefactor of 1.5 is applied later
+
+            const double E_ij = rho_weight_j * Phi_ij;
+            const double U_ij = E_ij * (g_sum + g_ij) * g_ji * g_ij_ji_sum_1;
+            const double W_ij = U_ij * r_ij2;
+
+            U_i += U_ij;
+            W_i += W_ij;
+            E_i += E_ij;
+        }
+        __syncthreads();
+    }
+
+    _vv10_block_reduce3(U_i, W_i, E_i);
+    if (threadIdx.x == 0 && active) {
+        U[i] = -U_i * 1.5;
+        W[i] = -W_i * 1.5;
+        E[i] = E_i * 1.5;
+    }
+}
+
 __global__
 static void vv10_fock_eval_UWE_kernel(double* __restrict__ U, double* __restrict__ W, double* __restrict__ E,
                                       const double* __restrict__ grid_coord, const double* __restrict__ rho_weight,
@@ -646,6 +896,46 @@ static void vv10_hess_eval_D_B_in_double_grid_response_offdiagonal_kernel(double
     D_B[B_atom * 9 * ngrids + 8 * ngrids + i] = -(2 * 1.5) * D_B_i[8];
 }
 
+// Issue #10 candidate C1: runtime kernel selection for the VV10 UWE
+// evaluation. The reference 'warp1' kernel (one thread per i, one
+// 128-thread block per 128 i, j chunk staged once and shared by the
+// block's 128 i points) is the default and remains bit-for-bit the
+// historical path. 'warp4' routes to the multi-warp variant (one block
+// per i, four warps cooperating on each i's j-loop; 128x global read
+// amplification; kept from round 1, opt-in). 'tile8'/'tile16'/'tile32'
+// route to the multi-i tile kernel with I_TILE = 8/16/32 i points per
+// block (global read amplification 16x/8x/4x; per-pair fp64 arithmetic
+// identical to the reference, summation-order-only difference, see the
+// kernel comment). Selection is a process-lifetime decision read from
+// GPU4PYSCF_VV10_UWE_KERNEL once; anything unrecognized (including
+// unset) keeps the reference kernel, and an unknown non-empty value is
+// reported and ignored rather than guessed. Returns 0 = warp1,
+// 1 = warp4, or the I_TILE of the selected multi-i tile.
+static int vv10_uwe_kernel_variant()
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char* env = getenv("GPU4PYSCF_VV10_UWE_KERNEL");
+        if (env != nullptr && strcmp(env, "warp4") == 0) {
+            cached = 1;
+        } else if (env != nullptr && strcmp(env, "tile8") == 0) {
+            cached = 8;
+        } else if (env != nullptr && strcmp(env, "tile16") == 0) {
+            cached = 16;
+        } else if (env != nullptr && strcmp(env, "tile32") == 0) {
+            cached = 32;
+        } else {
+            if (env != nullptr && strlen(env) > 0 && strcmp(env, "warp1") != 0) {
+                fprintf(stderr, "vv10 UWE kernel selector: unknown value "
+                        "'%s' (expected warp1|warp4|tile8|tile16|tile32); "
+                        "using the reference warp1 kernel\n", env);
+            }
+            cached = 0;
+        }
+    }
+    return cached;
+}
+
 extern "C" {
 __host__
 int VXC_vv10nlc_fock_eval_UWE(const cudaStream_t stream,
@@ -654,10 +944,32 @@ int VXC_vv10nlc_fock_eval_UWE(const cudaStream_t stream,
                               const double* omega, const double* kappa,
                               const int ngrids)
 {
+    const int variant = vv10_uwe_kernel_variant();
     const dim3 threads(NG_PER_BLOCK);
-    const dim3 blocks((ngrids+NG_PER_BLOCK-1)/NG_PER_BLOCK);
-    vv10_fock_eval_UWE_kernel<<<blocks, threads, 0, stream>>>(U, W, E,
-                                                              grid_coord, rho_weight, omega, kappa, ngrids);
+    if (variant == 1) {
+        // warp4: one block per grid point; the j-loop inside is cooperative
+        const dim3 blocks(ngrids);
+        vv10_fock_eval_UWE_multiwarp_kernel<<<blocks, threads, 0, stream>>>(
+            U, W, E, grid_coord, rho_weight, omega, kappa, ngrids);
+    } else if (variant >= 4) {
+        // multi-i tile: one block per I_TILE grid points; the per-i
+        // reduction lives inside one warp (see kernel comment)
+        const dim3 blocks((ngrids + variant - 1) / variant);
+        if (variant == 8) {
+            vv10_fock_eval_UWE_multii_kernel<8><<<blocks, threads, 0, stream>>>(
+                U, W, E, grid_coord, rho_weight, omega, kappa, ngrids);
+        } else if (variant == 16) {
+            vv10_fock_eval_UWE_multii_kernel<16><<<blocks, threads, 0, stream>>>(
+                U, W, E, grid_coord, rho_weight, omega, kappa, ngrids);
+        } else {
+            vv10_fock_eval_UWE_multii_kernel<32><<<blocks, threads, 0, stream>>>(
+                U, W, E, grid_coord, rho_weight, omega, kappa, ngrids);
+        }
+    } else {
+        const dim3 blocks((ngrids+NG_PER_BLOCK-1)/NG_PER_BLOCK);
+        vv10_fock_eval_UWE_kernel<<<blocks, threads, 0, stream>>>(
+            U, W, E, grid_coord, rho_weight, omega, kappa, ngrids);
+    }
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA Error of vv10 fock eval_UWE: %s\n", cudaGetErrorString(err));
