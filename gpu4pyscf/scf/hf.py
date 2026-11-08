@@ -44,6 +44,21 @@ overlap_zero_eigenvalue_threshold = getattr(__config__, 'scf_hf_overlap_zero_eig
 # Threshold on |E_n - E_{n-1}| for switching fp32 -> fp64 in the 'auto'
 # mixed-precision policy
 _PRECISION_SWITCH_TOL = getattr(__config__, 'scf_hf_precision_switch_tol', 1e-4)
+# SP-14 (scf-priority-20261025 card): below this AO count the auto
+# policy's fp32 head is a measured net LOSS, not a win -- the per-cycle
+# SCF excess is launch-bound at small shapes (SP-12 envelope: C/B t_scf
+# median 1.111 below 100 AO / 1.068 at 100-250, vs 0.978-1.008 at 250+;
+# SP-13: the excess is FLAT 1.10-1.13 across 0-150 AO and carried by the
+# head cycles, head-wall ratios 1.24-2.31x on every probed loss cell,
+# melatonin-318 0.741 = the size-sign flip; CDERI share exactly 0).
+# Below the threshold the plain 'auto' lane therefore degenerates to the
+# exact fp64 lane (see the _kernel gate): fp64 from cycle 0, _mixed_auto
+# False so the switch has no fp32 phase to leave and the vmat-knob lane
+# eligibility is identical to an explicit fp64 request -- the SCF
+# trajectory is bitwise the fp64 lane's.  The verify/strict variants are
+# not gated.  At/above the threshold nothing changes: the head is a
+# measured win from ~270 AO up.
+_AUTO_HEAD_MIN_AO = getattr(__config__, 'scf_hf_auto_head_min_ao', 250)
 
 # Divergence guard for the 'auto' policy: on large exact-exchange systems
 # (measured: ~1877 AO, def2-tzvp, Azadirachtin) the fp32 phase can oscillate
@@ -221,6 +236,268 @@ def energy_elec(mf, dm=None, h1e=None, vhf=None):
     logger.debug(mf, 'E1 = %s  E2 = %s  Ecoul = %s  Exc = %s', e1, e2, ecoul, exx)
     return e1+e2, e2
 
+# CONV-UKS-ADAPTIVE-SWITCH-01 opt-in self-limiting adaptive switch
+# (GPU4PYSCF_SCF_ADAPTIVE_NEWTON, DEFAULT OFF).  Phase A basis: entry
+# 442 (CONV-UKS-GRIND-PREDICT-01, 2026-11-07) measured the per-cycle
+# CDIIS indicator I1=|ddm| on the closed 23-trace corpus separating
+# the grind class (ibuprofen_anion wb97mv/tzvp 573 AO: |ddm|@12 =
+# 0.115, 49 CDIIS cycles; the composed newton wins there, entry 428
+# ratio 0.7173) from the easy class (naproxen-611 / testosterone-819:
+# |ddm|@12 <= 0.00707, 21 / 17 cycles; the fixed switch LOSES there,
+# entries 433/414) by 16.27x.  The frozen dispatch rule is the
+# geometric midpoint of that gap (0.0285) at cycle >= 12: plain CDIIS
+# keeps control and the dispatcher only breaks the loop early when
+# the density is still moving at the grind-class level, handing the
+# unconverged-by-tolerance cycle state to the CALLER (the driver) for
+# the second-order handoff (public newton() with the composed f32
+# interior, the entry-427/428 T-arm class).  The mechanism is a
+# source sibling of the deployed GPU4PYSCF_SOSCF_* knob family: env
+# knob + explicit frozen-default parameters, home-module engagement
+# counter, strict-fp64-reference inertness, default-off bitwise
+# verbatim (the std convergence test in _kernel_body is untouched and
+# every hook short-circuits on a False local).  Mechanism site note:
+# the corpus UKS cells run THIS module's _kernel_body loop (the class
+# binds kernel/scf to the module-level scf() below; the site-packages
+# pyscf kernel with its mf.check_convergence pivot is NOT on this
+# path -- its check_convergence hook is never consulted here), and
+# the level_shift-gated extra recheck block does not run on default
+# settings (class default level_shift=None), so the fire path breaks
+# the loop directly and scf_conv is honestly reset after the loop
+# (the max_cycle-truncated fixed-k head class, entry 414/428).
+_ADAPTIVE_NEWTON_DEFAULT_DDM = 0.0285
+_ADAPTIVE_NEWTON_DEFAULT_MIN_CYCLE = 12
+_ADAPTIVE_NEWTON = None      # cached env value; None = not yet read
+_ADAPTIVE_NEWTON_FIRES = 0   # dispatcher fires across armed kernels
+_ADAPTIVE_NEWTON_RUN = None  # latest kernel's dispatcher state (None
+                             # when that kernel ran disarmed)
+
+def _note_adaptive_newton_fire():
+    '''Bump the dispatcher engagement counter (home module: the
+    _kernel_body loop is the sole fire site; counting real fires,
+    not knob presence).'''
+    global _ADAPTIVE_NEWTON_FIRES
+    _ADAPTIVE_NEWTON_FIRES += 1
+
+def _scf_adaptive_newton():
+    '''Optional self-limiting adaptive-newton dispatcher for the plain
+    SCF loop (opt-in, CONV-UKS-ADAPTIVE-SWITCH-01).
+
+    GPU4PYSCF_SCF_ADAPTIVE_NEWTON=1 arms an additional loop-exit rule
+    in _kernel_body ONLY: after the VERBATIM standard convergence
+    test (e_diff < conv_tol and norm_gorb < conv_tol_grad, evaluated
+    first and untouched), an armed kernel may break the CDIIS loop at
+    cycle+1 >= GPU4PYSCF_SCF_ADAPTIVE_NEWTON_MIN_CYCLE (default 12)
+    when norm_ddm is still >= GPU4PYSCF_SCF_ADAPTIVE_NEWTON_DDM
+    (default 0.0285, the entry-442 geometric midpoint) -- exactly the
+    measured grind signature on which the composed second-order
+    refinement wins (entry 428), and never on the measured easy class
+    (|ddm|@12 <= 0.00707).  The fire is NOT tolerance convergence:
+    scf_conv is reset to False after the loop (the honest unconverged
+    head of the entry-414/428 fixed-k class) and the caller owns the
+    newton() handoff; mf._adaptive_newton_fired_cycle carries the
+    1-based fire cycle and the home-module _ADAPTIVE_NEWTON_RUN dict
+    carries {fired, fire_cycle, threshold, min_cycle,
+    indicator_trace=[(cycle, |ddm|), ...]} as engagement evidence.
+    Acceptance tolerances are NEVER touched (the entry-417 lesson);
+    the knob-off path is bitwise verbatim CDIIS.  Companion knobs
+    accept any positive float / positive int; malformed, non-finite
+    or out-of-domain values warn and fall back to the frozen
+    defaults.  Strict fp64-reference lanes never arm.  Default OFF.'''
+    global _ADAPTIVE_NEWTON
+    if _ADAPTIVE_NEWTON is None:
+        import os
+        raw = os.environ.get('GPU4PYSCF_SCF_ADAPTIVE_NEWTON', '')
+        _ADAPTIVE_NEWTON = raw in ('1', 'on')
+        if not _ADAPTIVE_NEWTON and raw not in ('', '0', 'off'):
+            import warnings
+            warnings.warn('GPU4PYSCF_SCF_ADAPTIVE_NEWTON=%r ignored; '
+                          'expected 1 (arm the self-limiting '
+                          'adaptive-newton dispatcher) or 0/off (the '
+                          'default verbatim CDIIS loop)' % (raw,))
+    return _ADAPTIVE_NEWTON
+
+def _scf_adaptive_newton_params():
+    '''(ddm_threshold, min_cycle) for the armed dispatcher, parsed per
+    armed kernel call from GPU4PYSCF_SCF_ADAPTIVE_NEWTON_DDM /
+    _MIN_CYCLE.  The frozen defaults (0.0285 / 12, the entry-442
+    midpoint rule) carry any malformed, non-finite or out-of-domain
+    value with a warning (warn-and-fallback, never a silent parse).'''
+    import math
+    import os
+    import warnings
+    ddm = _ADAPTIVE_NEWTON_DEFAULT_DDM
+    raw_d = os.environ.get('GPU4PYSCF_SCF_ADAPTIVE_NEWTON_DDM', '')
+    if raw_d:
+        try:
+            val = float(raw_d)
+        except ValueError:
+            val = math.nan
+        if not (math.isfinite(val) and val > 0.0):
+            warnings.warn('GPU4PYSCF_SCF_ADAPTIVE_NEWTON_DDM=%r ignored; '
+                          'expected a positive finite float (frozen '
+                          'default %g)' % (raw_d, ddm))
+        else:
+            ddm = val
+    min_cycle = _ADAPTIVE_NEWTON_DEFAULT_MIN_CYCLE
+    raw_m = os.environ.get('GPU4PYSCF_SCF_ADAPTIVE_NEWTON_MIN_CYCLE', '')
+    if raw_m:
+        try:
+            val = int(raw_m)
+        except ValueError:
+            val = 0
+        if val < 1:
+            warnings.warn('GPU4PYSCF_SCF_ADAPTIVE_NEWTON_MIN_CYCLE=%r '
+                          'ignored; expected an int >= 1 (frozen default '
+                          '%d)' % (raw_m, min_cycle))
+        else:
+            min_cycle = val
+    return ddm, min_cycle
+
+# CONV-UKS-DISPATCH-VETO-01 opt-in fire-time veto on the dispatcher
+# above (GPU4PYSCF_SCF_ADAPTIVE_NEWTON_VETO, DEFAULT OFF).  Phase A
+# basis: entry 447 (CONV-UKS-DISPATCH-WINPRED-SCREEN-01, 2026-11-07)
+# screened the already-captured pre-fire indicator trajectories of
+# entries 443/445/446 (9 WIN fired trajectories over 3 process/
+# geometry contexts of ibuprofen-573 vs 3 LOSS trajectories of
+# phenacetin-481; win labels recomputed from the frozen pairwise
+# t_scf: 0.7187 vs 1.2653) and found the fire-time WIN/LOSS
+# information living in trajectory SHAPE, not the fire level
+# (F01 v@12 0.1154-0.1159 vs 0.1097 does NOT separate, confirming
+# the entry-445 near-identical-levels prior; the frozen 10%-of-level
+# floor refuses the 5.2e-3 micro-gap).  The three frozen
+# mechanism-bearing separators (disjoint WIN/LOSS ranges, gap >= 2x
+# within-class spread and >= 10% of level, all three WIN contexts on
+# one side) are:
+#   mean_late      = mean(v[c-5..c])           WIN 0.4754-0.4786  LOSS 0.09434
+#   log_slope_late = (ln v[c] - ln v[c-5]) / 5 WIN -0.3426..-0.3271 LOSS +0.03051
+#   last_delta     = v[c] - v[c-1]             WIN -0.19475..-0.16049 LOSS -0.017330
+# and the veto thresholds below are their EXACT midpoint-of-gap
+# values (the entry-442 midpoint idiom applied to the 447 stats;
+# F11 nao separated only as a cell fingerprint and is excluded --
+# overfit risk, not mechanism).  A would-be fire with >= 2 of 3 LOSS
+# votes suppresses that dispatch: plain CDIIS keeps control and the
+# veto is recorded (the phenacetin-481 LOSS class of entry 445
+# becomes a plain-DIIS natural-convergence run).  Continuous
+# re-evaluation at every would-be fire; <6-entry or non-contiguous
+# windows never veto (the fire keeps its measured 9e76115 class);
+# a non-positive log endpoint leaves that vote undecidable (not
+# LOSS).  Veto-off lanes are bitwise verbatim 9e76115 (the check
+# short-circuits on a False local inside the fire branch; no
+# numerical operation is added); acceptance tolerances are NEVER
+# touched; strict fp64-reference lanes never arm (the veto local
+# requires the armed dispatcher).  2-grind-cell thin basis disclosed
+# (effective 1-vs-1 with multi-context stability): formal fresh-cell
+# validation is the GPU phase's job, not this knob's default.
+_ADAPTIVE_VETO_MEAN_LATE = 0.28484988086487395     # (0.09434038113570287 + 0.4753593805940451) / 2
+_ADAPTIVE_VETO_LOG_SLOPE = -0.14831226366241876   # (-0.3271361227271979 + 0.03051159540236039) / 2
+_ADAPTIVE_VETO_LAST_DELTA = -0.08890777970366057  # (-0.017329982233245625 + -0.1604855771740755) / 2
+_ADAPTIVE_VETO = None           # cached env value; None = not yet read
+_ADAPTIVE_VETO_SUPPRESSES = 0   # vetoed would-be fires across armed kernels
+_ADAPTIVE_VETO_LONELY_WARNED = False  # one-time warn for veto-without-dispatcher
+
+def _note_adaptive_veto_suppress():
+    '''Bump the veto engagement counter (home module: real
+    suppressions only, not knob presence).'''
+    global _ADAPTIVE_VETO_SUPPRESSES
+    _ADAPTIVE_VETO_SUPPRESSES += 1
+
+def _warn_adaptive_veto_lonely():
+    '''Warn ONCE per process when the veto knob is armed while the
+    dispatcher knob itself is off (the veto has nothing to suppress;
+    it stays inert, this is a configuration note, not an error).'''
+    global _ADAPTIVE_VETO_LONELY_WARNED
+    if not _ADAPTIVE_VETO_LONELY_WARNED:
+        _ADAPTIVE_VETO_LONELY_WARNED = True
+        import warnings
+        warnings.warn('%s is armed but %s is off: the veto only '
+                      'conditions dispatcher fires and is inert '
+                      'without the dispatcher' % (
+                          'GPU4PYSCF_SCF_ADAPTIVE_NEWTON_VETO',
+                          'GPU4PYSCF_SCF_ADAPTIVE_NEWTON'))
+
+def _scf_adaptive_newton_veto():
+    '''Optional fire-time veto for the adaptive-newton dispatcher
+    (opt-in, CONV-UKS-DISPATCH-VETO-01).
+
+    GPU4PYSCF_SCF_ADAPTIVE_NEWTON_VETO=1 (with the dispatcher itself
+    armed) makes every WOULD-BE fire additionally evaluate the frozen
+    entry-447 3-vote rule on the last 6 indicator-trace entries;
+    >= 2 LOSS votes (mean_late <= midpoint, log_slope_late >=
+    midpoint, last_delta >= midpoint -- the predicted-LOSS grind
+    shape) suppress that dispatch and plain CDIIS keeps control to
+    its natural convergence, recording a veto event in
+    _ADAPTIVE_NEWTON_RUN['veto_events'] = [(cycle, evidence), ...],
+    bumping the home-module _ADAPTIVE_VETO_SUPPRESSES counter and
+    marking mf._adaptive_newton_veto_cycles.  The veto decides from
+    in-flight observables ONLY (the trace the dispatcher already
+    records); it never changes a tolerance, never fires the loop
+    itself, and the veto-off path is bitwise verbatim 9e76115.
+    Default OFF.'''
+    global _ADAPTIVE_VETO
+    if _ADAPTIVE_VETO is None:
+        import os
+        raw = os.environ.get('GPU4PYSCF_SCF_ADAPTIVE_NEWTON_VETO', '')
+        _ADAPTIVE_VETO = raw in ('1', 'on')
+        if not _ADAPTIVE_VETO and raw not in ('', '0', 'off'):
+            import warnings
+            warnings.warn('GPU4PYSCF_SCF_ADAPTIVE_NEWTON_VETO=%r '
+                          'ignored; expected 1 (arm the fire-time '
+                          'veto) or 0/off (the default verbatim '
+                          'dispatcher)' % (raw,))
+    return _ADAPTIVE_VETO
+
+def _adaptive_veto_decision(trace):
+    '''(veto, evidence) for one would-be fire, a PURE function of the
+    dispatcher's indicator trace (CONV-UKS-DISPATCH-VETO-01).
+
+    trace is the [(1-based cycle, |ddm|), ...] list the dispatcher
+    records; the decision window is the LAST 6 entries (cycles
+    c-5..c, the entry-447 late window at the fire cycle).  >= 2 of
+    the 3 frozen LOSS votes vetoes: mean_late <= 0.28484988086487395,
+    log_slope_late >= -0.14831226366241876, last_delta >=
+    -0.08890777970366057 (exact midpoint-of-gap values of the 447
+    feature ranges, inclusive comparisons).  Windows with < 6
+    entries or non-contiguous cycle labels never veto (the fire
+    keeps its measured 9e76115 class); a non-positive log endpoint
+    leaves the slope vote undecidable (NOT a LOSS vote).  No env
+    read, no GPU work: the caller owns arming.'''
+    import math
+    if len(trace) < 6:
+        return False, {'reason': 'short_trace', 'loss_votes': 0,
+                       'window_len': len(trace)}
+    win = trace[-6:]
+    cycs = [int(c) for c, _ in win]
+    if cycs[-1] - cycs[0] != 5:
+        return False, {'reason': 'non_contiguous', 'loss_votes': 0,
+                       'window_len': 6}
+    vals = [float(v) for _, v in win]
+    mean_late = sum(vals) / 6.0
+    last_delta = vals[-1] - vals[-2]
+    if vals[-1] > 0.0 and vals[0] > 0.0:
+        log_slope_late = (math.log(vals[-1]) - math.log(vals[0])) / 5.0
+    else:
+        log_slope_late = None   # undecidable: not a LOSS vote
+    votes = {
+        'mean_late': mean_late <= _ADAPTIVE_VETO_MEAN_LATE,
+        'log_slope_late': (log_slope_late is not None
+                           and log_slope_late >= _ADAPTIVE_VETO_LOG_SLOPE),
+        'last_delta': last_delta >= _ADAPTIVE_VETO_LAST_DELTA,
+    }
+    loss_votes = sum(votes.values())
+    evidence = {
+        'mean_late': mean_late,
+        'log_slope_late': log_slope_late,
+        'last_delta': last_delta,
+        'votes': votes,
+        'loss_votes': loss_votes,
+        'thresholds': {
+            'mean_late': _ADAPTIVE_VETO_MEAN_LATE,
+            'log_slope_late': _ADAPTIVE_VETO_LOG_SLOPE,
+            'last_delta': _ADAPTIVE_VETO_LAST_DELTA,
+        },
+    }
+    return loss_votes >= 2, evidence
+
 def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
            dump_chk=True, dm0=None, callback=None, conv_check=True, **kwargs):
     conv_tol = mf.conv_tol
@@ -239,16 +516,115 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
     #   'auto'  - early iterations in fp32; once the energy change drops
     #             below _PRECISION_SWITCH_TOL, switch to fp64 for the tail
     #             iterations and the final energy (restores full accuracy).
+    #             (SP-14) below _AUTO_HEAD_MIN_AO basis functions the head
+    #             never engages: the run is bitwise the fp64 lane (the
+    #             head is a measured net loss at small shapes).
+    #   'auto+verify' - the auto policy plus the opt-in UKS solution-
+    #             stability verification (gpu4pyscf.scf.stability_verify):
+    #             after the SCF converges, one strict-fp64 reference SCF
+    #             from the same init guess is run; if the two trajectories
+    #             converge to different densities, a bounded fp64
+    #             refinement from the auto density decides whether that is
+    #             an fp32 fixed-point displacement (same solution; the
+    #             stationary point is adopted) or a genuine branch split
+    #             (the lower stationary solution is kept; see
+    #             stability_verify's docstring for the measured motivation).
+    #   'auto+strict' - the auto policy plus the strict fp64-reference
+    #             matching route (stability_verify.verify_reference_match,
+    #             LC-76): the fp64-lane solution is returned (reference
+    #             adopted unconditionally on a distinct result) or the
+    #             route fails closed with the exact reason -- the contract
+    #             is matching the identical-settings FP64 trajectory, not
+    #             selecting the lower stationary solution.
     _mode = getattr(mf, 'precision_mode', None)
-    if _mode is not None and _mode not in ('fp64', 'fp32', 'auto'):
+    if _mode is not None and _mode not in ('fp64', 'fp32', 'auto',
+                                           'auto+verify', 'auto+strict'):
         raise ValueError(
-            f"precision_mode must be None, 'fp64', 'fp32' or 'auto', got {_mode!r}")
+            f"precision_mode must be None, 'fp64', 'fp32', 'auto', "
+            f"'auto+verify' or 'auto+strict', got {_mode!r}")
     _precision_saved = precision.get_precision()
-    if _mode in ('auto', 'fp32'):
+    _mixed_auto = _mode in ('auto', 'auto+verify', 'auto+strict')
+    # SP-14 size gate: on small molecules the fp32 head is a measured net
+    # loss (see _AUTO_HEAD_MIN_AO), so the plain 'auto' lane rides the
+    # exact fp64 lane there -- _mixed_auto False means fp64 from cycle 0,
+    # no switch phase to leave, and vmat-knob lane eligibility identical
+    # to an explicit fp64 request (bitwise the fp64 trajectory).  The
+    # verify/strict variants are NOT gated: their main lane keeps today's
+    # head at every size, so the verifier's displacement scenarios and
+    # the measured strict-route composition stay untouched.
+    if _mode == 'auto' and mf.mol.nao < _AUTO_HEAD_MIN_AO:
+        _mixed_auto = False
+    if _mode == 'fp32' or _mixed_auto:
         precision.set_precision('fp32')
     else:
         precision.set_precision('fp64')
-    _mixed_auto = _mode == 'auto'
+    # LC-105: the opt-in GPU4PYSCF_SCF_VMAT_F32 knob runs the XC vmat
+    # grid contractions in fp32 on PURE-fp64 lanes only.  The auto
+    # family's fp64 tail resolves get_precision()=='fp64' but must stay
+    # bitwise fp64 (measured e_tot shift 3.5e-11 when the cast is
+    # ungated, 2026-10-13-lc105 part 3), and stability_verify's strict
+    # fp64-reference siblings (marked _strict_fp64_reference) must never
+    # feel the knob.  Outside an SCF kernel the lane flag stays False:
+    # standalone nr_rks/nr_uks contractions are unchanged.
+    from gpu4pyscf.dft import numint as _numint_mod
+    _vmat_f32_saved = _numint_mod._scf_vmat_f32_lane
+    _numint_mod._scf_vmat_f32_lane = (
+        _numint_mod._scf_vmat_f32()
+        and not _mixed_auto
+        and not getattr(mf, '_strict_fp64_reference', False))
+    # RHO-F32-LANE-B-01: the opt-in GPU4PYSCF_SCF_RHO_F32 knob runs the
+    # rho-build contractions in fp32 on the SCF head of PURE-fp64 lanes
+    # (numint._scf_rho_f32_lane; DEFAULT OFF, same lane gating as the
+    # vmat knob above -- the auto family's fp32 head already runs the
+    # cast and its fp64 tail must stay bitwise fp64, and the strict
+    # fp64-reference siblings never feel the knob).  'headtail' flips
+    # the lane off at the same in-cycle trigger in _kernel_body.
+    _rho_f32_saved = _numint_mod._scf_rho_f32_lane
+    _numint_mod._scf_rho_f32_lane = (
+        _numint_mod._scf_rho_f32()
+        and not _mixed_auto
+        and not getattr(mf, '_strict_fp64_reference', False))
+    # SCFJK-KBUILD-IMPL-01: the opt-in GPU4PYSCF_SCF_JK_F32 knob runs
+    # the DF K-transform contractions of df_jk.get_jk in fp32 on the
+    # SCF head of PURE-fp64 lanes (df_jk._scf_jk_f32_lane; DEFAULT OFF,
+    # same lane gating as the vmat/rho knobs above -- the auto family's
+    # fp32 head already runs the fp32 branch and its fp64 tail must
+    # stay bitwise fp64, and the strict fp64-reference siblings never
+    # feel the knob).  'headtail' flips the lane off at the same
+    # in-cycle trigger in _kernel_body.
+    from gpu4pyscf.df import df_jk as _df_jk_mod
+    _jk_f32_saved = _df_jk_mod._scf_jk_f32_lane
+    # SCFJK-WINDOW-01: the opt-in GPU4PYSCF_SCF_JK_F32_ARM_AFTER=N
+    # companion (defined for the headtail value only, warn+ignore
+    # otherwise) keeps the jk lane off at kernel entry through cycle N
+    # (the fp64 prefix is bitwise the knob-off trajectory);
+    # _kernel_body arms the lane once at that cycle-end latch.  0 (the
+    # default) arms at entry -- the SCFJK-KBUILD-IMPL-01 semantics
+    # unchanged.
+    _jk_f32_arm_after = _df_jk_mod._scf_jk_f32_arm_after()
+    _df_jk_mod._scf_jk_f32_lane = (
+        _df_jk_mod._scf_jk_f32()
+        and not _mixed_auto
+        and not getattr(mf, '_strict_fp64_reference', False)
+        and _jk_f32_arm_after == 0)
+    # SP-27: the auto-family head CAN keep the rho-build contraction in
+    # float64 (numint._scf_rho_f64_lane; opt-in GPU4PYSCF_AUTO_RHO_F64=1,
+    # default off since the SP-27 paired REJECT measurement); every other
+    # lane, the auto policy's fp64 tail and standalone fp32 contexts are
+    # unchanged either way
+    _rho_f64_saved = _numint_mod._scf_rho_f64_lane
+    _numint_mod._scf_rho_f64_lane = (
+        _mixed_auto and _numint_mod._auto_rho_f64())
+    # SP-31: the auto-family fp32 head CAN skip the NLC/VV10 term of
+    # the SCF veff entirely (opt-in GPU4PYSCF_AUTO_HEAD_NLC_SKIP=1,
+    # default off; numint._scf_head_nlc_skip_lane).  The converged
+    # result stays the full method's fixed point -- the fp64 tail runs
+    # the exact fp64 map; only the head path changes.  Armed for
+    # auto-family kernels only: pure-fp64/strict lanes and standalone
+    # contexts never feel the knob (the SP-27 lane-flag pattern).
+    _head_nlc_saved = _numint_mod._scf_head_nlc_skip_lane
+    _numint_mod._scf_head_nlc_skip_lane = (
+        _mixed_auto and _numint_mod._auto_head_nlc_skip())
     try:
         return _kernel_body(mf, conv_tol, conv_tol_grad, dump_chk, dm0, callback,
                             conv_check, _mixed_auto, log, t0, t1, **kwargs)
@@ -256,6 +632,11 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         # the policy above mutates process-global state; leaving it set would
         # silently contaminate the next calculation if this one raised
         precision.set_precision(_precision_saved)
+        _numint_mod._scf_vmat_f32_lane = _vmat_f32_saved
+        _numint_mod._scf_rho_f32_lane = _rho_f32_saved
+        _numint_mod._scf_rho_f64_lane = _rho_f64_saved
+        _numint_mod._scf_head_nlc_skip_lane = _head_nlc_saved
+        _df_jk_mod._scf_jk_f32_lane = _jk_f32_saved
 
 
 def _kernel_body(mf, conv_tol, conv_tol_grad, dump_chk, dm0, callback,
@@ -263,6 +644,86 @@ def _kernel_body(mf, conv_tol, conv_tol_grad, dump_chk, dm0, callback,
     conv_tol = mf.conv_tol
     mol = mf.mol
     conv_tol_grad = conv_tol_grad if conv_tol_grad is not None else conv_tol**.5
+    # LC-115: 'headtail' value of GPU4PYSCF_SCF_VMAT_F32 -- the fp32 vmat
+    # contractions run in the SCF head only, and the lane flag set by
+    # _kernel is flipped back off (single trigger, below) at the first
+    # cycle-end |dE| below the auto policy's switch tolerance, so the
+    # convergence tail uses the exact fp64 contraction map.  The full
+    # knob's fp32 tail displaces the SCF fixed point and breaks
+    # convergence at large AO (687 AO: 3/3 non-convergent, +7.9e-9,
+    # LC-108); the head/tail discipline restores the true fixed point at
+    # any size at ~60-90% of the gain (LC-114).
+    from gpu4pyscf.dft import numint as _numint_mod
+    _vmat_f32_headtail = (_numint_mod._scf_vmat_f32() == 'headtail')
+    # RHO-F32-LANE-B-01: the rho knob's head/tail value flips at the
+    # SAME single trigger as the vmat knob below (same tolerance, same
+    # end-of-cycle point), so both lanes share one head/tail boundary
+    # and the convergence tail runs the exact bitwise-fp64 rho map
+    # (LC-115 fixed-point restoration argument verbatim)
+    _rho_f32_headtail = (_numint_mod._scf_rho_f32() == 'headtail')
+    # SCFJK-KBUILD-IMPL-01: the jk knob's head/tail value flips at the
+    # SAME single trigger as the vmat/rho knobs below (same tolerance,
+    # same end-of-cycle point), so all three lanes share one head/tail
+    # boundary and the convergence tail runs the exact fp64 K-transform
+    # map (LC-115 fixed-point restoration argument verbatim)
+    from gpu4pyscf.df import df_jk as _df_jk_mod
+    _jk_f32_headtail = (_df_jk_mod._scf_jk_f32() == 'headtail')
+    # SCFJK-WINDOW-01 delayed-arm window state: _jk_f32_arm_lane
+    # mirrors the _kernel arming gate (the auto family and strict
+    # references never arm the lane, whatever the delay);
+    # _jk_f32_window_open is the single-latch window state (waiting ->
+    # armed -> closed; closed by the arm itself, by the tail flip, or
+    # by an e_diff already below the switch tolerance at the arm
+    # point).  0 (the default) leaves the entry-armed semantics of
+    # SCFJK-KBUILD-IMPL-01 fully in charge and these latches inert.
+    _jk_f32_arm_after = _df_jk_mod._scf_jk_f32_arm_after()
+    _jk_f32_arm_lane = (_jk_f32_headtail
+                        and not _mixed_auto
+                        and not getattr(mf, '_strict_fp64_reference', False))
+    _jk_f32_window_open = _jk_f32_arm_after > 0
+    # CONV-UKS-ADAPTIVE-SWITCH-01 opt-in self-limiting dispatcher (see
+    # _scf_adaptive_newton above): plain CDIIS stays in control; the
+    # armed kernel only records the per-cycle indicator and may break
+    # the loop at the measured grind signature (norm_ddm still >= the
+    # frozen threshold at/after the frozen minimum cycle, entry 442).
+    # Knob-off lanes and strict fp64-reference lanes never take a
+    # single statement of it (bitwise verbatim trajectory); the std
+    # convergence test below is the VERBATIM prior authority and the
+    # fire is not a tolerance convergence (honest reset after the
+    # loop; the caller owns the newton() handoff).
+    global _ADAPTIVE_NEWTON_RUN
+    _adaptive_dispatch = (_scf_adaptive_newton()
+                          and not getattr(mf, '_strict_fp64_reference',
+                                          False))
+    _adaptive_ddm_threshold = _ADAPTIVE_NEWTON_DEFAULT_DDM
+    _adaptive_min_cycle = _ADAPTIVE_NEWTON_DEFAULT_MIN_CYCLE
+    _adaptive_state = None
+    if _adaptive_dispatch:
+        (_adaptive_ddm_threshold,
+         _adaptive_min_cycle) = _scf_adaptive_newton_params()
+        _adaptive_state = {
+            'armed': True, 'knob': 'GPU4PYSCF_SCF_ADAPTIVE_NEWTON',
+            'threshold': _adaptive_ddm_threshold,
+            'min_cycle': _adaptive_min_cycle,
+            'fired': False, 'fire_cycle': None, 'indicator_trace': []}
+        _ADAPTIVE_NEWTON_RUN = _adaptive_state
+    else:
+        # the module state mirrors the LATEST kernel: a disarmed
+        # kernel clears any stale armed-run state
+        _ADAPTIVE_NEWTON_RUN = None
+    # CONV-UKS-DISPATCH-VETO-01 fire-time veto (see
+    # _scf_adaptive_newton_veto above): armed ONLY on an armed
+    # dispatcher lane (a lonely veto warns once and stays inert);
+    # the state keys exist only when armed, so a veto-off dispatcher
+    # run keeps the exact 9e76115 state dict
+    _adaptive_veto_knob = _scf_adaptive_newton_veto()
+    _adaptive_veto_armed = bool(_adaptive_dispatch and _adaptive_veto_knob)
+    _adaptive_veto_cycles = []
+    if _adaptive_veto_armed:
+        _adaptive_state['veto_armed'] = True
+        _adaptive_state['veto_events'] = []
+    elif _adaptive_veto_knob and not _scf_adaptive_newton():
+        _warn_adaptive_veto_lonely()
 
     if dm0 is None:
         dm0 = mf.get_init_guess(mol, mf.init_guess)
@@ -302,7 +763,13 @@ def _kernel_body(mf, conv_tol, conv_tol_grad, dump_chk, dm0, callback,
         mf_diis = mf.diis
     elif mf.diis:
         assert issubclass(mf.DIIS, lib.diis.DIIS)
-        mf_diis = mf.DIIS(mf, mf.diis_file)
+        if diis._adiis_head_tail_armed(mf):
+            # ADIAS-HEAD-01 opt-in (GPU4PYSCF_DIIS_MODE=adiis, default
+            # off): ADIIS head-phase extrapolation + CDIIS tail handover;
+            # inert under the strict fp64 reference lane.
+            mf_diis = diis.ADIISHeadTail(mf, mf.diis_file)
+        else:
+            mf_diis = mf.DIIS(mf, mf.diis_file)
         mf_diis.space = mf.diis_space
         mf_diis.rollback = mf.diis_space_rollback
         # CDIIS just require a C that's orthonormal (C.T@S@C==I), and X satisfies that.
@@ -346,6 +813,11 @@ def _kernel_body(mf, conv_tol, conv_tol_grad, dump_chk, dm0, callback,
         norm_gorb = cupy.linalg.norm(mf.get_grad(mo_coeff, mo_occ, fock))
 
         norm_ddm = cupy.linalg.norm(dm-dm_last)
+        if _adaptive_dispatch:
+            # dispatcher engagement evidence: the I1=|ddm| trajectory
+            # per cycle (read-only; no computational-state change)
+            _adaptive_state['indicator_trace'].append(
+                (cycle + 1, float(norm_ddm)))
         t1 = log.timer(f'cycle={cycle+1}', *t0)
 
         log.info('cycle= %d E= %.15g  delta_E= %4.3g  |g|= %4.3g  |ddm|= %4.3g',
@@ -378,13 +850,106 @@ def _kernel_body(mf, conv_tol, conv_tol_grad, dump_chk, dm0, callback,
                              _PRECISION_SWITCH_CHAOS_TOL, chaos_streak)
                     precision.set_precision('fp64')
         e_diff = abs(e_tot-last_hf_e)
+        if (_vmat_f32_headtail and _numint_mod._scf_vmat_f32_lane
+                and e_diff < _PRECISION_SWITCH_TOL):
+            # LC-115 head/tail single trigger, mirroring the auto policy's
+            # fp32->fp64 switch above (same tolerance, same end-of-cycle
+            # point).  The lane-flag term is the single-trigger latch: the
+            # auto family and strict references never enter (their lane
+            # flag stays False at the _kernel gate), and on pure-fp64
+            # lanes the flag is re-armed by _kernel at the next kernel
+            # call.  No DIIS reset: the stale head entries ride the exact
+            # fp64 map fine (LC-114 measured; the reset hypothesis is a
+            # separately falsified family).
+            _numint_mod._scf_vmat_f32_lane = False
+        if (_rho_f32_headtail and _numint_mod._scf_rho_f32_lane
+                and e_diff < _PRECISION_SWITCH_TOL):
+            # RHO-F32-LANE-B-01 head/tail single trigger, mirroring the
+            # vmat flip above (same gate shape and latch semantics: the
+            # auto family and strict references never arm the lane, and
+            # a pure-fp64 lane re-arms at the next _kernel call)
+            _numint_mod._scf_rho_f32_lane = False
+        if (_jk_f32_headtail and _df_jk_mod._scf_jk_f32_lane
+                and e_diff < _PRECISION_SWITCH_TOL):
+            # SCFJK-KBUILD-IMPL-01 head/tail single trigger, mirroring
+            # the vmat/rho flips above (same gate shape and latch
+            # semantics: the auto family and strict references never
+            # arm the lane, and a pure-fp64 lane re-arms at the next
+            # _kernel call)
+            _df_jk_mod._scf_jk_f32_lane = False
+        if (_jk_f32_headtail and e_diff < _PRECISION_SWITCH_TOL):
+            # SCFJK-WINDOW-01: the tail boundary also closes any still
+            # pending delayed window -- an e_diff already below the
+            # switch tolerance means the run is in its exact-fp64 tail
+            # and must not arm the fp32 K map there (the LC-115 tail
+            # discipline).  Idempotent no-op for the entry-armed case.
+            _jk_f32_window_open = False
+        if (_jk_f32_arm_lane and _jk_f32_window_open
+                and not _df_jk_mod._scf_jk_f32_lane
+                and cycle + 1 >= _jk_f32_arm_after):
+            # SCFJK-WINDOW-01 delayed-arm latch: arm the jk lane ONCE
+            # at the end of cycle ARM_AFTER (the first armed get_veff
+            # is cycle ARM_AFTER+1's; the fp64 prefix -- the init call
+            # and cycles 1..ARM_AFTER -- is bitwise the knob-off
+            # trajectory).  Single latch: the window never re-opens
+            # after arming or after the tail flip above; the per-kernel
+            # re-arm discipline stays in _kernel.
+            _df_jk_mod._scf_jk_f32_lane = True
+            _jk_f32_window_open = False
         if(e_diff < conv_tol and norm_gorb < conv_tol_grad):
             scf_conv = True
             break
+        if (_adaptive_dispatch and cycle + 1 >= _adaptive_min_cycle
+                and float(norm_ddm) >= _adaptive_ddm_threshold):
+            # dispatcher fire: the density is still moving at the
+            # measured grind-class level (entry 442) -- break the
+            # CDIIS loop and hand the cycle state to the caller for
+            # the second-order refinement.  NOT a tolerance
+            # convergence: scf_conv is honestly reset after the loop
+            # and the caller reads mf._adaptive_newton_fired_cycle.
+            _vetoed = False
+            if _adaptive_veto_armed:
+                # CONV-UKS-DISPATCH-VETO-01: evaluate the frozen
+                # entry-447 3-vote rule on the in-flight trace; a
+                # predicted-LOSS grind suppresses THIS dispatch (plain
+                # CDIIS keeps control; continuous re-evaluation at
+                # every later would-be fire).  Veto-off lanes never
+                # enter: bitwise verbatim 9e76115 fire class.
+                _vetoed, _veto_evidence = _adaptive_veto_decision(
+                    _adaptive_state['indicator_trace'])
+                if _vetoed:
+                    _adaptive_state['veto_events'].append(
+                        (cycle + 1, _veto_evidence))
+                    _adaptive_veto_cycles.append(cycle + 1)
+                    _note_adaptive_veto_suppress()
+                    log.info('adaptive dispatcher: fire at cycle %d '
+                             'vetoed (predicted-LOSS grind shape, '
+                             '%d/3 loss votes)',
+                             cycle + 1, _veto_evidence['loss_votes'])
+            if not _vetoed:
+                _adaptive_state['fired'] = True
+                _adaptive_state['fire_cycle'] = cycle + 1
+                mf._adaptive_newton_fired_cycle = cycle + 1
+                _note_adaptive_newton_fire()
+                scf_conv = True
+                break
     else:
         log.warn("SCF failed to converge")
 
     mf.cycles = cycle + 1
+    if _adaptive_dispatch and _adaptive_state['fired']:
+        # honest head: the dispatcher's early exit did NOT meet the
+        # SCF tolerances -- return unconverged exactly like the
+        # max_cycle-truncated fixed-k head (the entry-414/428 class);
+        # the caller (driver) owns the newton handoff and the final
+        # convergence verdict
+        scf_conv = False
+    if _adaptive_dispatch and _adaptive_veto_cycles:
+        # CONV-UKS-DISPATCH-VETO-01 fire marker: the cycles whose
+        # dispatch was vetoed (evidence only; the veto never changes
+        # the convergence verdict -- a vetoed run is the plain CDIIS
+        # trajectory and converges or not exactly like it)
+        mf._adaptive_newton_veto_cycles = list(_adaptive_veto_cycles)
     if scf_conv and mf.level_shift is not None:
         # An extra diagonalization, to remove level shift
         mo_energy, mo_coeff = mf.eig(fock, s1e, x=x_orth)
@@ -456,6 +1021,37 @@ def scf(mf, dm0=None, **kwargs):
         mf.e_tot = _kernel(mf, mf.conv_tol, mf.conv_tol_grad,
                             dm0=dm0, callback=mf.callback,
                             conv_check=mf.conv_check, **kwargs)[1]
+
+    # opt-in solution-stability verification (precision_mode='auto+verify'):
+    # one strict-fp64 reference SCF from the same initial density the main
+    # run used (explicit dm0, or the density rebuilt from a previous
+    # wavefunction); keeps the lower converged solution when the auto
+    # policy landed on a different branch (near-degenerate UKS stationary
+    # pairs).  Default policies never enter this branch.  The verifiers
+    # must receive the ACTUAL dm0: restarting them from mf.init_guess
+    # violates the same-starting-point fp64-trajectory contract and can
+    # land the reference on a different UKS branch than the main run.
+    if getattr(mf, 'precision_mode', None) == 'auto+verify':
+        if mf.converged:
+            from gpu4pyscf.scf import stability_verify
+            stability_verify.verify_solution_stability(mf, dm0=dm0)
+        else:
+            mf.scf_summary['stability_verification'] = {
+                'policy': 'auto+verify',
+                'skipped': 'main SCF did not converge',
+            }
+    elif getattr(mf, 'precision_mode', None) == 'auto+strict':
+        # strict fp64-reference matching (LC-76): the fp64-lane solution
+        # or fail-closed -- see stability_verify.verify_reference_match
+        # (same actual-dm0 carry as auto+verify above)
+        if mf.converged:
+            from gpu4pyscf.scf import stability_verify
+            stability_verify.verify_reference_match(mf, dm0=dm0)
+        else:
+            mf.scf_summary['stability_verification'] = {
+                'policy': 'auto+strict',
+                'skipped': 'main SCF did not converge',
+            }
 
     logger.timer(mf, 'SCF', *cput0)
     mf._finalize()
@@ -787,8 +1383,12 @@ class SCF(pyscf_lib.StreamObject):
 
     # Mixed-precision policy for the SCF iterations. None/'fp64' runs
     # everything in float64; 'fp32' runs every iteration with float32
-    # contractions; 'auto' starts in float32 and finishes in float64. See
-    # gpu4pyscf.lib.precision.
+    # contractions; 'auto' starts in float32 and finishes in float64;
+    # 'auto+verify' additionally runs the opt-in UKS solution-stability
+    # verification pass after convergence (see
+    # gpu4pyscf.scf.stability_verify); 'auto+strict' runs the strict
+    # fp64-reference matching route (the fp64-lane solution or fail
+    # closed; stability_verify.verify_reference_match).
     precision_mode = None
 
     # Adaptive SCF convergence threshold for geometry optimization: 'auto'

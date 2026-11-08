@@ -1,0 +1,21 @@
+diff --git a/gpu4pyscf/lib/gdft/nr_eval_gto.cu b/gpu4pyscf/lib/gdft/nr_eval_gto.cu
+index 0f37c2d..3533b31 100644
+--- a/gpu4pyscf/lib/gdft/nr_eval_gto.cu
++++ b/gpu4pyscf/lib/gdft/nr_eval_gto.cu
+@@ -77,6 +77,16 @@ static void _screen_index(int8_t *non0shl_mask, double log_cutoff,
+ 
+     int8_t is_large = 0;
+     for (int grid0 = grid_start; grid0 < grid_stop; grid0 += NG_PER_BLOCK) {
++        // MR-10 (2026-10-23, mainline repair): the tile cache is written at
++        // the top of each iteration but was only barrier-separated from the
++        // consumer by the single __syncthreads() AFTER the load, leaving the
++        // consumer of tile k racing the load of tile k+1 (a thread that
++        // already set is_large takes the early `continue` below and jumps
++        // straight to the next load).  A second, unconditional barrier at
++        // the loop top closes the window: every path through an iteration
++        // passes it, so the `continue` stays deadlock-free and the consumer
++        // of tile k is ordered before the load of tile k+1.
++        __syncthreads();
+         if (grid0 + thread_id < ngrids) {
+             gridx_cache[thread_id] = coords[         grid0+thread_id];
+             gridy_cache[thread_id] = coords[ngrids  +grid0+thread_id];
