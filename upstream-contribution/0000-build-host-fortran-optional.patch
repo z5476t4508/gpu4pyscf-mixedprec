@@ -1,0 +1,44 @@
+diff --git a/gpu4pyscf/lib/CMakeLists.txt b/gpu4pyscf/lib/CMakeLists.txt
+index b77ccab..24d0c4f 100644
+--- a/gpu4pyscf/lib/CMakeLists.txt
++++ b/gpu4pyscf/lib/CMakeLists.txt
+@@ -13,7 +13,20 @@
+ # limitations under the License.
+ 
+ cmake_minimum_required (VERSION 3.19 FATAL_ERROR) # 3.19 is required by cutlass
+-project (gpu4pyscf C CXX CUDA Fortran)
++
++# Fortran is only needed by the SMD solvent target (mnsol_interface.f90).  On
++# hosts without a Fortran compiler (e.g. the RTX 4090 build host) the solvent
++# library is skipped; the Python layer falls back to libsolvent = None and the
++# SMD model is unavailable, which does not affect the DFT/benchmark paths.
++include(CheckLanguage)
++check_language(Fortran)
++if(CMAKE_Fortran_COMPILER)
++  project (gpu4pyscf C CXX CUDA Fortran)
++else()
++  message(WARNING "No Fortran compiler found: BUILD_SOLVENT is forced OFF (SMD solvent model unavailable).")
++  set(BUILD_SOLVENT OFF)
++  project (gpu4pyscf C CXX CUDA)
++endif()
+ 
+ set(CMAKE_C_STANDARD "99")
+ set(CMAKE_CXX_STANDARD 17)
+@@ -105,9 +118,15 @@ set(CXX_LINK_TEMPLATE "<CMAKE_CXX_COMPILER> <CMAKE_SHARED_LIBRARY_CXX_FLAGS> <LA
+ option(BUILD_CUTLASS "Using cutlass" ON)
+ if(BUILD_CUTLASS)
+   include(ExternalProject)
++  # codeload tarball instead of a git clone: equivalent content for a fixed
++  # tag, and it works on hosts where github.com (git smart-http) is blocked
++  # while codeload.github.com is reachable.
++  set(CUTLASS_TARBALL_URL https://codeload.github.com/NVIDIA/cutlass/tar.gz/refs/tags/v3.4.0)
++  set(CUTLASS_TARBALL_SHA512 6debdfa0ffbb9c14293619a281e864ac16592f64856e4a54ae456a79cbce3ec2f5068031f4eae589e72fb10c3c61f1fa6d3fa14650754a27c4b12e14774e7f75)
+   ExternalProject_Add(cutlass
+-    GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
+-    GIT_TAG        v3.4.0
++    URL ${CUTLASS_TARBALL_URL}
++    URL_HASH SHA512=${CUTLASS_TARBALL_SHA512}
++    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+     CONFIGURE_COMMAND ""  # No configure step
+     BUILD_COMMAND ""      # No build step
+     INSTALL_COMMAND ""    # No install step
