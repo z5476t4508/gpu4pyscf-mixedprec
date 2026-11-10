@@ -384,9 +384,12 @@ def get_grad_hcore(mf_grad, mo_coeff=None, mo_occ=None):
     # `work` below is batch_size x 3 x nao^2 fp64; a fixed batch of 32
     # allocates 27.6 GB at ~3370 AO (measured 2026-09-13, Azadirachtin
     # def2-qzvp) and OOMs. Cap it by available memory: at most ~1/8 of
-    # free VRAM, at least 1.
+    # free VRAM, at least 1. The factor 8 is the fp64 itemsize: without
+    # it the cap bounds the tensor to 100% of free VRAM instead of the
+    # documented 1/8 (found by the issue-#11 chunk audit, 2026-10-04;
+    # the original fix omitted the itemsize conversion).
     mem_avail = get_avail_mem(exclude_memory_pool=True)
-    batch_size = min(32, natm, max(1, int(mem_avail * .125) // (3 * nao1 * nao1)))
+    batch_size = min(32, natm, max(1, int(mem_avail * .125) // (3 * nao1 * nao1 * 8)))
     omega = 0.
     eval_ip1, _, aux_offsets = _int3c2e_ip1_evaluator(
         opt, int3c2e_scheme_ip1(omega, 27), batch_size, 'fill_int3c2e_ip1', omega)
@@ -585,19 +588,40 @@ class GradientsBase(lib.StreamObject):
     def _resolve_precision(self):
         '''The precision lane this gradient runs in.
 
-        'auto' on the mean-field object means "fp32 early iterations, fp64
-        for the converged energy".  A gradient has no iteration to converge,
-        so there is no fp64 tail to fall back to and 'auto' simply selects
-        fp32 here.  That is the intended reading for a geometry
-        optimisation: the measured fp32 gradient error is ~1e-5 Eh/Bohr, an
-        order of magnitude below geomeTRIC's 3e-4 convergence threshold, so
-        it does not move where the optimiser stops.  Set precision_mode on
-        the gradient object itself to override.
+        'auto' on the mean-field object means "fp32 early iterations,
+        fp64 for the converged energy" -- the mixed precision lives in
+        the SCF head.  For the gradient itself, plain 'auto' resolves
+        fp64: the fp32 gradient casts were measured NEVER faster at any
+        size (SP-21 same-head paired A/B: t_grad fp64/fp32 = 0.971 /
+        1.000 / 0.942 / 0.952 at 270/318/348/522 AO, median 0.961;
+        SP-16's below-gate measurement 0.99-1.15; SP-10's NLC
+        falsification 0.86-1.04 vs a <=0.50 bar) while costing
+        3.2e-7..8.6e-7 Eh/Bohr of isolated gradient error, so riding
+        the exact fp64 kernels is faster-or-equal AND numerically
+        cleaner at every nao (SP-22 extends SP-16's below-gate
+        resolution to all sizes).  Set precision_mode='fp32' on the
+        gradient object to force the fp32 kernels.
+
+        'auto+verify' (the UKS solution-stability policy,
+        gpu4pyscf.scf.stability_verify) keeps fp32 gradient kernels:
+        the verification pass resolves the *solution* selection, not
+        the kernel precision.  'auto+strict' (the strict fp64-reference
+        matching route, stability_verify.verify_reference_match)
+        likewise: it selects the solution (override with
+        precision_mode on this gradient object).
         '''
         mode = self.precision_mode
         if mode is None:
             mode = getattr(self.base, 'precision_mode', None)
         if mode == 'auto':
+            # (SP-22) the fp32 gradient casts are measured non-winners
+            # at every nao (SP-21: 0.942-1.000 above gate, SP-16:
+            # 0.99-1.15 below, SP-10 falsification), so plain auto
+            # resolves the exact fp64 gradient path unconditionally
+            mode = 'fp64'
+        elif mode == 'auto+verify':
+            mode = 'fp32'
+        elif mode == 'auto+strict':
             mode = 'fp32'
         if mode is not None and mode not in ('fp64', 'fp32'):
             raise ValueError(
