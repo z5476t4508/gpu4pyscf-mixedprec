@@ -20,6 +20,8 @@
 DIIS
 """
 
+import os
+import numpy
 import cupy as cp
 import scipy.linalg
 import scipy.optimize
@@ -127,3 +129,139 @@ class CDIIS(lib.diis.DIIS):
         return errvec.ravel()
 
 SCFDIIS = SCF_DIIS = DIIS = CDIIS
+
+
+def _adiis_head_tail_armed(rec):
+    '''ADIAS-HEAD-01 (GPU4PYSCF_DIIS_MODE=adiis, default off): opt-in
+    ADIIS head-phase Fock extrapolation with CDIIS tail handover.  Inert
+    under the strict fp64 reference lane (R anchors are never altered) and
+    for every other knob value.'''
+    if getattr(rec, '_strict_fp64_reference', False):
+        return False
+    return os.environ.get('GPU4PYSCF_DIIS_MODE', '').strip().lower() == 'adiis'
+
+
+def _adiis_minimize(df, idnewest):
+    '''Host minimizer over the ADIIS energy model on a precomputed df
+    matrix.  The cost/gradient/BFGS arithmetic mirrors pyscf 2.14
+    pyscf.scf.diis.adiis_minimize verbatim; only the df assembly (device
+    einsum in ADIISHeadTail._adiis_extrapolate vs host einsum in pyscf)
+    differs, which pins GPU-vs-CPU update-path parity to solver tolerance.
+    Ref: JCP 132, 054109 (2010); DOI:10.1063/1.3304922'''
+    nx = df.shape[0]
+    d_fn = df[:,idnewest]
+    dn_f = df[idnewest]
+    dn_fn = df[idnewest,idnewest]
+    dd_fn = d_fn - dn_fn
+    df = df - d_fn[:,None] - dn_f + dn_fn
+
+    def costf(x):
+        c = x**2 / (x**2).sum()
+        return (numpy.einsum('i,i', c, dd_fn) * 2 +
+                numpy.einsum('i,ij,j', c, df, c))
+
+    def grad(x):
+        x2sum = (x**2).sum()
+        c = x**2 / x2sum
+        fc = 2*dd_fn
+        fc += numpy.einsum('j,kj->k', c, df)
+        fc += numpy.einsum('i,ik->k', c, df)
+        cx = numpy.diag(x*x2sum) - numpy.einsum('k,n->kn', x**2, x)
+        cx *= 2/x2sum**2
+        return numpy.einsum('k,kn->n', fc, cx)
+
+    res = scipy.optimize.minimize(costf, numpy.ones(nx), method='BFGS',
+                                  jac=grad, tol=1e-9)
+    return res.fun, (res.x**2)/(res.x**2).sum()
+
+
+class ADIISHeadTail(CDIIS):
+    '''ADIAS-HEAD-01 opt-in (GPU4PYSCF_DIIS_MODE=adiis, default off):
+    ADIIS head-phase Fock extrapolation with permanent handover to the
+    deployed CDIIS tail.
+
+    While the Corth-basis SDF-FDS error rms stays above adiis_switch_rms
+    the update stores the (dm, fock) history in a ring buffer of size
+    `space` and returns the ADIIS model extrapolation (JCP 132, 054109
+    (2010)); at/below the threshold -- or after adiis_max_fallbacks failed
+    minimizations -- it latches to the parent CDIIS.update for the rest of
+    the SCF.  The handover cycle is recorded in mf.scf_summary
+    (adias_switch_cycle / adias_head_cycles) for engagement evidence.
+    Update-path change only: the converged fixed point, the Fock build and
+    the precision map are untouched, so the converged energy is identical
+    up to the convergence tolerance.'''
+
+    def __init__(self, mf=None, filename=None):
+        CDIIS.__init__(self, mf, filename)
+        self.mf = mf
+        # 1e-5 per amendment-1 (2026-11-05): the measured melatonin rms
+        # trajectory (4.9e-3 at cycle 0) put the 1e-2 latch on a knife
+        # edge after ONE ADIIS cycle; 1e-5 holds the measured head
+        # (entry-269 boundary maps to rms ~6e-6..2e-6) and keeps ADIIS
+        # off the asymptotic CDIIS tail.
+        self.adiis_switch_rms = 1e-5
+        self.adiis_max_fallbacks = 3
+        self.adiis_active = True
+        self.adiis_cycle = 0
+        self.adiis_switch_cycle = None
+        self.adiis_fallbacks = 0
+        self._adiis_buffer = {}
+        self._adiis_head = 0
+
+    def _record(self, key, value):
+        mf = self.mf
+        if mf is not None and hasattr(mf, 'scf_summary'):
+            mf.scf_summary[key] = value
+
+    def _latch_cdiis(self, rms=None):
+        self.adiis_active = False
+        self.adiis_switch_cycle = self.adiis_cycle
+        self._record('adias_switch_cycle', self.adiis_cycle)
+        logger.debug(self, 'ADIAS-HEAD-01 handover to CDIIS at head cycle %d (rms %s)',
+                     self.adiis_cycle, rms)
+
+    def _adiis_extrapolate(self, d, f):
+        if not self._adiis_buffer:
+            shape = (self.space,) + d.shape
+            self._adiis_buffer['dm'] = cp.zeros(shape, dtype=f.dtype)
+            self._adiis_buffer['fock'] = cp.zeros(shape, dtype=f.dtype)
+        head = self._adiis_head
+        self._adiis_buffer['dm'][head] = d
+        self._adiis_buffer['fock'][head] = f
+        ds = self._adiis_buffer['dm']
+        fs = self._adiis_buffer['fock']
+        nx, nao = ds.shape[0], ds.shape[-1]
+        df = cp.einsum('inpq,jnqp->ij',
+                       ds.reshape(nx, -1, nao, nao),
+                       fs.reshape(nx, -1, nao, nao)).real
+        fun, c = _adiis_minimize(cp.asnumpy(df), head)
+        if not numpy.all(numpy.isfinite(c)) or not numpy.isfinite(fun):
+            raise RuntimeError('ADIAS-HEAD-01 non-finite minimizer output')
+        self._adiis_head = head + 1
+        if self._adiis_head >= self.space:
+            self._adiis_head = 0
+        return cp.einsum('i,i...pq->...pq', cp.asarray(c, dtype=f.dtype), fs)
+
+    def update(self, s, d, f, *args, **kwargs):
+        if not self.adiis_active:
+            return CDIIS.update(self, s, d, f, *args, **kwargs)
+        errvec = self._sdf_err_vec(s, d, f)
+        rms = float(cp.linalg.norm(errvec)) / errvec.size ** .5
+        if self._adiis_head > 0 and rms < self.adiis_switch_rms:
+            self._latch_cdiis(rms)
+            return CDIIS.update(self, s, d, f, *args, **kwargs)
+        try:
+            fock = self._adiis_extrapolate(d, f)
+        except Exception:
+            self.adiis_fallbacks += 1
+            logger.debug(self, 'ADIAS-HEAD-01 minimizer fallback %d',
+                         self.adiis_fallbacks)
+            if self.adiis_fallbacks >= self.adiis_max_fallbacks:
+                self._latch_cdiis(rms)
+            else:
+                self.adiis_cycle += 1
+                self._record('adias_head_cycles', self.adiis_cycle)
+            return CDIIS.update(self, s, d, f, *args, **kwargs)
+        self.adiis_cycle += 1
+        self._record('adias_head_cycles', self.adiis_cycle)
+        return fock

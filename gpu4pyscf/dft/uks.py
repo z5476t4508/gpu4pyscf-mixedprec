@@ -16,7 +16,7 @@ import cupy
 from pyscf.dft import uks as uks_cpu
 from pyscf import lib
 from gpu4pyscf.lib import logger
-from gpu4pyscf.dft import rks
+from gpu4pyscf.dft import numint, rks
 from gpu4pyscf.scf import hf, uhf, j_engine
 from gpu4pyscf.lib.cupy_helper import tag_array, asarray
 from gpu4pyscf.lib import utils
@@ -45,7 +45,9 @@ def get_veff(ks, mol=None, dm=None, dm_last=None, vhf_last=None, hermi=1):
         max_memory = ks.max_memory - lib.current_memory()[0]
         n, exc, vxc = ni.nr_uks(mol, ks.grids, ks.xc, dm.view(cupy.ndarray), max_memory=max_memory)
         log.debug('nelec by numeric integration = %s', n)
-        if ks.do_nlc():
+        # SP-31: the opt-in auto-head NLC skip (numint lane flag armed
+        # by scf.hf._kernel; default off = this block unchanged bitwise)
+        if ks.do_nlc() and not numint._scf_head_nlc_suppressed():
             if ni.libxc.is_nlc(ks.xc):
                 xc = ks.xc
             else:

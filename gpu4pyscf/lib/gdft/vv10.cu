@@ -27,6 +27,573 @@
 
 #define NG_PER_BLOCK      128
 
+// Block-wide tree reduction of three doubles (used by the multi-warp VV10
+// UWE kernel). blockDim.x is a power of two in every caller, and every
+// thread enters with __syncthreads() balanced, so the barriers below are
+// uniform across the block.
+__device__
+static void _vv10_block_reduce3(double& U, double& W, double& E)
+{
+    __shared__ double s_U[NG_PER_BLOCK];
+    __shared__ double s_W[NG_PER_BLOCK];
+    __shared__ double s_E[NG_PER_BLOCK];
+    s_U[threadIdx.x] = U;
+    s_W[threadIdx.x] = W;
+    s_E[threadIdx.x] = E;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            s_U[threadIdx.x] += s_U[threadIdx.x + stride];
+            s_W[threadIdx.x] += s_W[threadIdx.x + stride];
+            s_E[threadIdx.x] += s_E[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    U = s_U[0];
+    W = s_W[0];
+    E = s_E[0];
+}
+
+// Issue #10 candidate C1 (rework): the REFERENCE kernel below (warp1)
+// assigns one grid point i to each THREAD and one 128-thread block to 128
+// consecutive i points; it stages each 128-point j chunk into shared memory
+// ONCE per block and reuses it for all 128 i points of the block (minimum
+// possible global read amplification: each j element is read once per
+// ngrids/128 blocks). Its limitation is parallelism, not traffic: with one
+// thread per i the kernel exposes only ngrids threads, so small grids
+// (e.g. ~58k points -> 452 blocks) under-occupy the GPU and run the fp64
+// pipes at a fraction of the achievable rate, while large grids already
+// sit near the fp64 roofline.
+//
+// The multi-warp variant (warp4, kept below for continuity) is the opposite
+// trade: one block per i with all 128 threads cooperating on that i's
+// j-loop, which restores parallelism but restages the whole j grid in every
+// block (128x global read amplification) and turns L2 bandwidth into the
+// binding limit at benzene-scale grids.
+//
+// The multi-i tile kernel (this file, selected via GPU4PYSCF_VV10_UWE_KERNEL
+// = tile8/tile16/tile32) interpolates between the two: one block serves
+// I_TILE i points, and the 128 threads are split into groups of
+// 128/I_TILE that cooperatively walk each i's j-loop over the block-shared
+// staged j chunk. Global read amplification becomes 128/I_TILE (16x/8x/4x
+// for tile8/tile16/tile32 respectively, vs warp4's 128x and the reference's
+// 1x) while exposed parallelism becomes ngrids * 128/I_TILE threads. The
+// per-pair fp64
+// arithmetic expression is IDENTICAL to the reference kernel; the result
+// differs from the reference only in fp64 summation order (per-i partials
+// over 128/I_TILE strided j subsets combined by a within-warp shuffle
+// tree reduction instead of one serial chain), the same class of
+// reduction-order noise already probed for warp4 (issue #10 precision
+// probe: <= 4.3e-16 kernel-level, <= 5.7e-14 Ha SCF-level).
+//
+// Boundary handling: I_TILE i points per block means the last block may
+// carry fewer than I_TILE active i points (partial tile) and the last j
+// chunk may be shorter than 128 (tail chunk). No thread ever exits early:
+// inactive i groups keep executing the uniform chunk loop (their loads are
+// skipped and their accumulators stay zero) so every __syncthreads() in the
+// loop is reached by all 128 threads, and staged shared slots beyond the
+// tail are never read because the compute loop bound is the same uniform
+// block_upper_bound used by the reference kernel. Ownership: exactly one
+// thread (group lane 0) writes each active i's U/W/E, so there is no
+// write race between groups.
+//
+// Selected at runtime via GPU4PYSCF_VV10_UWE_KERNEL (unset/empty = warp1
+// reference, the default; 'warp4' = multi-warp; 'tile8'/'tile16'/'tile32'
+// = multi-i tile); the default never changes without that opt-in.
+template <int I_TILE>
+__global__
+static void vv10_fock_eval_UWE_multii_kernel(double* __restrict__ U, double* __restrict__ W, double* __restrict__ E,
+                                             const double* __restrict__ grid_coord, const double* __restrict__ rho_weight,
+                                             const double* __restrict__ omega, const double* __restrict__ kappa,
+                                             const int ngrids)
+{
+    constexpr int THREADS_PER_I = NG_PER_BLOCK / I_TILE;
+    static_assert(THREADS_PER_I >= 4 && THREADS_PER_I <= 32,
+                  "multi-i tile keeps the per-i reduction inside one warp "
+                  "(I_TILE in 4..32; I_TILE=128 is the reference kernel)");
+    const int group = threadIdx.x / THREADS_PER_I;
+    const int lane_in_group = threadIdx.x % THREADS_PER_I;
+    const int i = blockIdx.x * I_TILE + group;
+    const bool active = i < ngrids;
+
+    double omega_i = NAN;
+    double kappa_i = NAN;
+    double3 r_i = { NAN, NAN, NAN };
+    if (active) {
+        omega_i = omega[i];
+        kappa_i = kappa[i];
+        r_i.x = grid_coord[i * 3 + 0];
+        r_i.y = grid_coord[i * 3 + 1];
+        r_i.z = grid_coord[i * 3 + 2];
+    }
+
+    double U_i = 0;
+    double W_i = 0;
+    double E_i = 0;
+
+    __shared__ double3 shared_omega_kappa_rhow_j[NG_PER_BLOCK];
+    __shared__ double3 shared_r_j[NG_PER_BLOCK];
+
+    for (int j_block_offset = 0; j_block_offset < ngrids; j_block_offset += NG_PER_BLOCK) {
+        const int j = j_block_offset + threadIdx.x;
+        if (j < ngrids) {
+            shared_omega_kappa_rhow_j[threadIdx.x].x = omega[j];
+            shared_omega_kappa_rhow_j[threadIdx.x].y = kappa[j];
+            shared_omega_kappa_rhow_j[threadIdx.x].z = rho_weight[j];
+            shared_r_j[threadIdx.x].x = grid_coord[j * 3 + 0];
+            shared_r_j[threadIdx.x].y = grid_coord[j * 3 + 1];
+            shared_r_j[threadIdx.x].z = grid_coord[j * 3 + 2];
+        }
+        __syncthreads();
+
+        const int block_upper_bound = min(NG_PER_BLOCK, ngrids - j_block_offset);
+        // group lanes walk the staged chunk with stride THREADS_PER_I, so
+        // the group's lanes together cover every staged j for their i
+        for (int j_in_block = lane_in_group; j_in_block < block_upper_bound; j_in_block += THREADS_PER_I) {
+            const double omega_j = shared_omega_kappa_rhow_j[j_in_block].x;
+            const double kappa_j = shared_omega_kappa_rhow_j[j_in_block].y;
+            const double3 r_j = shared_r_j[j_in_block];
+            const double rho_weight_j = shared_omega_kappa_rhow_j[j_in_block].z;
+
+            const double r_ij2 = (r_i.x - r_j.x) * (r_i.x - r_j.x) + (r_i.y - r_j.y) * (r_i.y - r_j.y) + (r_i.z - r_j.z) * (r_i.z - r_j.z);
+            const double g_ij = omega_i * r_ij2 + kappa_i;
+            const double g_ji = omega_j * r_ij2 + kappa_j;
+            const double g_sum = g_ij + g_ji;
+            const double g_ij_ji_sum_1 = 1 / (g_ij * g_ji * g_sum);
+            const double Phi_ij = -g_ij_ji_sum_1; // Prefactor of 1.5 is applied later
+
+            const double E_ij = rho_weight_j * Phi_ij;
+            const double U_ij = E_ij * (g_sum + g_ij) * g_ji * g_ij_ji_sum_1;
+            const double W_ij = U_ij * r_ij2;
+
+            U_i += U_ij;
+            W_i += W_ij;
+            E_i += E_ij;
+        }
+        __syncthreads();
+    }
+
+    // per-i reduction inside the owning warp: THREADS_PER_I is 4..32 and
+    // groups are aligned contiguous lane ranges (NG_PER_BLOCK is a
+    // multiple of 32 and THREADS_PER_I divides 32), so a shuffle tree
+    // reduction over THREADS_PER_I lanes needs no shared memory and no
+    // barrier. All threads reach here (no early return above), so the
+    // full-warp sync mask is uniform.
+    #pragma unroll
+    for (int stride = THREADS_PER_I / 2; stride > 0; stride >>= 1) {
+        U_i += __shfl_down_sync(0xffffffffu, U_i, stride);
+        W_i += __shfl_down_sync(0xffffffffu, W_i, stride);
+        E_i += __shfl_down_sync(0xffffffffu, E_i, stride);
+    }
+    if (lane_in_group == 0 && active) {
+        U[i] = -U_i * 1.5;
+        W[i] = -W_i * 1.5;
+        E[i] = E_i * 1.5;
+    }
+}
+
+// The fp32-safe mixed-precision UWE kernel (LC-80, review 2026-10-12
+// continuation): the SAME warp1 block/j-staging structure as the
+// reference kernel, but the per-pair arithmetic runs in fp32 with the
+// numerically safe expression measured in LC-79
+// (tasks/issue-9/2026-10-13-lc79-vv10-lever):
+//   * omega/kappa/rho_weight arrive as fp64 (computed by the fp64
+//     omega_derivative kernel); they are cast to fp32 ONCE at staging.
+//     This keeps the rho^-4 overflow (measured 8.5e39 at nonzero-rho
+//     ~1e-10 grid points) OUT of the fp32 domain -- a fully-fp32 VV10
+//     is structurally NaN there.
+//   * the three reciprocals are computed as separate 1/g factors; the
+//     reference's 1/(g_ij*g_ji*g_sum) overflows fp32 on far pairs
+//     (measured 154k pairs with g-prod above FLT_MAX on benzene/tzvp).
+//   * accumulation: per-j-chunk (128-term) partial sums in fp32,
+//     combined into an fp64 accumulator. A pure serial fp32 chain over
+//     the full ngrids (127k terms on benzene/tzvp) was measured at
+//     dE +1.5e-6 Ha (compiler reassociation makes the serial order
+//     uncontrollable), while chunked partials + fp64 combine measured
+//     dE -2.6e-11 Ha on the same data (LC-80 diag_accum.py); the
+//     cupy-tree equivalent measured +8.5e-10. The chunk partial is a
+//     plain fp32 sum of 128 contiguous terms (reassociation within a
+//     chunk is bounded by 128 eps against terms of one chunk).
+//   * coordinates are staged relative to the first grid point: the
+//     origin is subtracted in fp64 BEFORE the fp32 cast (independent
+//     review 2026-10-17; absolute-coordinate staging broke rigid-
+//     translation invariance, measured +5.27e-6 Ha at 1e6 Bohr).
+// Selected via GPU4PYSCF_VV10_UWE_KERNEL=fp32 (opt-in; default and all
+// other selectors unchanged).
+__global__
+static void vv10_fock_eval_UWE_fp32safe_kernel(double* __restrict__ U, double* __restrict__ W, double* __restrict__ E,
+                                               const double* __restrict__ grid_coord, const double* __restrict__ rho_weight,
+                                               const double* __restrict__ omega, const double* __restrict__ kappa,
+                                               const int ngrids)
+{
+    const int i = blockIdx.x * NG_PER_BLOCK + threadIdx.x;
+    const bool active = i < ngrids;
+
+    // Translation-safe staging (independent review 2026-10-17): the fp32
+    // cast must never see ABSOLUTE coordinates.  At a distant origin
+    // (measured on a rigid 1e6-Bohr translation of every NLC grid point,
+    // rho/weights/omega/kappa unchanged) the fp32 mantissa quantizes the
+    // low bits of each coordinate and the pair differences inherit the
+    // quantization: dE_NLC +5.27e-6 Ha on methanol/def2-SVP/wb97m-v,
+    // while the fp64 kernels stayed at ~7e-15.  Subtracting the first
+    // grid point in fp64 before the cast keeps every staged value
+    // molecule-scale (the grid spans one molecule, so the origin is
+    // always near) and restores rigid-translation invariance: a common
+    // shift moves the origin with the grid and cancels in the fp64
+    // subtraction, leaving only fp64-rounding ~1e-10 Bohr before the
+    // cast -- the same error class as the unshifted molecule.
+    const double origin_x = grid_coord[0];
+    const double origin_y = grid_coord[1];
+    const double origin_z = grid_coord[2];
+
+    float omega_i = NAN;
+    float kappa_i = NAN;
+    float3 r_i = { NAN, NAN, NAN };
+    if (active) {
+        omega_i = __double2float_rn(omega[i]);
+        kappa_i = __double2float_rn(kappa[i]);
+        r_i.x = __double2float_rn(grid_coord[i * 3 + 0] - origin_x);
+        r_i.y = __double2float_rn(grid_coord[i * 3 + 1] - origin_y);
+        r_i.z = __double2float_rn(grid_coord[i * 3 + 2] - origin_z);
+    }
+
+    double U_i = 0;
+    double W_i = 0;
+    double E_i = 0;
+
+    __shared__ float3 shared_omega_kappa_rhow_j[NG_PER_BLOCK];
+    __shared__ float3 shared_r_j[NG_PER_BLOCK];
+
+    for (int j_block_offset = 0; j_block_offset < ngrids; j_block_offset += NG_PER_BLOCK) {
+        const int j = j_block_offset + threadIdx.x;
+        if (j < ngrids) {
+            shared_omega_kappa_rhow_j[threadIdx.x].x = __double2float_rn(omega[j]);
+            shared_omega_kappa_rhow_j[threadIdx.x].y = __double2float_rn(kappa[j]);
+            shared_omega_kappa_rhow_j[threadIdx.x].z = __double2float_rn(rho_weight[j]);
+            shared_r_j[threadIdx.x].x = __double2float_rn(grid_coord[j * 3 + 0] - origin_x);
+            shared_r_j[threadIdx.x].y = __double2float_rn(grid_coord[j * 3 + 1] - origin_y);
+            shared_r_j[threadIdx.x].z = __double2float_rn(grid_coord[j * 3 + 2] - origin_z);
+        }
+        __syncthreads();
+
+        const int block_upper_bound = min(NG_PER_BLOCK, ngrids - j_block_offset);
+        float U_chunk = 0;
+        float W_chunk = 0;
+        float E_chunk = 0;
+        for (int j_in_block = 0; j_in_block < block_upper_bound; ++j_in_block) {
+            const float omega_j = shared_omega_kappa_rhow_j[j_in_block].x;
+            const float kappa_j = shared_omega_kappa_rhow_j[j_in_block].y;
+            const float3 r_j = shared_r_j[j_in_block];
+            const float rho_weight_j = shared_omega_kappa_rhow_j[j_in_block].z;
+
+            const float dx = r_i.x - r_j.x;
+            const float dy = r_i.y - r_j.y;
+            const float dz = r_i.z - r_j.z;
+            const float r_ij2 = dx * dx + dy * dy + dz * dz;
+            const float g_ij = omega_i * r_ij2 + kappa_i;
+            const float g_ji = omega_j * r_ij2 + kappa_j;
+            const float g_sum = g_ij + g_ji;
+            // three separate reciprocals: 1/(g_ij*g_ji*g_sum) overflows
+            // fp32 on far pairs (measured; see the kernel comment above)
+            const float inv_gij = 1.0f / g_ij;
+            const float inv_gji = 1.0f / g_ji;
+            const float inv_gsum = 1.0f / g_sum;
+            const float Phi_ij = -(inv_gij * inv_gji * inv_gsum);
+            const float E_ij = rho_weight_j * Phi_ij;
+            const float U_ij = E_ij * (g_sum + g_ij) * g_ji * inv_gij * inv_gji * inv_gsum;
+            const float W_ij = U_ij * r_ij2;
+
+            U_chunk += U_ij;
+            W_chunk += W_ij;
+            E_chunk += E_ij;
+        }
+        // chunk partials (<= 128 fp32 terms) combined in fp64: bounds
+        // any within-chunk reassociation and keeps the accumulator
+        // error at the fp64 level (measured dE -2.6e-11 Ha benzene/tzvp)
+        U_i += double(U_chunk);
+        W_i += double(W_chunk);
+        E_i += double(E_chunk);
+        __syncthreads();
+    }
+
+    if (active) {
+        U[i] = -U_i * 1.5;
+        W[i] = -W_i * 1.5;
+        E[i] = E_i * 1.5;
+    }
+}
+
+// NLC-KERNEL-OPT-01 (2026-11-04; implementation child of entry 299
+// HEADROOM_PASS_K-C2): the deployed fp32safe kernel above measures
+// 1.40-1.53x over its OWN stripped-arithmetic floor at the two wb97mv
+// roster cells (239.781 vs 156.414 ms ibuprofen, 445.837 vs 318.541 ms
+// testosterone; staging/sync/launch overhead 40-53% of a unit that is
+// 31.8-35.4% of lane-B t_scf).  This template attacks that overhead with
+// the multi-i tile block structure proven in the fp64 ladder above (SP-3 /
+// SRK-1 closed that ladder AT the fp64 arithmetic floor), ported onto the
+// fp32safe per-pair arithmetic with its measured numerical-safety
+// discipline preserved verbatim:
+//   * fp64 omega/kappa/rho_weight/coords staged and cast to fp32 ONCE
+//     (the rho^-4 overflow stays out of the fp32 domain);
+//   * coordinates staged RELATIVE to the first grid point, origin
+//     subtracted in fp64 BEFORE the fp32 cast (the review-2026-10-17
+//     rigid-translation fix, both the i-load and the j-shared staging);
+//   * per-j-chunk fp32 partials promoted to per-lane fp64 accumulators
+//     every chunk: each lane's chunk partial spans <= 128/I_TILE
+//     contiguous-stride terms (shorter than the deployed 128-term serial
+//     chain), so the within-chunk reassociation stays bounded by the same
+//     chunk-length eps argument and the cross-lane combine happens in fp64
+//     (per-lane accumulators, final within-group shuffle reduction).  The
+//     result differs from the deployed kernel only in fp32 summation
+//     order (and, for NDIV==2, the identity below) -- the fp64 tile-ladder
+//     precedent for order-only differences is |dE_NLC| <= 2.4e-15, and
+//     the equivalence band for every variant here is measured at the
+//     1e-9-Ha kernel level before any SCF-level claim.
+// I_TILE = 128/THREADS_PER_I in {8,16,32}; I_TILE = 128 (one thread per i,
+// contiguous serial j walk) reproduces the deployed warp1 STRUCTURE
+// exactly, so NDIV==2 at I_TILE=128 isolates the arithmetic change alone.
+// NDIV == 3 is the deployed expression verbatim (three separate IEEE fp32
+// reciprocals; never 1/(g_ij*g_ji*g_sum), which overflows on far pairs).
+// NDIV == 2 is the 3->2-division algebraic identity
+//   inv_q = 1/(g_ij*g_ji); inv_gsum = 1/g_sum; inv_gij = g_ji*inv_q;
+//   Phi_ij = -(inv_q*inv_gsum); U_ij = E_ij*(inv_gij+inv_gsum)
+// (algebra: U_ij = E_ij*(g_sum+g_ij)*g_ji/(g_ij*g_ji*g_sum) =
+// E_ij*(1/g_ij + 1/g_sum)).  Entry-299 caveat: the Phase-A probe value for
+// this identity was compiler-eliminated and void; its PRICE and its dE
+// are measured only by the correctness-forced probe and the in-kernel
+// ladder arm.  Numerical structure of the identity: per-pair differences
+// vs the 3-div route are O(ulp) on normal pairs; on pairs where the
+// g_ij*g_ji product alone overflows FLT_MAX (a strict subset of LC-79's
+// measured 3-product-overflow class) inv_q flushes to 0, making that
+// pair's Phi/E/U ~1e-57-class zeros where the 3-div route produced
+// ~1e-57-class denormals; no new NaN class exists because
+// g_sum = g_ij+g_ji > 0 always (kappa > 0, omega >= 0, r_ij2 >= 0), so
+// inv_gsum is finite and 0*finite stays finite.  Every claim about this
+// identity is gated by measurement (kernel-level 1e-9-Ha band and the
+// 1e-6-Ha / 3e-5-Eh/Bohr project gates), never by this argument.
+// Boundary handling: identical contract to the fp64 multi-i template
+// above (inactive i groups execute the uniform chunk loop with NaN
+// partials and never write; staged slots beyond the tail chunk are never
+// read; no early thread exit).  All opt-in via GPU4PYSCF_VV10_UWE_KERNEL
+// = fp32tile8|fp32tile16|fp32tile32|fp32d2|fp32tile8d2|fp32tile16d2|
+// fp32tile32d2 (default and every pre-existing selector unchanged);
+// the fp64d2 twin of fp32d2 -- the same 2-division identity in the
+// reference warp1 structure with double arithmetic -- is selected the
+// same way (code 48; see its kernel comment).
+template <int I_TILE, int NDIV>
+__global__
+static void vv10_fock_eval_UWE_fp32safe_multii_kernel(double* __restrict__ U, double* __restrict__ W, double* __restrict__ E,
+                                                      const double* __restrict__ grid_coord, const double* __restrict__ rho_weight,
+                                                      const double* __restrict__ omega, const double* __restrict__ kappa,
+                                                      const int ngrids)
+{
+    constexpr int THREADS_PER_I = NG_PER_BLOCK / I_TILE;
+    static_assert(THREADS_PER_I >= 1 && THREADS_PER_I <= 32,
+                  "the per-i reduction stays inside one warp "
+                  "(I_TILE in 4..128; I_TILE=128 is the deployed warp1 "
+                  "structure with one thread per i)");
+    static_assert(NDIV == 3 || NDIV == 2,
+                  "3 = deployed separate-reciprocal expression, "
+                  "2 = the algebraic identity above");
+    const int group = threadIdx.x / THREADS_PER_I;
+    const int lane_in_group = threadIdx.x % THREADS_PER_I;
+    const int i = blockIdx.x * I_TILE + group;
+    const bool active = i < ngrids;
+
+    // translation-safe staging (independent review 2026-10-17): the fp32
+    // cast must never see ABSOLUTE coordinates (see the deployed kernel's
+    // comment for the measured +5.27e-6 Ha failure this prevents)
+    const double origin_x = grid_coord[0];
+    const double origin_y = grid_coord[1];
+    const double origin_z = grid_coord[2];
+
+    float omega_i = NAN;
+    float kappa_i = NAN;
+    float3 r_i = { NAN, NAN, NAN };
+    if (active) {
+        omega_i = __double2float_rn(omega[i]);
+        kappa_i = __double2float_rn(kappa[i]);
+        r_i.x = __double2float_rn(grid_coord[i * 3 + 0] - origin_x);
+        r_i.y = __double2float_rn(grid_coord[i * 3 + 1] - origin_y);
+        r_i.z = __double2float_rn(grid_coord[i * 3 + 2] - origin_z);
+    }
+
+    double U_i = 0;
+    double W_i = 0;
+    double E_i = 0;
+
+    __shared__ float3 shared_omega_kappa_rhow_j[NG_PER_BLOCK];
+    __shared__ float3 shared_r_j[NG_PER_BLOCK];
+
+    for (int j_block_offset = 0; j_block_offset < ngrids; j_block_offset += NG_PER_BLOCK) {
+        const int j = j_block_offset + threadIdx.x;
+        if (j < ngrids) {
+            shared_omega_kappa_rhow_j[threadIdx.x].x = __double2float_rn(omega[j]);
+            shared_omega_kappa_rhow_j[threadIdx.x].y = __double2float_rn(kappa[j]);
+            shared_omega_kappa_rhow_j[threadIdx.x].z = __double2float_rn(rho_weight[j]);
+            shared_r_j[threadIdx.x].x = __double2float_rn(grid_coord[j * 3 + 0] - origin_x);
+            shared_r_j[threadIdx.x].y = __double2float_rn(grid_coord[j * 3 + 1] - origin_y);
+            shared_r_j[threadIdx.x].z = __double2float_rn(grid_coord[j * 3 + 2] - origin_z);
+        }
+        __syncthreads();
+
+        const int block_upper_bound = min(NG_PER_BLOCK, ngrids - j_block_offset);
+        // group lanes walk the staged chunk with stride THREADS_PER_I;
+        // THREADS_PER_I == 1 (I_TILE=128) degenerates to the deployed
+        // contiguous serial walk of the whole chunk
+        float U_chunk = 0;
+        float W_chunk = 0;
+        float E_chunk = 0;
+        for (int j_in_block = lane_in_group; j_in_block < block_upper_bound; j_in_block += THREADS_PER_I) {
+            const float omega_j = shared_omega_kappa_rhow_j[j_in_block].x;
+            const float kappa_j = shared_omega_kappa_rhow_j[j_in_block].y;
+            const float3 r_j = shared_r_j[j_in_block];
+            const float rho_weight_j = shared_omega_kappa_rhow_j[j_in_block].z;
+
+            const float dx = r_i.x - r_j.x;
+            const float dy = r_i.y - r_j.y;
+            const float dz = r_i.z - r_j.z;
+            const float r_ij2 = dx * dx + dy * dy + dz * dz;
+            const float g_ij = omega_i * r_ij2 + kappa_i;
+            const float g_ji = omega_j * r_ij2 + kappa_j;
+            const float g_sum = g_ij + g_ji;
+            float Phi_ij;
+            float E_ij;
+            float U_ij;
+            if constexpr (NDIV == 2) {
+                // the algebraic identity (see the template comment): two
+                // IEEE divisions per pair instead of three
+                const float inv_q = 1.0f / (g_ij * g_ji);
+                const float inv_gsum = 1.0f / g_sum;
+                const float inv_gij = g_ji * inv_q;
+                Phi_ij = -(inv_q * inv_gsum);
+                E_ij = rho_weight_j * Phi_ij;
+                U_ij = E_ij * (inv_gij + inv_gsum);
+            } else {
+                // three separate reciprocals: 1/(g_ij*g_ji*g_sum)
+                // overflows fp32 on far pairs (measured; deployed form)
+                const float inv_gij = 1.0f / g_ij;
+                const float inv_gji = 1.0f / g_ji;
+                const float inv_gsum = 1.0f / g_sum;
+                Phi_ij = -(inv_gij * inv_gji * inv_gsum);
+                E_ij = rho_weight_j * Phi_ij;
+                U_ij = E_ij * (g_sum + g_ij) * g_ji * inv_gij * inv_gji * inv_gsum;
+            }
+            const float W_ij = U_ij * r_ij2;
+
+            U_chunk += U_ij;
+            W_chunk += W_ij;
+            E_chunk += E_ij;
+        }
+        // per-chunk promotion to per-lane fp64 accumulators (the deployed
+        // chunk discipline, per lane; cross-lane combine is fp64 at the end)
+        U_i += double(U_chunk);
+        W_i += double(W_chunk);
+        E_i += double(E_chunk);
+        __syncthreads();
+    }
+
+    // per-i reduction inside the owning warp (groups are aligned
+    // contiguous lane ranges; THREADS_PER_I divides 32; THREADS_PER_I == 1
+    // skips the loop).  All threads reach here (no early return above).
+    #pragma unroll
+    for (int stride = THREADS_PER_I / 2; stride > 0; stride >>= 1) {
+        U_i += __shfl_down_sync(0xffffffffu, U_i, stride);
+        W_i += __shfl_down_sync(0xffffffffu, W_i, stride);
+        E_i += __shfl_down_sync(0xffffffffu, E_i, stride);
+    }
+    if (lane_in_group == 0 && active) {
+        U[i] = -U_i * 1.5;
+        W[i] = -W_i * 1.5;
+        E[i] = E_i * 1.5;
+    }
+}
+
+// The multi-warp variant (issue #10 candidate C1 round 1): one block per
+// grid point i, with all NG_PER_BLOCK threads cooperating on that single
+// i's j-loop (thread t takes every NG_PER_BLOCK-th j; per-i sums via block
+// reduction). Compared with the reference kernel this raises exposed
+// parallelism from ngrids threads to ngrids*128 threads but restages the
+// entire j grid in every block (128x global read amplification), which
+// makes L2 bandwidth the binding limit at benzene-scale grids; measured
+// end-to-end it was 0.944x-1.152x by cell, so it stays opt-in. The fp64
+// arithmetic expression per pair is identical to the reference kernel;
+// only the fp64 summation order differs (block tree reduction of 128
+// partials instead of one serial chain).
+__global__
+static void vv10_fock_eval_UWE_multiwarp_kernel(double* __restrict__ U, double* __restrict__ W, double* __restrict__ E,
+                                                const double* __restrict__ grid_coord, const double* __restrict__ rho_weight,
+                                                const double* __restrict__ omega, const double* __restrict__ kappa,
+                                                const int ngrids)
+{
+    const int i = blockIdx.x;
+    const bool active = i < ngrids;
+
+    double omega_i = NAN;
+    double kappa_i = NAN;
+    double3 r_i = { NAN, NAN, NAN };
+    if (active) {
+        omega_i = omega[i];
+        kappa_i = kappa[i];
+        r_i.x = grid_coord[i * 3 + 0];
+        r_i.y = grid_coord[i * 3 + 1];
+        r_i.z = grid_coord[i * 3 + 2];
+    }
+
+    double U_i = 0;
+    double W_i = 0;
+    double E_i = 0;
+
+    __shared__ double3 shared_omega_kappa_rhow_j[NG_PER_BLOCK];
+    __shared__ double3 shared_r_j[NG_PER_BLOCK];
+
+    for (int j_block_offset = 0; j_block_offset < ngrids; j_block_offset += NG_PER_BLOCK) {
+        const int j = j_block_offset + threadIdx.x;
+        if (j < ngrids) {
+            shared_omega_kappa_rhow_j[threadIdx.x].x = omega[j];
+            shared_omega_kappa_rhow_j[threadIdx.x].y = kappa[j];
+            shared_omega_kappa_rhow_j[threadIdx.x].z = rho_weight[j];
+            shared_r_j[threadIdx.x].x = grid_coord[j * 3 + 0];
+            shared_r_j[threadIdx.x].y = grid_coord[j * 3 + 1];
+            shared_r_j[threadIdx.x].z = grid_coord[j * 3 + 2];
+        }
+        __syncthreads();
+
+        const int block_upper_bound = min(NG_PER_BLOCK, ngrids - j_block_offset);
+        // thread t takes j_in_block = t, t+blockDim.x, ... within this
+        // 128-j chunk: all four warps cooperate on the j-loop
+        for (int j_in_block = threadIdx.x; j_in_block < block_upper_bound; j_in_block += blockDim.x) {
+            const double omega_j = shared_omega_kappa_rhow_j[j_in_block].x;
+            const double kappa_j = shared_omega_kappa_rhow_j[j_in_block].y;
+            const double3 r_j = shared_r_j[j_in_block];
+            const double rho_weight_j = shared_omega_kappa_rhow_j[j_in_block].z;
+
+            const double r_ij2 = (r_i.x - r_j.x) * (r_i.x - r_j.x) + (r_i.y - r_j.y) * (r_i.y - r_j.y) + (r_i.z - r_j.z) * (r_i.z - r_j.z);
+            const double g_ij = omega_i * r_ij2 + kappa_i;
+            const double g_ji = omega_j * r_ij2 + kappa_j;
+            const double g_sum = g_ij + g_ji;
+            const double g_ij_ji_sum_1 = 1 / (g_ij * g_ji * g_sum);
+            const double Phi_ij = -g_ij_ji_sum_1; // Prefactor of 1.5 is applied later
+
+            const double E_ij = rho_weight_j * Phi_ij;
+            const double U_ij = E_ij * (g_sum + g_ij) * g_ji * g_ij_ji_sum_1;
+            const double W_ij = U_ij * r_ij2;
+
+            U_i += U_ij;
+            W_i += W_ij;
+            E_i += E_ij;
+        }
+        __syncthreads();
+    }
+
+    _vv10_block_reduce3(U_i, W_i, E_i);
+    if (threadIdx.x == 0 && active) {
+        U[i] = -U_i * 1.5;
+        W[i] = -W_i * 1.5;
+        E[i] = E_i * 1.5;
+    }
+}
+
 __global__
 static void vv10_fock_eval_UWE_kernel(double* __restrict__ U, double* __restrict__ W, double* __restrict__ E,
                                       const double* __restrict__ grid_coord, const double* __restrict__ rho_weight,
@@ -98,8 +665,111 @@ static void vv10_fock_eval_UWE_kernel(double* __restrict__ U, double* __restrict
     }
 }
 
+// The fp64 twin of the fp32d2 kernel (MP-461-PRECISION-MARGIN-01, the
+// 2026-11-09 fixed-grid mixed-precision mainline).  fp32d2 (code 43, the
+// fp32safe template at I_TILE=128, NDIV=2) simultaneously carries the
+// 3->2-division algebraic identity AND the fp32 arithmetic discipline, so
+// pairing it against the plain reference warp1 kernel (3-division, fp64)
+// mixes an implementation change with the precision change.  This kernel
+// is the reference warp1 kernel body (absolute double coordinates,
+// double3 shared staging, one thread per i, serial 128-chunk j walk,
+// serial double accumulation, identical write scaling) with ONLY the
+// per-pair expression swapped to the 2-division identity executed in
+// double:
+//   Phi_ij = -(1/(g_ij*g_ji)) * (1/g_sum)
+//   U_ij   = E_ij * (1/g_ij + 1/g_sum)
+// (the same pair expression as the fp32d2 arm of the fp32safe template,
+// evaluated in fp64).  Structural deltas vs fp32d2 are exactly the
+// arithmetic-path deltas of the two dtypes and are named in the pairing
+// preregistration: (a) pair/staging/accumulator dtype double vs float,
+// (b) serial double accumulation vs the deployed per-chunk float +
+// per-chunk double promotion, (c) absolute coordinates vs the
+// origin-relative staging the fp32 cast requires (the +5.27e-6 Ha class).
+// In fp64 the g_ij*g_ji product cannot overflow (no far-pair denormal
+// class), so the deviation vs the reference kernel is ulp-level
+// rounding-order noise of the identity only; every claim here is gated
+// by the focused regression (kernel-level band vs the reference kernel
+// and whole-SCF/gradient bands vs knob-off), never by this argument.
+// Opt-in via GPU4PYSCF_VV10_UWE_KERNEL=fp64d2 (code 48, default and
+// every pre-existing selector value unchanged; the strict-fp64-reference
+// override 0 keeps winning by construction).
 __global__
-static void vv10_fock_eval_omega_derivative_kernel(double* __restrict__ omega, double* __restrict__ domega_drho, double* __restrict__ domega_dgamma,
+static void vv10_fock_eval_UWE_fp64d2_kernel(double* __restrict__ U, double* __restrict__ W, double* __restrict__ E,
+                                             const double* __restrict__ grid_coord, const double* __restrict__ rho_weight,
+                                             const double* __restrict__ omega, const double* __restrict__ kappa,
+                                             const int ngrids)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool active = i < ngrids;
+
+    double omega_i = NAN;
+    double kappa_i = NAN;
+    double3 r_i = { NAN, NAN, NAN };
+    if (active) {
+        omega_i = omega[i];
+        kappa_i = kappa[i];
+        r_i.x = grid_coord[i * 3 + 0];
+        r_i.y = grid_coord[i * 3 + 1];
+        r_i.z = grid_coord[i * 3 + 2];
+    }
+
+    double U_i = 0;
+    double W_i = 0;
+    double E_i = 0;
+
+    __shared__ double3 shared_omega_kappa_rhow_j[NG_PER_BLOCK];
+    __shared__ double3 shared_r_j[NG_PER_BLOCK];
+
+    for (int j_block_offset = 0; j_block_offset < ngrids; j_block_offset += NG_PER_BLOCK) {
+        const int j = j_block_offset + threadIdx.x;
+        if (j < ngrids) {
+            shared_omega_kappa_rhow_j[threadIdx.x].x = omega[j];
+            shared_omega_kappa_rhow_j[threadIdx.x].y = kappa[j];
+            shared_omega_kappa_rhow_j[threadIdx.x].z = rho_weight[j];
+            shared_r_j[threadIdx.x].x = grid_coord[j * 3 + 0];
+            shared_r_j[threadIdx.x].y = grid_coord[j * 3 + 1];
+            shared_r_j[threadIdx.x].z = grid_coord[j * 3 + 2];
+        }
+        __syncthreads();
+
+        const int block_upper_bound = min(NG_PER_BLOCK, ngrids - j_block_offset);
+        for (int j_in_block = 0; j_in_block < block_upper_bound; j_in_block++) {
+            const double omega_j = shared_omega_kappa_rhow_j[j_in_block].x;
+            const double kappa_j = shared_omega_kappa_rhow_j[j_in_block].y;
+            const double3 r_j = shared_r_j[j_in_block];
+            const double rho_weight_j = shared_omega_kappa_rhow_j[j_in_block].z;
+
+            const double r_ij2 = (r_i.x - r_j.x) * (r_i.x - r_j.x) + (r_i.y - r_j.y) * (r_i.y - r_j.y) + (r_i.z - r_j.z) * (r_i.z - r_j.z);
+            const double g_ij = omega_i * r_ij2 + kappa_i;
+            const double g_ji = omega_j * r_ij2 + kappa_j;
+            const double g_sum = g_ij + g_ji;
+            // the 2-division identity (the fp32d2 pair expression, in double):
+            // two IEEE divisions per pair instead of three
+            const double inv_q = 1.0 / (g_ij * g_ji);
+            const double inv_gsum = 1.0 / g_sum;
+            const double inv_gij = g_ji * inv_q;
+            const double Phi_ij = -(inv_q * inv_gsum); // Prefactor of 1.5 is applied later
+
+            const double E_ij = rho_weight_j * Phi_ij;
+            const double U_ij = E_ij * (inv_gij + inv_gsum);
+            const double W_ij = U_ij * r_ij2;
+
+            U_i += U_ij;
+            W_i += W_ij;
+            E_i += E_ij;
+        }
+        __syncthreads();
+    }
+
+    if (active) {
+        U[i] = -U_i * 1.5;
+        W[i] = -W_i * 1.5;
+        E[i] = E_i * 1.5;
+    }
+}
+
+__global__
+static void vv10_fock_eval_omega_derivative_kernel(double* __restrict__ omega, double* domega_drho, double* domega_dgamma,
                                                    const double* __restrict__ rho, const double* __restrict__ gamma, const double C_factor,
                                                    const int ngrids)
 {
@@ -646,7 +1316,113 @@ static void vv10_hess_eval_D_B_in_double_grid_response_offdiagonal_kernel(double
     D_B[B_atom * 9 * ngrids + 8 * ngrids + i] = -(2 * 1.5) * D_B_i[8];
 }
 
+// Issue #10 candidate C1: runtime kernel selection for the VV10 UWE
+// evaluation. The reference 'warp1' kernel (one thread per i, one
+// 128-thread block per 128 i, j chunk staged once and shared by the
+// block's 128 i points) is the default and remains bit-for-bit the
+// historical path. 'warp4' routes to the multi-warp variant (one block
+// per i, four warps cooperating on each i's j-loop; 128x global read
+// amplification; kept from round 1, opt-in). 'tile8'/'tile16'/'tile32'
+// route to the multi-i tile kernel with I_TILE = 8/16/32 i points per
+// block (global read amplification 16x/8x/4x; per-pair fp64 arithmetic
+// identical to the reference, summation-order-only difference, see the
+// kernel comment). 'fp32' routes to the fp32-safe mixed-precision kernel
+// (LC-80: fp32 pair arithmetic with separate reciprocals; measured
+// dE <= 8.6e-10 Ha on wb97mv benzene/methanol -- see that kernel's
+// comment). NLC-KERNEL-OPT-01 (2026-11-04) adds the opt-in fp32safe tile
+// and identity combinations: 'fp32tile8|fp32tile16|fp32tile32' = the
+// multi-i tile block structure with the deployed fp32safe arithmetic
+// (codes 40/41/42); 'fp32d2' = the deployed warp1 structure with the
+// 2-division algebraic identity (code 43; arithmetic-only isolation of
+// the identity); 'fp32tile8d2|fp32tile16d2|fp32tile32d2' = tile structure
+// AND the identity together (codes 44/45/46); 'fp32t128' = the deployed
+// warp1 structure AND arithmetic through the new template, the port's
+// structure-equivalence control (code 47, diagnostic); 'fp64d2' = the
+// reference warp1 structure with the 2-division identity in double, the
+// fp64 twin of fp32d2 for the pure-precision pairing (code 48).  Every
+// pre-existing value keeps its exact frozen dispatch and kernel body.
+// Selection is a
+// process-lifetime decision read from GPU4PYSCF_VV10_UWE_KERNEL once;
+// anything unrecognized (including unset) keeps the reference kernel, and
+// an unknown non-empty value is reported and ignored rather than guessed.
+// Returns 0 = warp1, 1 = warp4, 2 = fp32-safe, the I_TILE of the selected
+// multi-i tile, 40..46 for the NLC-KERNEL-OPT-01 variants, 47 for the
+// fp32t128 control, or 48 for the fp64d2 twin.
+//
+// MR1 (mainline repair 2026-10-21): g_uwe_kernel_override, set through the
+// exported VV10_uwe_kernel_set_override below, is honored ahead of the
+// env-cached selection.  gpu4pyscf.dft.numint.strict_fp64_reference_ctx sets
+// it to 0 (the reference warp1 kernel) while a stability_verify strict
+// fp64-reference sibling SCF runs, so arming
+// GPU4PYSCF_VV10_UWE_KERNEL=fp32 in the candidate process cannot leak the
+// fp32 kernel into the reference trajectory.  -1 = no override (env-cached
+// behavior, the previous semantics).
+static int g_uwe_kernel_override = -1;
+
+static int vv10_uwe_kernel_variant()
+{
+    if (g_uwe_kernel_override >= 0) {
+        return g_uwe_kernel_override;
+    }
+    static int cached = -1;
+    if (cached < 0) {
+        const char* env = getenv("GPU4PYSCF_VV10_UWE_KERNEL");
+        if (env != nullptr && strcmp(env, "warp4") == 0) {
+            cached = 1;
+        } else if (env != nullptr && strcmp(env, "fp32") == 0) {
+            cached = 2;
+        } else if (env != nullptr && strcmp(env, "tile8") == 0) {
+            cached = 8;
+        } else if (env != nullptr && strcmp(env, "tile16") == 0) {
+            cached = 16;
+        } else if (env != nullptr && strcmp(env, "tile32") == 0) {
+            cached = 32;
+        } else if (env != nullptr && strcmp(env, "fp32tile8") == 0) {
+            cached = 40;
+        } else if (env != nullptr && strcmp(env, "fp32tile16") == 0) {
+            cached = 41;
+        } else if (env != nullptr && strcmp(env, "fp32tile32") == 0) {
+            cached = 42;
+        } else if (env != nullptr && strcmp(env, "fp32d2") == 0) {
+            cached = 43;
+        } else if (env != nullptr && strcmp(env, "fp32tile8d2") == 0) {
+            cached = 44;
+        } else if (env != nullptr && strcmp(env, "fp32tile16d2") == 0) {
+            cached = 45;
+        } else if (env != nullptr && strcmp(env, "fp32tile32d2") == 0) {
+            cached = 46;
+        } else if (env != nullptr && strcmp(env, "fp32t128") == 0) {
+            cached = 47;
+        } else if (env != nullptr && strcmp(env, "fp64d2") == 0) {
+            cached = 48;
+        } else {
+            if (env != nullptr && strlen(env) > 0 && strcmp(env, "warp1") != 0) {
+                fprintf(stderr, "vv10 UWE kernel selector: unknown value "
+                        "'%s' (expected warp1|warp4|fp32|tile8|tile16|"
+                        "tile32|fp32tile8|fp32tile16|fp32tile32|fp32d2|"
+                        "fp32tile8d2|fp32tile16d2|fp32tile32d2|fp32t128|"
+                        "fp64d2); "
+                        "using the reference warp1 kernel\n", env);
+            }
+            cached = 0;
+        }
+    }
+    return cached;
+}
+
 extern "C" {
+// MR1 (mainline repair 2026-10-21): strict fp64-reference kernel override.
+// Sets the UWE kernel selection override (0 = warp1 reference kernel) and
+// returns the previous override value (-1 = follow the env-cached
+// selection).  See g_uwe_kernel_override above.
+__host__
+int VV10_uwe_kernel_set_override(int variant)
+{
+    int prev = g_uwe_kernel_override;
+    g_uwe_kernel_override = variant;
+    return prev;
+}
+
 __host__
 int VXC_vv10nlc_fock_eval_UWE(const cudaStream_t stream,
                               double* U, double* W, double* E,
@@ -654,10 +1430,97 @@ int VXC_vv10nlc_fock_eval_UWE(const cudaStream_t stream,
                               const double* omega, const double* kappa,
                               const int ngrids)
 {
+    const int variant = vv10_uwe_kernel_variant();
     const dim3 threads(NG_PER_BLOCK);
-    const dim3 blocks((ngrids+NG_PER_BLOCK-1)/NG_PER_BLOCK);
-    vv10_fock_eval_UWE_kernel<<<blocks, threads, 0, stream>>>(U, W, E,
-                                                              grid_coord, rho_weight, omega, kappa, ngrids);
+    if (variant == 1) {
+        // warp4: one block per grid point; the j-loop inside is cooperative
+        const dim3 blocks(ngrids);
+        vv10_fock_eval_UWE_multiwarp_kernel<<<blocks, threads, 0, stream>>>(
+            U, W, E, grid_coord, rho_weight, omega, kappa, ngrids);
+    } else if (variant == 2) {
+        // fp32-safe mixed-precision kernel (LC-80): same warp1 structure,
+        // fp32 pair arithmetic; see the kernel comment for the measured
+        // numerical-safety structure and gate margins
+        const dim3 blocks((ngrids+NG_PER_BLOCK-1)/NG_PER_BLOCK);
+        vv10_fock_eval_UWE_fp32safe_kernel<<<blocks, threads, 0, stream>>>(
+            U, W, E, grid_coord, rho_weight, omega, kappa, ngrids);
+    } else if (variant == 8 || variant == 16 || variant == 32) {
+        // multi-i tile (fp64): one block per I_TILE grid points; the per-i
+        // reduction lives inside one warp (see kernel comment)
+        const dim3 blocks((ngrids + variant - 1) / variant);
+        if (variant == 8) {
+            vv10_fock_eval_UWE_multii_kernel<8><<<blocks, threads, 0, stream>>>(
+                U, W, E, grid_coord, rho_weight, omega, kappa, ngrids);
+        } else if (variant == 16) {
+            vv10_fock_eval_UWE_multii_kernel<16><<<blocks, threads, 0, stream>>>(
+                U, W, E, grid_coord, rho_weight, omega, kappa, ngrids);
+        } else {
+            vv10_fock_eval_UWE_multii_kernel<32><<<blocks, threads, 0, stream>>>(
+                U, W, E, grid_coord, rho_weight, omega, kappa, ngrids);
+        }
+    } else if (variant == 40) {
+        // NLC-KERNEL-OPT-01: fp32safe arithmetic x multi-i tile (H1)
+        const dim3 blocks((ngrids + 7) / 8);
+        vv10_fock_eval_UWE_fp32safe_multii_kernel<8, 3><<<blocks, threads, 0, stream>>>(
+            U, W, E, grid_coord, rho_weight, omega, kappa, ngrids);
+    } else if (variant == 41) {
+        const dim3 blocks((ngrids + 15) / 16);
+        vv10_fock_eval_UWE_fp32safe_multii_kernel<16, 3><<<blocks, threads, 0, stream>>>(
+            U, W, E, grid_coord, rho_weight, omega, kappa, ngrids);
+    } else if (variant == 42) {
+        const dim3 blocks((ngrids + 31) / 32);
+        vv10_fock_eval_UWE_fp32safe_multii_kernel<32, 3><<<blocks, threads, 0, stream>>>(
+            U, W, E, grid_coord, rho_weight, omega, kappa, ngrids);
+    } else if (variant == 43) {
+        // fp32d2: the deployed warp1 structure with the 2-division
+        // algebraic identity -- arithmetic-only isolation of H2
+        const dim3 blocks((ngrids+NG_PER_BLOCK-1)/NG_PER_BLOCK);
+        vv10_fock_eval_UWE_fp32safe_multii_kernel<128, 2><<<blocks, threads, 0, stream>>>(
+            U, W, E, grid_coord, rho_weight, omega, kappa, ngrids);
+    } else if (variant == 44) {
+        // tile structure AND the identity together (H1+H2)
+        const dim3 blocks((ngrids + 7) / 8);
+        vv10_fock_eval_UWE_fp32safe_multii_kernel<8, 2><<<blocks, threads, 0, stream>>>(
+            U, W, E, grid_coord, rho_weight, omega, kappa, ngrids);
+    } else if (variant == 45) {
+        const dim3 blocks((ngrids + 15) / 16);
+        vv10_fock_eval_UWE_fp32safe_multii_kernel<16, 2><<<blocks, threads, 0, stream>>>(
+            U, W, E, grid_coord, rho_weight, omega, kappa, ngrids);
+    } else if (variant == 46) {
+        const dim3 blocks((ngrids + 31) / 32);
+        vv10_fock_eval_UWE_fp32safe_multii_kernel<32, 2><<<blocks, threads, 0, stream>>>(
+            U, W, E, grid_coord, rho_weight, omega, kappa, ngrids);
+    } else if (variant == 47) {
+        // fp32t128: the deployed warp1 structure AND deployed arithmetic
+        // through the new template -- the structure-equivalence control
+        // for the port (diagnostic arm; expected to match the deployed
+        // fp32safe kernel to the fp32-scheduling noise level)
+        const dim3 blocks((ngrids+NG_PER_BLOCK-1)/NG_PER_BLOCK);
+        vv10_fock_eval_UWE_fp32safe_multii_kernel<128, 3><<<blocks, threads, 0, stream>>>(
+            U, W, E, grid_coord, rho_weight, omega, kappa, ngrids);
+    } else if (variant == 48) {
+        // fp64d2: the reference warp1 structure with the 2-division
+        // identity in double -- the fp64 twin of fp32d2 (pure-precision
+        // pairing anchor for the fixed-grid mixed-precision mainline;
+        // same warp1 launch geometry as the reference kernel)
+        const dim3 blocks((ngrids+NG_PER_BLOCK-1)/NG_PER_BLOCK);
+        vv10_fock_eval_UWE_fp64d2_kernel<<<blocks, threads, 0, stream>>>(
+            U, W, E, grid_coord, rho_weight, omega, kappa, ngrids);
+    } else if (variant == 0) {
+        const dim3 blocks((ngrids+NG_PER_BLOCK-1)/NG_PER_BLOCK);
+        vv10_fock_eval_UWE_kernel<<<blocks, threads, 0, stream>>>(
+            U, W, E, grid_coord, rho_weight, omega, kappa, ngrids);
+    } else {
+        // fail-closed (NLC-KERNEL-OPT-01): the frozen-parent dispatch
+        // silently launched tile32-fp64 for every variant code at or
+        // above 4 (an unknown override int would silently select a
+        // kernel).  Only exact known codes route; anything else is an
+        // error.  No existing caller passes values outside
+        // {-1, 0, 1, 2, 8, 16, 32} (grep-pinned).
+        fprintf(stderr, "vv10 UWE kernel launcher: unknown variant code %d "
+                        "(expected 0|1|2|8|16|32|40|41|42|43|44|45|46|47|48)\n", variant);
+        return 1;
+    }
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA Error of vv10 fock eval_UWE: %s\n", cudaGetErrorString(err));
