@@ -18,6 +18,7 @@
 
 import ctypes
 import math
+import os
 import numpy as np
 import cupy as cp
 import warnings
@@ -33,10 +34,11 @@ from gpu4pyscf.lib.cupy_helper import (
 from gpu4pyscf.lib.utils import splits_by_blocksize
 from gpu4pyscf.lib import multi_gpu
 from gpu4pyscf.gto.mole import (
-    PTR_BAS_COORD, SortedMole, RysIntEnvVars, extract_pgto_params, groupby)
+    PTR_BAS_COORD, SortedMole, RysIntEnvVars, extract_pgto_params, groupby,
+    _split_l_ctr_groups)
 from gpu4pyscf.scf.jk import (
-    _nearest_power2, _scale_sp_ctr_coeff, _cache_q_cond_and_non0pairs,
-    _check_rsh_factors, SHM_SIZE, libvhf_rys)
+    _nearest_power2, _scale_sp_ctr_coeff, _check_rsh_factors, SHM_SIZE,
+    libvhf_rys)
 from gpu4pyscf.__config__ import props as gpu_specs
 
 __all__ = [
@@ -51,6 +53,144 @@ POOL_SIZE = 25600
 
 libvhf_rys.pair_recontraction_info.restype = ctypes.c_int
 libvhf_rys.recontract_ao_pair.restype = ctypes.c_int
+
+# DF-GRAD-TASKGRAN-01 (Phase A, default off): opt-in port of the
+# upstream #970 (8475f60) host-side task-granularity mechanisms into
+# our diverged df machinery, per the entry-517 FUNDED disposition.
+# (a) the pair cap min(nsp*4, max(nsp//4, 16)) at the four
+#     aggregate_shl_pairs sites of this module
+#     (int3c2e_evaluator/contract_dm/contract_auxvec/
+#     _int3c2e_ip1_evaluator) and df/grad/rhf.py's ip1-sum-kernel site;
+# (b) the fixed <=16-shell aux subdivision of the J-only gradient
+#     ksh_offsets (df/grad/rhf.py _j_energy_per_atom, via
+#     _taskgran_aux16_offsets below; _split_l_ctr_groups is already
+#     ours at gto/mole.py);
+# (c) DF-GRAD-TASKGRAN-967-01, GPU4PYSCF_DF_TASKGRAN=2 additionally
+#     arms the upstream #967 uniform splits_by_blocksize re-split +
+#     multi-group launch count at the _int3c2e_ip1_evaluator fill
+#     machinery and df/grad/rhf.py's ip1 sum-kernel loop (see
+#     _taskgran_resplit_splits below).  The Int3c2eOpt.int3c2e_evaluator
+#     aux packing (upstream's bdiv:216 hunk) is a DISCLOSED NON-PORT of
+#     (c): it changes aux_offsets semantics for every aux_batch_size
+#     caller (uhf/tdrhf/hessian/mp/pbc) whose consumer loops this card
+#     does not port.
+# Long indivisible tasks (whole homogeneous aux groups, 4B/16B-pair
+# blocks) leave workers idle as a launch finishes; the smaller ranges
+# expose more independently schedulable work.  Armed differences are
+# launch-geometry only: the ip1/j3c atomicAdd interleaving class.  Our
+# VRAM-driven _split_l_ctr_pattern bounds (rhf.py:432 lineage, bdiv:746
+# whole-group reject) are untouched by every level.
+_TASKGRAN = None            # cached env value; None = not yet read
+_TASKGRAN_PAIRCAP_SETS = 0  # armed pair-cap geometries differing from verbatim
+_TASKGRAN_AUX16_SPLITS = 0  # armed 16-shell aux splits differing from verbatim
+_TASKGRAN_RESPLITS = 0      # armed #967 repacks differing from verbatim units
+
+def _taskgran():
+    '''The task-granularity level (opt-in, DF-GRAD-TASKGRAN-01/-967-01;
+    default off = verbatim).
+
+    GPU4PYSCF_DF_TASKGRAN=1 arms the #970 mechanisms (a)/(b); =2 arms
+    them plus the #967 uniform re-split (c); anything else keeps every
+    site's verbatim expression value-identical.
+    '''
+    global _TASKGRAN
+    if _TASKGRAN is None:
+        raw = os.environ.get('GPU4PYSCF_DF_TASKGRAN', '')
+        if raw == '1':
+            _TASKGRAN = 1
+        elif raw == '2':
+            _TASKGRAN = 2
+        elif raw in ('', '0'):
+            _TASKGRAN = 0
+        else:
+            warnings.warn(f'GPU4PYSCF_DF_TASKGRAN={raw!r} ignored; '
+                          'expected 1 (#970) or 2 (#970 + the #967 '
+                          'uniform re-split) to arm the task-granularity '
+                          'launch geometry or 0 (verbatim, the default)')
+            _TASKGRAN = 0
+    return _TASKGRAN
+
+def _taskgran_pair_batch(nsp0, mult):
+    '''(a) The #970 pair cap for one aggregate_shl_pairs site; returns
+    the npairs value the caller passes on.  nsp0 is the site's
+    ``nsp_per_block[0]`` -- the per-(li,lj) capacity table for s-type
+    aux (a 2-D ndarray at the gout_width sites; a scalar in unit use)
+    -- so the cap applies elementwise, exactly the shape class the
+    verbatim ``nsp0*mult`` expression and upstream #970 both pass.
+
+    Knob off (or the strict fp64-reference context active): the
+    verbatim ``nsp0*mult`` value with zero engagement.  Armed:
+    ``min(nsp0*4, max(nsp0//4, 16))`` elementwise (upstream #970); when
+    the capped table equals the verbatim one (e.g. all capacities 4 at
+    a 4x site) the geometry is identical and no engagement is counted,
+    so drivers can assert the counter exactly.  mult is the site's
+    verbatim multiplier -- 4 at the upstream-mirror sites, 16 at
+    contract_dm, which the card arms with the same 4B-based cap
+    (upstream leaves 16x sites raw; disclosed deviation, default off).
+    '''
+    from gpu4pyscf.dft import numint as _numint
+    if _taskgran() >= 1 and not _numint._strict_fp64_reference_active:
+        cap = np.minimum(nsp0*4, np.maximum(nsp0//4, 16))
+        if not np.array_equal(cap, nsp0*mult):
+            global _TASKGRAN_PAIRCAP_SETS
+            _TASKGRAN_PAIRCAP_SETS += 1
+            return cap
+    return nsp0*mult
+
+def _taskgran_aux16_offsets(auxmol, laux):
+    '''(b) The #970 fixed <=16-shell aux subdivision of the J-only
+    gradient ksh_offsets; returns the CPU offsets array.
+
+    Knob off / strict reference: the verbatim
+    ``np.append(0, np.cumsum(auxmol.l_ctr_counts))`` values.  Armed:
+    ``_split_l_ctr_groups(..., [16]*(laux+1))`` -- at most 16 shells
+    per task regardless of memory (a scheduling bound; the VRAM-driven
+    _split_l_ctr_pattern stays the memory bound on the hybrid route).
+    The engagement counter registers only real offset changes.
+    '''
+    from gpu4pyscf.dft import numint as _numint
+    raw = np.append(0, np.cumsum(auxmol.l_ctr_counts))
+    if _taskgran() >= 1 and not _numint._strict_fp64_reference_active:
+        _, aux_counts = _split_l_ctr_groups(
+            auxmol.uniq_l_ctr, auxmol.l_ctr_counts, [16]*(laux+1))
+        offsets = np.append(0, np.cumsum(aux_counts))
+        if len(offsets) != len(raw) or not np.array_equal(offsets, raw):
+            global _TASKGRAN_AUX16_SPLITS
+            _TASKGRAN_AUX16_SPLITS += 1
+        return offsets
+    return raw
+
+def _taskgran_resplit_active():
+    '''(c) Whether the #967 uniform re-split is armed for this call
+    (DF-GRAD-TASKGRAN-967-01; level >= 2 and not the strict
+    fp64-reference context).'''
+    from gpu4pyscf.dft import numint as _numint
+    return _taskgran() >= 2 and not _numint._strict_fp64_reference_active
+
+def _taskgran_resplit_splits(aux_offsets, batch_size):
+    '''(c) The #967 uniform splits_by_blocksize re-split of the launch
+    aux batches; returns the split-index list over aux_offsets.
+
+    Knob level < 2 (or the strict fp64-reference context active): the
+    verbatim one-group-per-launch units ``list(range(n+1))`` --
+    value-identical iteration.  Armed: consecutive aux groups are packed
+    up to batch_size functions per launch (upstream #967); every packed
+    unit spans whole groups (group boundaries and function ordering are
+    preserved), so when the input groups each span at most batch_size
+    functions -- the post-_split_l_ctr_pattern invariant at both armed
+    sites -- every packed unit also spans at most batch_size functions:
+    the VRAM admission bound of the verbatim one-group-per-launch
+    buffers cannot grow.  The engagement counter registers only real
+    unit-count changes.
+    '''
+    n_units = len(aux_offsets) - 1
+    if _taskgran_resplit_active():
+        splits = splits_by_blocksize(np.asarray(aux_offsets), batch_size)
+        if len(splits) - 1 != n_units:
+            global _TASKGRAN_RESPLITS
+            _TASKGRAN_RESPLITS += 1
+        return splits
+    return list(range(n_units + 1))
 
 def aux_e2(mol, auxmol, omega=None, lr_factor=None, sr_factor=None):
     r'''
@@ -114,6 +254,154 @@ def contract_int3c2e_auxvec(mol, auxmol, auxvec, sort_output=True,
         vj = int3c2e_opt.mol.apply_CT_mat_C(vj)
     return vj
 
+def _sort_pair_ij_order(ish0, nish, jsh0, njsh, nbas, tile=4):
+    '''Host reproduction of PBCsort_pair_ij's enumeration order
+    (lib/pbc/supmol_sr_estimator.cu: sort_pair_ij_kernel).  Returns
+    ish*nbas+jsh as int64 in the exact order the device kernel writes,
+    including partial i/j tiles; the tiled order is preserved so the
+    q-cond estimator input array stays bit-identical to the reference
+    assembly path.
+    '''
+    parts = []
+    for i_tile in range((nish + tile - 1) // tile):
+        nish_rem = min(tile, nish - i_tile * tile)
+        for j_tile in range((njsh + tile - 1) // tile):
+            njsh_rem = njsh - j_tile * tile
+            if njsh_rem >= tile:
+                seg = np.arange(nish_rem * tile)
+                ir, jr = seg // tile, seg - seg // tile * tile
+            else:
+                seg = np.arange(nish_rem * njsh_rem)
+                ir, jr = seg // njsh_rem, seg - seg // njsh_rem * njsh_rem
+            i = ish0 + i_tile * tile + ir
+            j = jsh0 + j_tile * tile + jr
+            parts.append(i.astype(np.int64) * nbas + j)
+    if not parts:
+        return np.empty(0, dtype=np.int64)
+    return np.concatenate(parts)
+
+def _screen_bas_pairs_qcond(mol, rys_envs, precision=1e-14, tile=4, tril=True):
+    '''Screened shell-pair lists for Int3c2eOpt.build: returns
+    {group_key: uint32 pair array} equivalent to
+    {k: v[0] for k, v in _cache_q_cond_and_non0pairs(...).items()}.
+
+    Int3c2eOpt.build re-sorts the pairs (cp.sort) and discards the
+    q-cond values, so the descending-q ordering _group_by_split_points
+    computes for the JK screening engines is wasted work here (measured
+    2026-10-06: 41-73 ms of a 60-102 ms build on consumer cells).  This
+    path keeps only the screening decision:
+
+    * pair assembly runs host-side in PBCsort_pair_ij's tiled order
+      (bit-identical input to the estimator kernel);
+    * the SAME int2e_qcond_estimator kernel is called with the same
+      scheme/omega factors as the reference;
+    * the keep predicate q_cond > log(precision) is exactly the
+      bin >= 1 subset _group_by_split_points retains
+      (cp.searchsorted(split_points, q, side='left') >= 1
+      <=> q > split_points[0] = log(precision)).
+
+    The result is the identical SET of surviving pairs per group; build
+    then sorts, so the cached arrays are bit-identical to the reference
+    path.
+    '''
+    from gpu4pyscf.pbc.gto import int1e
+    omega = mol.omega
+    ls = np.arange(LMAX+1)
+    li = ls[:,None]
+    lj = ls
+    lij = li + lj
+    nfi = (li + 1) * (li + 2) // 2
+    nfj = (lj + 1) * (lj + 2) // 2
+    nroots = lij + 1
+    if omega < 0:
+        nroots *= 2
+
+    SIZEOF_FLOAT = ctypes.sizeof(ctypes.c_float)
+    gout_width = 29
+    unit = (li+1)*(lj+1)*2 + (li+1)*(lj+1)*(lij+1) + 6 + nroots*2
+    shm_size = 1024 * 48 - 1024
+    nsp_max = _nearest_power2(shm_size // (unit*SIZEOF_FLOAT))
+    gout_size = nfi * nfj
+    gout_stride = (gout_size+gout_width-1) // gout_width
+    gout_stride = _nearest_power2(gout_stride, return_leq=False)
+    nsp_per_block = THREADS // gout_stride
+    nsp_per_block = np.where(nsp_per_block < nsp_max, nsp_per_block, nsp_max)
+    gout_stride = THREADS // nsp_per_block
+    gout_stride_dev = cp.asarray(gout_stride, dtype=np.int32)
+    shm_size = nsp_per_block * (unit*SIZEOF_FLOAT)
+    # (pp|pp) requires more shm than this estimation. 5888 is the required size
+    max_shm_size = max(shm_size.max(), 5888*SIZEOF_FLOAT)
+
+    l_ctr_offsets = np.append(0, np.cumsum(mol.l_ctr_counts))
+    nbas = mol.nbas
+    uniq_l = mol.uniq_l_ctr[:,0]
+    n_groups = np.count_nonzero(uniq_l <= LMAX)
+    if tril:
+        pair_keys = [(i, j) for i in range(n_groups) for j in range(i+1)]
+    else:
+        pair_keys = [(i, j) for i in range(n_groups) for j in range(n_groups)]
+
+    ovlp_mask = int1e._shell_overlap_mask(mol, precision=precision**2)
+    if tril:
+        ovlp_mask = cp.tril(ovlp_mask)
+    ovlp_mask = cp.asnumpy(ovlp_mask.ravel())
+
+    # Host-side pair assembly in the device kernel's tiled order; integer
+    # indices only, so the values are bit-identical to the elementwise
+    # device assembly.
+    parts = []
+    for i, j in pair_keys:
+        ish0, ish1 = l_ctr_offsets[i], l_ctr_offsets[i+1]
+        jsh0, jsh1 = l_ctr_offsets[j], l_ctr_offsets[j+1]
+        pij = _sort_pair_ij_order(ish0, ish1-ish0, jsh0, jsh1-jsh0, nbas, tile)
+        parts.append(pij[ovlp_mask[pij]])
+    if parts:
+        all_pairs = cp.asarray(np.concatenate(parts), dtype=np.uint32)
+    else:
+        all_pairs = cp.empty(0, dtype=np.uint32)
+    offsets = np.append(0, np.cumsum([len(p) for p in parts]))
+
+    q_out = None
+    if len(all_pairs) > 0:
+        shl_pair_offsets = []
+        sp0 = sp1 = 0
+        for (i, j), part in zip(pair_keys, parts):
+            sp0, sp1 = sp1, sp1 + len(part)
+            nspb = THREADS // int(gout_stride[uniq_l[i], uniq_l[j]]) * 8
+            shl_pair_offsets.append(np.arange(sp0, sp1, nspb, dtype=np.int32))
+        shl_pair_offsets.append(np.int32(sp1))
+        shl_pair_offsets = cp.asarray(np.hstack(shl_pair_offsets), dtype=np.int32)
+
+        lr_factor = sr_factor = 1
+        if omega < 0:
+            lr_factor = 0
+        if omega > 0:
+            sr_factor = 0
+        q_out = cp.empty(len(all_pairs), dtype=np.float32)
+        libvhf_rys.int2e_qcond_estimator.restype = ctypes.c_int
+        err = libvhf_rys.int2e_qcond_estimator(
+            ctypes.cast(q_out.data.ptr, ctypes.c_void_p),
+            ctypes.byref(rys_envs),
+            ctypes.c_int(max_shm_size),
+            ctypes.c_int(len(shl_pair_offsets) - 1),
+            ctypes.cast(all_pairs.data.ptr, ctypes.c_void_p),
+            ctypes.cast(shl_pair_offsets.data.ptr, ctypes.c_void_p),
+            ctypes.cast(gout_stride_dev.data.ptr, ctypes.c_void_p),
+            ctypes.c_double(omega),
+            ctypes.c_double(lr_factor),
+            ctypes.c_double(sr_factor))
+        if err != 0:
+            raise RuntimeError('int2e_qcond_estimator kernel failed')
+
+    threshold = math.log(precision)
+    bas_ij_cache = {}
+    for k, key in enumerate(pair_keys):
+        seg = all_pairs[offsets[k]:offsets[k+1]]
+        if q_out is not None and len(seg) > 0:
+            seg = seg[q_out[offsets[k]:offsets[k+1]] > threshold]
+        bas_ij_cache[key] = seg
+    return bas_ij_cache
+
 class Int3c2eOpt:
     def __init__(self, mol, auxmol):
         self.mol = mol
@@ -136,10 +424,10 @@ class Int3c2eOpt:
         self._int3c2e_envs = RysIntEnvVars.new(
             mol.natm, mol.nbas, _atm, _bas, _env, ao_loc)
 
-        bas_pair_cache = _cache_q_cond_and_non0pairs(
+        bas_pair_cache = _screen_bas_pairs_qcond(
             mol, self._int3c2e_envs, cutoff, tril=tril)
         self.bas_ij_cache = {
-            k: cp.sort(v[0]) for k, v in mol.iter_pair_by_l(bas_pair_cache)}
+            k: cp.sort(v) for k, v in mol.iter_pair_by_l(bas_pair_cache)}
         return self
 
     @property
@@ -175,7 +463,7 @@ class Int3c2eOpt:
             else:
                 bas_ij_cache = self.bas_ij_cache
             bas_ij_idx, shl_pair_offsets = mol.aggregate_shl_pairs(
-                bas_ij_cache, nsp_per_block[0]*4)
+                bas_ij_cache, _taskgran_pair_batch(nsp_per_block[0], 4))
             ao_pair_loc = get_ao_pair_loc(mol.uniq_l_ctr[:,0], bas_ij_cache, cart)
             nao_pair = ao_pair_loc[-1].get()
 
@@ -355,7 +643,7 @@ class Int3c2eOpt:
         laux = auxmol.uniq_l_ctr[:,0].max()
         shm_size_max = shm_size[:laux+1,:lmax+1,:lmax+1].max()
         bas_ij_idx, shl_pair_offsets = mol.aggregate_shl_pairs(
-            self.bas_ij_cache, nsp_per_block[0]*16)
+            self.bas_ij_cache, _taskgran_pair_batch(nsp_per_block[0], 16))
         gout_stride = cp.asarray(gout_stride, dtype=np.int32)
 
         int3c2e_envs = self.int3c2e_envs
@@ -406,7 +694,7 @@ class Int3c2eOpt:
         shm_size_max = shm_size[:laux+1,:lmax+1,:lmax+1].max()
         shm_size_max += dm_batch_size*nfk_max * sizeof_float64
         bas_ij_idx, shl_pair_offsets = mol.aggregate_shl_pairs(
-            self.bas_ij_cache, nsp_per_block[0]*4)
+            self.bas_ij_cache, _taskgran_pair_batch(nsp_per_block[0], 4))
         gout_stride = cp.asarray(gout_stride, dtype=np.int32)
 
         l_ctr_aux_offsets = np.append(0, np.cumsum(auxmol.l_ctr_counts))
@@ -788,7 +1076,7 @@ def _int3c2e_ip1_evaluator(int3c2e_opt, scheme, batch_size,
     shm_size_max = shm_size[:laux+1,:lmax+1,:lmax+1].max()
 
     bas_ij_idx, shl_pair_offsets = mol.aggregate_shl_pairs(
-        int3c2e_opt.bas_ij_cache, nsp_per_block[0]*4)
+        int3c2e_opt.bas_ij_cache, _taskgran_pair_batch(nsp_per_block[0], 4))
     ao_pair_loc = get_ao_pair_loc(mol.uniq_l_ctr[:,0], int3c2e_opt.bas_ij_cache)
     nao_pair = int(ao_pair_loc[-1].get())
 
@@ -811,7 +1099,12 @@ def _int3c2e_ip1_evaluator(int3c2e_opt, scheme, batch_size,
 
     ksh_offsets_cpu = l_ctr_aux_offsets
     ksh_offsets_gpu = cp.asarray(ksh_offsets_cpu+mol.nbas, dtype=np.int32)
-    aux_splits = range(len(ksh_offsets_cpu))
+    # DF-GRAD-TASKGRAN-967-01 (c): GPU4PYSCF_DF_TASKGRAN=2 packs
+    # consecutive aux groups up to batch_size functions per launch
+    # (upstream #967) instead of one group per launch; the kernel's
+    # group-count argument below carries the packed count.  Knob-off
+    # lanes iterate value-identically (aux_split1 - aux_split0 == 1).
+    aux_splits = _taskgran_resplit_splits(aux_loc[ksh_offsets_cpu], batch_size)
     aux_offsets = aux_loc[ksh_offsets_cpu[aux_splits]]
     kern = getattr(libvhf_rys, kern)
     int3c2e_envs = int3c2e_opt.int3c2e_envs
@@ -834,7 +1127,7 @@ def _int3c2e_ip1_evaluator(int3c2e_opt, scheme, batch_size,
             ctypes.c_double(lr_factor), ctypes.c_double(sr_factor),
             ctypes.c_int(shm_size_max),
             ctypes.c_int(len(shl_pair_offsets) - 1),
-            ctypes.c_int(1),
+            ctypes.c_int(aux_split1 - aux_split0),
             ctypes.cast(shl_pair_offsets.data.ptr, ctypes.c_void_p),
             ctypes.cast(bas_ij_idx.data.ptr, ctypes.c_void_p),
             ctypes.cast(ksh_offsets_gpu[aux_split0:].data.ptr, ctypes.c_void_p),
