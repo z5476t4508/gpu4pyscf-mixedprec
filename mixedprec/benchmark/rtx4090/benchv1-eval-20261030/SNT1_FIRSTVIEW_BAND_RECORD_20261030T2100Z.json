@@ -1,0 +1,73 @@
+{
+ "schema": "benchv1-snt1-firstview-band-record-v1",
+ "written_at_utc": "2026-10-30T20:58:17Z",
+ "session": "20261030T170617560740Z",
+ "first_view_by": "live session (chain printed compare rc=0 2026-10-30T20:56Z; this session opened snt1-compare.{json,md} immediately)",
+ "preregistration": "/data/work/gpu4pyscf-agent/state/long-chain/roadmap-3q-20261030-work/sentinel-preregistration.json (written 2026-10-30T06:56:53Z, BEFORE any SNT-1 output existed)",
+ "bands_applied_verbatim": {
+  "energy_hartree": {
+   "hybrid-gga": 1e-08,
+   "hybrid-mgga": 1e-08,
+   "vv10-nlc": 1e-06,
+   "d4-gcp": 1e-08
+  },
+  "gradient_max_eh_bohr": 1e-05
+ },
+ "per_cell": [
+  {
+   "tag": "uracil_b3lyp_def2-svp",
+   "class": "hybrid-gga",
+   "abs_dE": 5.15e-11,
+   "band_dE": 1e-08,
+   "dE_in_band": true,
+   "max_abs_dg": 2.361e-06,
+   "band_dg": 1e-05,
+   "dg_in_band": true,
+   "verdict": "IN-BAND"
+  },
+  {
+   "tag": "propranolol_m062x_def2-svp",
+   "class": "hybrid-mgga",
+   "abs_dE": 2.547e-11,
+   "band_dE": 1e-08,
+   "dE_in_band": true,
+   "max_abs_dg": 9.079e-07,
+   "band_dg": 1e-05,
+   "dg_in_band": true,
+   "verdict": "IN-BAND"
+  },
+  {
+   "tag": "adenine_wb97mv_def2-svp",
+   "class": "vv10-nlc",
+   "abs_dE": 1.824e-08,
+   "band_dE": 1e-06,
+   "dE_in_band": true,
+   "vv10_decomposition_followup": "NOT triggered (1.824e-08 < 4e-7 floor)",
+   "max_abs_dg": 7.651e-07,
+   "band_dg": 1e-05,
+   "dg_in_band": true,
+   "verdict": "IN-BAND"
+  },
+  {
+   "tag": "benzoic_acid_r2scan3c_def2-mtzvpp",
+   "class": "d4-gcp",
+   "abs_dE": 2.387e-12,
+   "band_dE": 1e-08,
+   "dE_in_band": true,
+   "max_abs_dg": 1.387e-06,
+   "band_dg": 1e-05,
+   "dg_in_band": true,
+   "verdict": "IN-BAND"
+  }
+ ],
+ "summary_verdict": "4/4 IN-BAND under the preregistered tier-2 bands; bands applied verbatim at first view, no value-derived adjustment",
+ "semantics": "tier-2 CPU-vs-GPU implementation agreement only; NEVER the 1e-6 Ha / 3e-5 Eh/Bohr matching-R mixed-precision gate; not project acceptance",
+ "exposure_caveat": "GPU strict-R rows for these cells existed on disk at band-derivation time (values not read then); if Codex rules the exposure disqualifying, these outputs are exploratory diagnostics and independent acceptance stays pending",
+ "raw_sources": {
+  "snt1_compare_json": "/data/results/gpu4pyscf-agent/tasks/issue-9/2026-10-30-benchv1-sentinels/snt1/snt1-compare.json",
+  "snt1_compare_md": "/data/results/gpu4pyscf-agent/tasks/issue-9/2026-10-30-benchv1-sentinels/snt1/snt1-compare.md",
+  "snt1_compare_json_sha256": "61ac68d6cd7347c2f5d7729c90fd678f467aeb41cf991c589d8aadc8fdfcfca0",
+  "snt1_compare_md_sha256": "5592870dc7ed19b4cb5d90f8c642464a8cf4764666a165b1eaec5d884cfe3f62"
+ },
+ "review_pending": true
+}
