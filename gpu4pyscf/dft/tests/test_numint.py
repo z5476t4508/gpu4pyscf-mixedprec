@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import unittest
 import numpy as np
 import cupy
@@ -253,10 +254,32 @@ H   1.7   -2.0   0.4''',
             ao_loc = opt._sorted_mol.ao_loc
             ngrids = grids.size
             dat = grids.get_non0ao_idx(opt)
-            assert lib.fp(cupy.hstack([x[1] for x in dat]).get()) == 103.60117204957997
-            assert lib.fp(cupy.hstack([x[2] for x in dat]).get()) == 5.616197331343498
-            assert lib.fp(cupy.hstack([x[3] for x in dat]).get()) == -22.394314323727
-            assert lib.fp(cupy.hstack([x[4] for x in dat]).get()) == 351.2385939586691
+            # SPARSEIDX-CHECKSUM-REPAIR-01 (2026-11-12): the four original
+            # lib.fp pins (BLAS dot reductions recorded under upstream CI
+            # numpy at import 0a4cf33) fail deterministically in this
+            # environment at <=3e-13 -- a float64 reduction-order artifact,
+            # not a content change (the per-block sizes match the pinned
+            # list below exactly, and the _sparse_index reference at the
+            # end of this test is np.array_equal on every block).  The
+            # exact asserts aborted the test BEFORE those content checks,
+            # leaving zero sparse-index invariant coverage since LC-201
+            # (the documented SV-1 fingerprint).  Repair: pin the
+            # deterministic math.fsum checksum (exactly-rounded,
+            # order/BLAS-independent) and keep the original upstream pins
+            # as continuity bands (1e-9 is six orders below any
+            # index-content change ~O(0.1-1) per entry).
+            def fp_exact(arr):
+                weights = np.cos(np.arange(arr.size))
+                return math.fsum((weights * arr.astype(np.float64)).tolist())
+
+            hstacked = [cupy.hstack([x[k] for x in dat]).get() for k in (1, 2, 3, 4)]
+            new_pins = [103.6011720495799, 5.616197331343466,
+                        -22.39431432372699, 351.2385939586691]
+            old_pins = [103.60117204957997, 5.616197331343498,
+                        -22.394314323727, 351.2385939586691]
+            for arr, new_pin, old_pin in zip(hstacked, new_pins, old_pins):
+                assert fp_exact(arr) == new_pin
+                assert abs(lib.fp(arr) - old_pin) < 1e-9
             assert [i.size for x in dat for i in x[1:]] == [
                 46, 18, 9, 19, 50, 20, 9, 21, 28, 12, 9, 13, 49, 19, 9, 20, 45, 17,
                 9, 18, 45, 17, 9, 18, 45, 17, 9, 18, 45, 17, 9, 18, 50, 20, 9, 21,

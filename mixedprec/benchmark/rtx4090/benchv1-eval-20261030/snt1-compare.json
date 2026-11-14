@@ -1,0 +1,43 @@
+{
+ "schema": "benchv1-snt1-compare-v1",
+ "tier": 2,
+ "meaning": "implementation agreement (CPU PySCF FP64 vs GPU strict R); NOT the mixed-precision gate; band recorded at first view",
+ "cells": [
+  {
+   "tag": "uracil_b3lyp_def2-svp",
+   "e_cpu": -414.5174991558577,
+   "e_gpu_strict_r": -414.5174991559092,
+   "abs_dE": 5.150013748789206e-11,
+   "max_abs_dg": 2.3607814494397417e-06,
+   "cpu_repeats": 3,
+   "gpu_converged": true
+  },
+  {
+   "tag": "propranolol_m062x_def2-svp",
+   "e_cpu": -826.5536539680081,
+   "e_gpu_strict_r": -826.5536539679827,
+   "abs_dE": 2.546585164964199e-11,
+   "max_abs_dg": 9.078808664853e-07,
+   "cpu_repeats": 3,
+   "gpu_converged": true
+  },
+  {
+   "tag": "adenine_wb97mv_def2-svp",
+   "e_cpu": -466.81906830434895,
+   "e_gpu_strict_r": -466.8190682861097,
+   "abs_dE": 1.8239234123029746e-08,
+   "max_abs_dg": 7.651204043668258e-07,
+   "cpu_repeats": 3,
+   "gpu_converged": true
+  },
+  {
+   "tag": "benzoic_acid_r2scan3c_def2-mtzvpp",
+   "e_cpu": -420.74086380600386,
+   "e_gpu_strict_r": -420.74086380600147,
+   "abs_dE": 2.3874235921539366e-12,
+   "max_abs_dg": 1.3868343598510968e-06,
+   "cpu_repeats": 3,
+   "gpu_converged": true
+  }
+ ]
+}

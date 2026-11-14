@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import ctypes
+import os
 import numpy as np
 import cupy as cp
 from cupyx.scipy.linalg import solve_triangular
@@ -25,12 +26,325 @@ from gpu4pyscf.grad import rhf as rhf_grad
 from gpu4pyscf.df.int3c2e_bdiv import (
     _split_l_ctr_pattern, argsort_aux, get_ao_pair_loc,
     int2c2e_ip1_per_atom, int3c2e_scheme,
+    _taskgran_pair_batch, _taskgran_aux16_offsets,
+    _taskgran_resplit_active, _taskgran_resplit_splits,
+    _molecular_int3c2e_opt,
     SHM_SIZE, LMAX, L_AUX_MAX, THREADS, libvhf_rys, Int3c2eOpt, int2c2e)
 from gpu4pyscf.df import df
 from gpu4pyscf.df.df_jk import factorize_dm, _DFHF
 from gpu4pyscf.gto.mole import SortedMole
 
 __all__ = ['Gradients']
+
+# LC-42: opt-in fused launch of the sum_ejk_int3c2e_ip1 kernel on the J+K
+# (hybrid-functional) gradient path.  The default path serializes one
+# kernel launch per aux l-batch (grid (n_shell_pair_blocks, 1), 1 block/SM
+# at ~95 KB shared memory -> 16-28% SM occupancy on the 128-SM RTX 4090;
+# measured 8-12 sequential launches per gradient, 17-40% of the fp64
+# gradient phase at 43-222 AO).  The kernel's launcher has always accepted
+# a 2D grid; the J-only path (_j_energy_per_atom) has used it in
+# production since upstream.  Fusing the existing batch boundaries into
+# one launch does not change any block's arithmetic or memory addressing:
+# each y-block computes exactly what its per-batch launch computed (same
+# shl_pair x, same ksh_offsets slice relative to its own start, same
+# compressed columns, same atomicAdd order per block), so the result
+# differs from the per-batch path only by the atomic interleaving order
+# across blocks (the same nondeterminism class as any occupancy change;
+# the per-batch path itself is not deterministic across runs at the last
+# bits).  Sub-batch y-chunking was rejected by static analysis: the
+# exchange branch indexes the compressed buffer as
+# dm[pair_offset*naux + k0 + k*nksh] with nksh = ksh1-ksh0, i.e. the
+# column layout of the batch is interleaved by y-block shell count --
+# changing block boundaries inside a batch would read wrong columns.
+_IP1_FUSED = None   # cached env value; None = not yet read
+
+def _ip1_fused():
+    '''Whether to fuse the per-batch sum_ejk_int3c2e_ip1 launches (opt-in).
+
+    GPU4PYSCF_DF_IP1_FUSED=1 enables the fused launch when the full-width
+    compressed buffer fits the memory guard; anything else keeps the
+    upstream per-batch path byte-for-byte.
+    '''
+    global _IP1_FUSED
+    if _IP1_FUSED is None:
+        raw = os.environ.get('GPU4PYSCF_DF_IP1_FUSED', '')
+        if raw == '1':
+            _IP1_FUSED = True
+        elif raw:
+            import warnings
+            warnings.warn(f'GPU4PYSCF_DF_IP1_FUSED={raw!r} ignored; '
+                          'expected 1 to enable the fused ip1 launch')
+            _IP1_FUSED = False
+        else:
+            _IP1_FUSED = False
+    return _IP1_FUSED
+
+_IP1_F32 = None     # cached env value; None = not yet read
+
+def _ip1_f32():
+    '''Whether to run the ip1 integral kernel in float32 on the fp64 lane
+    (opt-in precision-policy prototype, LC-86).
+
+    GPU4PYSCF_DF_IP1_F32=1 selects sum_ejk_int3c2e_ip1_f32 for the DF
+    gradient ip1 kernel regardless of the global precision mode.  The
+    existing fp32 discipline is preserved exactly: only the integral
+    kernel and its pseudo-DM/dm+auxvec inputs go float32; the j3c@dm
+    contractions, the j2c metric solve and the atomic ejk/ejk_aux
+    accumulation targets stay float64 (the metric solve amplifies
+    float32 relative error by the auxiliary-basis condition number
+    straight into the gradient).  On lanes that already run the gradient
+    in fp32 (the resolved 'auto' policy) this is a no-op.
+    '''
+    global _IP1_F32
+    if _IP1_F32 is None:
+        raw = os.environ.get('GPU4PYSCF_DF_IP1_F32', '')
+        if raw == '1':
+            _IP1_F32 = True
+        elif raw:
+            import warnings
+            warnings.warn(f'GPU4PYSCF_DF_IP1_F32={raw!r} ignored; '
+                          'expected 1 to enable the fp32 ip1 kernel')
+            _IP1_F32 = False
+        else:
+            _IP1_F32 = False
+    return _IP1_F32
+
+_RESP_F32 = None     # cached env value; None = not yet read
+_RESP_F32_CALLS = 0  # armed response-f32 grad engagements (evidence counter)
+
+def _resp_f32():
+    '''Whether to run the phase-2 response contractions of the DF-gradient
+    J+K pseudo-DM build in float32 (opt-in precision-policy prototype,
+    DFJK-RESPGEMM-IMPL-01; BENCH-03 V1 basis, entry 368: 19.92x/28.83x
+    per-chain at the 819/1042 cells, operand numerics 4.6e-7/5.3e-7).
+
+    GPU4PYSCF_DFGRAD_RESP_F32=1 casts the response-chain operands (dm_oo,
+    dm_factor_l/r) to float32 ONCE per gradient call and runs the two
+    phase-2 contractions -- the transform and back-transform feeding the
+    ip1 pseudo-DM tensor -- in float32 buffers.  Phase-1 (the j3c@dm_factor
+    loop), the j2c metric solve, the J-part elementwise build and the
+    auxbasis-response contraction keep the deployed float64 discipline
+    verbatim (see the amplification note at the top of _jk_energy_per_atom;
+    the metric solve amplifies float32 relative error by the
+    auxiliary-basis condition number straight into the gradient).  dm_oo
+    itself stays float64 for the auxresp contraction; only the fp32 twin
+    is added.  On the float64 kernel lane the fp32 pseudo-DM tensor is
+    reassembled to float64 before the pair compression, so the compressed
+    buffer and the ip1 kernel keep their exact dtypes; on the fp32 kernel
+    lane (global fp32 mode or GPU4PYSCF_DF_IP1_F32=1) the fp32 dm_tensor
+    feeds the kernel directly and the redundant cast is skipped.
+    Default OFF.  The strict fp64-reference context
+    (numint.strict_fp64_reference_ctx) forces the knob inert.
+    '''
+    global _RESP_F32
+    if _RESP_F32 is None:
+        raw = os.environ.get('GPU4PYSCF_DFGRAD_RESP_F32', '')
+        if raw == '1':
+            _RESP_F32 = True
+        elif raw in ('', '0'):
+            _RESP_F32 = False
+        else:
+            import warnings
+            warnings.warn(f'GPU4PYSCF_DFGRAD_RESP_F32={raw!r} ignored; '
+                          'expected 1 to enable the fp32 response chain '
+                          'or 0 (fp64 everywhere, the default)')
+            _RESP_F32 = False
+    return _RESP_F32
+
+def _strict_fp64_reference_active():
+    '''Whether the current call runs under the strict fp64-reference
+    context (dft.numint.strict_fp64_reference_ctx, armed by
+    stability_verify around its exact-fp64 sibling trajectories).  The
+    response-f32 knob stays inert there: the sibling must reproduce the
+    plain DEFAULT-lane solution.  Lazy import so df.grad does not pay
+    the dft import at module load; attribute read at call time (the
+    flag flips inside the context manager).'''
+    from gpu4pyscf.dft import numint as _numint
+    return bool(_numint._strict_fp64_reference_active)
+
+def _arm_resp_f32(dm_oo, dm_factor_l, dm_factor_r):
+    '''DFJK-RESPGEMM-IMPL-01 armed-path operand staging, shared by the
+    RHF and UHF gradient twins.  Bumps the engagement counter and returns
+    the one-time fp32 operand casts (l/r aliased when the factor arrays
+    are the same object, mirroring _factorize_dm's hermi=1 aliasing).
+    Returns (None, None, None) when the knob is off or the strict
+    fp64-reference context is active -- the caller's resp32 flag is
+    simply ``dm_oo32 is not None``.'''
+    if not (_resp_f32() and not _strict_fp64_reference_active()):
+        return None, None, None
+    global _RESP_F32_CALLS
+    _RESP_F32_CALLS += 1
+    dm_factor_l32 = dm_factor_l.astype(cp.float32)
+    dm_factor_r32 = (dm_factor_l32 if dm_factor_l is dm_factor_r
+                     else dm_factor_r.astype(cp.float32))
+    dm_oo32 = dm_oo.astype(cp.float32)
+    return dm_oo32, dm_factor_l32, dm_factor_r32
+
+_J3C_REUSE = None     # cached env value; None = not yet read
+_J3C_REUSE_GRADS = 0  # armed cderi-reuse gradient engagements (evidence counter)
+_J3C_REUSE_JONLY_GRADS = 0  # armed pure-functional (k_factor==0) engagements
+
+def _note_j3c_reuse_engaged():
+    '''Bump the engagement counter from either the RHF or the UHF twin
+    (a ``global`` statement in uhf.py would touch uhf's namespace, not
+    this counter).'''
+    global _J3C_REUSE_GRADS
+    _J3C_REUSE_GRADS += 1
+
+def _note_j3c_reuse_jonly_engaged():
+    '''Bump the J-only-route engagement counter from either the RHF lane
+    or a future UHF twin (same home-module pattern as
+    _note_j3c_reuse_engaged: a ``global`` in uhf.py would fork the
+    counter into uhf's namespace).'''
+    global _J3C_REUSE_JONLY_GRADS
+    _J3C_REUSE_JONLY_GRADS += 1
+
+def _j3c_reuse():
+    '''Whether the DF-gradient K-chain may consume the SCF-built cderi
+    instead of re-evaluating fp64 j3c blocks (opt-in, GRAD-J3C-REUSE-01;
+    at pure functionals the armed pack also serves the J-only route,
+    GRAD-J3C-REUSE-JONLY-01: k_factor == 0 falls through to the joint
+    machinery instead of re-evaluating contract_dm + the j2c metric).
+
+    GPU4PYSCF_DF_GRAD_J3C_REUSE=1 keeps the with_df cderi (and its retained
+    aux-side j2c^{-1/2} factor, DF._cderi_aux_coef) alive across the
+    SCF->gradient phase boundary and rebuilds the pseudo-DM as
+    dm_oo = (dm_factor_l . cderi . dm_factor_r) . aux_coef^T -- the exact
+    associativity of the deployed chain's j3c-eval + j2c-metric route
+    (differences are only the _decompose_j2c discarded subspace and fp64
+    reassociation rounding).  This removes the per-batch plain-j3c Rys
+    re-evaluation (the measured fill3c member) and the fresh j2c build +
+    metric solve from the gradient.  The verbatim path runs whenever the
+    knob is off, the cderi is absent/host-resident, shapes disagree, or
+    retention would break the free-memory headroom; strict fp64-reference
+    lanes never arm.  Default OFF.
+    '''
+    global _J3C_REUSE
+    if _J3C_REUSE is None:
+        raw = os.environ.get('GPU4PYSCF_DF_GRAD_J3C_REUSE', '')
+        if raw == '1':
+            _J3C_REUSE = True
+        elif raw in ('', '0'):
+            _J3C_REUSE = False
+        else:
+            import warnings
+            warnings.warn(f'GPU4PYSCF_DF_GRAD_J3C_REUSE={raw!r} ignored; '
+                          'expected 1 to enable cderi reuse in the DF '
+                          'gradient or 0 (re-evaluate j3c, the default)')
+            _J3C_REUSE = False
+    return _J3C_REUSE
+
+_P1_F32 = None       # cached env value; None = not yet read
+_P1_F32_GRADS = 0    # armed phase-1-f32 grad engagements (evidence counter)
+
+def _note_p1_f32_engaged():
+    '''Bump the phase-1-f32 engagement counter from either the RHF lane or
+    a future UHF twin (same home-module pattern as
+    _note_j3c_reuse_engaged: a ``global`` in uhf.py would fork the
+    counter into uhf's namespace).'''
+    global _P1_F32_GRADS
+    _P1_F32_GRADS += 1
+
+def _p1_f32():
+    '''Whether the phase-1 j3c@dm_factor contractions of the reuse-armed
+    DF-gradient K-chain may run in float32 (opt-in precision-policy
+    prototype, GRAD-P1F32-01).
+
+    GPU4PYSCF_DFGRAD_P1_F32=1 casts the phase-1 operands and buffers --
+    the dense symmetric scatter destination, the two per-block GEMMs and
+    the X buffer -- to float32 ONCE per pack (the scatter converts
+    in-kernel from the retained fp64 cderi; the dm factors cast once per
+    gradient call); X is cast back to float64 before the aux_coef
+    einsum, which keeps float64, as does everything downstream (the
+    response chain, the J-part build, the ip1 kernel and the
+    auxbasis-response contraction are the armed parent's verbatim).
+
+    Discipline distinction: the float64 phase-1 + metric-solve note at
+    the top of _jk_energy_per_atom binds the VERBATIM path, where the
+    j2c^-1 metric solve amplifies float32 j3c rounding by the
+    auxiliary-basis condition number straight into the gradient.  The
+    reuse-armed path this knob composes with has NO metric solve:
+    dm_oo = aux_coef @ X applies the j2c^{-1/2} factor (sqrt of the
+    condition number), and the downstream float32 tolerance is the
+    deployed resp32 precedent (GPU4PYSCF_DFGRAD_RESP_F32, entry 369:
+    dg 4.6e-7/3.5e-7 Eh/Bohr at the band).  The verbatim path is
+    therefore never touched: the knob is inert -- warn + ignore --
+    whenever the reuse pack is absent, and the strict fp64-reference
+    context forces it inert.  RKS/RHF lane only; a UKS twin is a
+    successor unit.  Default OFF.
+    '''
+    global _P1_F32
+    if _P1_F32 is None:
+        raw = os.environ.get('GPU4PYSCF_DFGRAD_P1_F32', '')
+        if raw == '1':
+            _P1_F32 = True
+        elif raw in ('', '0'):
+            _P1_F32 = False
+        else:
+            import warnings
+            warnings.warn(f'GPU4PYSCF_DFGRAD_P1_F32={raw!r} ignored; '
+                          'expected 1 to enable the fp32 phase-1 lane on '
+                          'the cderi-reuse path or 0 (fp64, the default)')
+            _P1_F32 = False
+    return _P1_F32
+
+def _capture_grad_j3c_reuse(mf, omega):
+    '''Collect the retained-cderi reuse pack from mf.with_df, or None.
+
+    The SR (omega None/0) pack comes from with_df itself; a range-separated
+    pack lives on the per-omega RSH-DF object created by DF.range_coulomb
+    (the same object whose lazy first-use build the SCF already paid for).
+    Returns (cderi_device_array (nF, nao_pair), pair_addresses (original
+    AO order, matching cderi rows), aux_coef (sorted-aux rows x nF),
+    nao_original) or None with a debug reason when any precondition fails.
+    '''
+    wdf = getattr(mf, 'with_df', None)
+    if wdf is None:
+        return None
+    holder = wdf
+    if omega is not None and omega != 0:
+        holder = wdf._rsh_df.get('%.6f' % omega)
+        if holder is None:
+            logger.debug1(mf.mol, 'j3c-reuse inert: no RSH-DF object for '
+                          'omega=%s', omega)
+            return None
+    cderi_store = getattr(holder, '_cderi', None)
+    aux_coef = getattr(holder, '_cderi_aux_coef', None)
+    cderi_idx = getattr(holder, '_cderi_idx', None)
+    if (cderi_store is None or aux_coef is None or cderi_idx is None):
+        logger.debug1(mf.mol, 'j3c-reuse inert: cderi/aux_coef not retained')
+        return None
+    cderi = cderi_store[0] if isinstance(cderi_store, (list, tuple)) \
+        else cderi_store
+    # only the on-GPU store is in scope; the host-mapped build stays verbatim
+    if not isinstance(cderi, cp.ndarray) or cderi.ndim != 2:
+        logger.debug1(mf.mol, 'j3c-reuse inert: cderi not on device')
+        return None
+    # fp32-stored cderi (global fp32 cderi mode) is out of scope: the same
+    # metric-amplification discipline that keeps the verbatim chain fp64
+    if cderi.dtype != cp.float64 or aux_coef.dtype != cp.float64:
+        logger.debug1(mf.mol, 'j3c-reuse inert: non-fp64 cderi/aux_coef')
+        return None
+    pair_addresses = cderi_idx[0]
+    if cderi.shape[1] != len(pair_addresses):
+        logger.debug1(mf.mol, 'j3c-reuse inert: cderi/pair shape mismatch')
+        return None
+    if aux_coef.ndim != 2 or aux_coef.shape[1] != cderi.shape[0]:
+        logger.debug1(mf.mol, 'j3c-reuse inert: aux_coef/F mismatch')
+        return None
+    nao = mf.mol.nao
+    if int(pair_addresses.max()) >= nao * nao:
+        logger.debug1(mf.mol, 'j3c-reuse inert: pair addresses exceed nao^2')
+        return None
+    # admission: keeping the (already resident) cderi allocated must leave
+    # as much free memory as releasing it would, plus the standing headroom
+    # policy; else release and take the verbatim path.
+    free = get_avail_mem(exclude_memory_pool=True)
+    if free < cderi.nbytes + 2048 * 2**20:
+        logger.debug1(mf.mol, 'j3c-reuse inert: free %.0f MiB < cderi %.0f '
+                      'MiB + headroom', free / 2**20, cderi.nbytes / 2**20)
+        return None
+    return cderi, pair_addresses, aux_coef, nao
 
 def _gen_metric_solver(int2c, decompose_j2c='CD', lindep=df.LINEAR_DEP_THR):
     ''' generate a solver to solve Ax = b, RHS must be in (n,....) '''
@@ -59,17 +373,43 @@ def _gen_metric_solver(int2c, decompose_j2c='CD', lindep=df.LINEAR_DEP_THR):
 
 def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, hermi=0,
                         auxbasis_response=True, verbose=None,
-                        omega=None, lr_factor=None, sr_factor=None):
+                        omega=None, lr_factor=None, sr_factor=None,
+                        j3c_reuse=None):
     '''
     Computes the first-order derivatives of the energy contributions from
     J and K terms per atom.
+
+    j3c_reuse (GRAD-J3C-REUSE-01, opt-in): a pack from
+    _capture_grad_j3c_reuse -- (cderi (nF, nao_pair, original-AO pair
+    rows), pair_addresses, aux_coef (sorted-aux x nF), nao_original) --
+    rebuilds dm_oo as (dm_factor_l . cderi . dm_factor_r) . aux_coef^T,
+    the exact associativity of the verbatim j3c-evaluation + j2c-metric
+    route (differences: the _decompose_j2c discarded subspace + fp64
+    reassociation rounding only).  None everywhere by default.
     '''
     if hermi == 2:
         j_factor = 0
     if k_factor == 0:
         assert omega is None or omega == 0
-        return _j_energy_per_atom(int3c2e_opt, dm, hermi, auxbasis_response,
-                                  verbose) * j_factor
+        if j3c_reuse is None or j_factor == 0:
+            return _j_energy_per_atom(int3c2e_opt, dm, hermi,
+                                      auxbasis_response, verbose) * j_factor
+        # GRAD-J3C-REUSE-JONLY-01 armed pure-functional route: with the pack
+        # retained, k_factor == 0 falls through to the joint machinery below,
+        # where every exchange contribution is identically zero (the
+        # -.5*k_factor scales and the response-chain alpha) and the J
+        # derivative is computed through the same production-verified pack
+        # construction hybrids use, replacing the J-only re-evaluation of
+        # the 3c stream (contract_dm) + fresh j2c build + metric solve.
+        # The k_factor==0 joint math equals the J-only math up to the shared
+        # metric-route reassociation (measured 5.4e-13 Eh/Bohr max|dg| at
+        # the 63-AO probe cell); at small cells the pack construction can
+        # exceed the verbatim cost (0.17 vs 0.13 s/call at 63 AO), so the
+        # knob stays opt-in with the unchanged capture/admission guards.
+        # Pack capture upstream already refuses the strict fp64-reference
+        # context, non-fp64 or host-resident cderi, shape mismatches and
+        # VRAM-admission failures; those all keep the verbatim early return.
+        _note_j3c_reuse_jonly_engaged()
 
     if j_factor != 0 and (omega is not None and omega != 0):
         raise RuntimeError(
@@ -98,7 +438,17 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, hermi=0,
         omega=omega, lr_factor=lr_factor, sr_factor=sr_factor)
     aux_batches = len(aux_offsets) - 1
 
-    blksize = max(1, min(naux, int(mem_avail*.4/(nao*nao*2*8))//8*8))
+    # DF-GRAD-TASKGRAN-967-01 (c): GPU4PYSCF_DF_TASKGRAN=2 caps the
+    # launch capacity at the evaluator's largest aux batch (upstream
+    # #967 -- the same cap our df/hessian sites already carry) and
+    # bounds the blksize/scratch tensors by that capacity; knob-off
+    # lanes keep the verbatim expressions value-identically.
+    resplit = _taskgran_resplit_active()
+    if resplit:
+        batch_size = min(batch_size, int((aux_offsets[1:]-aux_offsets[:-1]).max()))
+
+    blksize = max(1, min(batch_size if resplit else naux,
+                         int(mem_avail*.4/(nao*nao*2*8))//8*8))
     log.debug1('%.3f GB free memory. nao_pair=%d naux=%d batch_size=%d blksize=%d',
                mem_free*1e-9, nao_pair, naux, batch_size, blksize)
 
@@ -108,37 +458,106 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, hermi=0,
     # errors of the j3c blocks (~1e-7 in float32) by the auxiliary-basis
     # condition number, which lands around 1e-3 in the final gradient -
     # far above the ~1e-5 obtained from the integral kernel alone.
-    j3c_full = cp.zeros((nao, nao, blksize))
-    buf = cp.empty((batch_size, nao_pair))
-    buf1 = cp.empty((blksize, nocc, nao))
-    j3c_oo = cp.empty((naux, nocc, nocc))
-    for kbatch in range(aux_batches):
-        compressed = eval_j3c(aux_batch_id=kbatch, out=buf)
-        naux_in_batch = compressed.shape[1]
-        for k0, k1 in lib.prange(0, naux_in_batch, blksize):
-            dk = k1 - k0
-            aux0, aux1 = aux1, aux1 + dk
-            j3c = j3c_full[:,:,:dk]
-            j3c[j_addr,i_addr] = j3c[i_addr,j_addr] = compressed[:,k0:k1]
-            tmp = ndarray((nocc, nao, dk), buffer=buf1)
-            contract('pqr,pi->iqr', j3c, dm_factor_r, out=tmp)
-            contract('iqr,qj->rij', tmp, dm_factor_l, out=j3c_oo[aux0:aux1])
-    j3c_full = buf = buf1 = eval_j3c = j3c = tmp = compressed = None
-    t0 = log.timer_debug1('contract dm', *t0)
+    if j3c_reuse is None:
+        if _p1_f32() and not _strict_fp64_reference_active():
+            # GRAD-P1F32-01 value-only knob: no armed pack to compose with
+            import warnings
+            warnings.warn('GPU4PYSCF_DFGRAD_P1_F32=1 ignored: the fp32 '
+                          'phase-1 lane requires GPU4PYSCF_DF_GRAD_J3C_REUSE'
+                          '=1 with an armed cderi pack; running the fp64 '
+                          'phase-1 verbatim')
+        j3c_full = cp.zeros((nao, nao, blksize))
+        buf = cp.empty((batch_size, nao_pair))
+        buf1 = cp.empty((blksize, nocc, nao))
+        j3c_oo = cp.empty((naux, nocc, nocc))
+        for kbatch in range(aux_batches):
+            compressed = eval_j3c(aux_batch_id=kbatch, out=buf)
+            naux_in_batch = compressed.shape[1]
+            for k0, k1 in lib.prange(0, naux_in_batch, blksize):
+                dk = k1 - k0
+                aux0, aux1 = aux1, aux1 + dk
+                j3c = j3c_full[:,:,:dk]
+                j3c[j_addr,i_addr] = j3c[i_addr,j_addr] = compressed[:,k0:k1]
+                tmp = ndarray((nocc, nao, dk), buffer=buf1)
+                contract('pqr,pi->iqr', j3c, dm_factor_r, out=tmp)
+                contract('iqr,qj->rij', tmp, dm_factor_l, out=j3c_oo[aux0:aux1])
+        j3c_full = buf = buf1 = eval_j3c = j3c = tmp = compressed = None
+        t0 = log.timer_debug1('contract dm', *t0)
 
-    aux_coeff = cp.asarray(auxmol.ctr_coeff)
-    aux_coeff, tmp = cp.empty_like(aux_coeff), aux_coeff
-    aux_coeff[aux_sorting] = tmp
-    tmp = None
+        aux_coeff = cp.asarray(auxmol.ctr_coeff)
+        aux_coeff, tmp = cp.empty_like(aux_coeff), aux_coeff
+        aux_coeff[aux_sorting] = tmp
+        tmp = None
 
-    j2c = int2c2e(auxmol, omega=omega, lr_factor=lr_factor, sr_factor=sr_factor)
-    if mol.omega <= 0 and not auxmol.mol.cart:
-        metric = aux_coeff.dot(_gen_metric_solver(j2c, 'CD')(aux_coeff.T))
+        j2c = int2c2e(auxmol, omega=omega, lr_factor=lr_factor, sr_factor=sr_factor)
+        if mol.omega <= 0 and not auxmol.mol.cart:
+            metric = aux_coeff.dot(_gen_metric_solver(j2c, 'CD')(aux_coeff.T))
+        else:
+            metric = aux_coeff.dot(_gen_metric_solver(j2c, 'ED')(aux_coeff.T))
+        j2c = aux_coeff = None
+        dm_oo = cp.einsum('uv,vij->uij', metric, j3c_oo)
+        metric = j3c_oo = None
     else:
-        metric = aux_coeff.dot(_gen_metric_solver(j2c, 'ED')(aux_coeff.T))
-    j2c = aux_coeff = None
-    dm_oo = cp.einsum('uv,vij->uij', metric, j3c_oo)
-    metric = j3c_oo = None
+        # GRAD-J3C-REUSE-01 armed path: same fp64 discipline, no fp32.
+        # The cderi rows are original-AO pairs (the convention the SCF's
+        # own DF machinery consumes), so the dense symmetric scatter and
+        # the two GEMMs run in the original AO basis with untransformed
+        # dm factors; aux_coef maps the reduced F axis onto the sorted-aux
+        # dm_oo rows the downstream ip1/auxresp tail expects.
+        _note_j3c_reuse_engaged()
+        cderi, pair_addr0, aux_coef, nao0 = j3c_reuse
+        i_addr0, j_addr0 = divmod(pair_addr0, nao0)
+        dm_factor_l0, dm_factor_r0 = factorize_dm(dm, hermi)
+        if dm_factor_r0 is None:
+            # mirror _factorize_dm's hermi=0 aliasing
+            dm_factor_r0 = dm_factor_l0
+        if hasattr(dm, 'symmetrize'):
+            # mirror _factorize_dm's convention on the original basis
+            if dm.symmetrize == 1:
+                dm_factor_l0, dm_factor_r0 = (
+                    cp.hstack([dm_factor_l0, dm_factor_r0]),
+                    cp.hstack([dm_factor_r0, dm_factor_l0]))
+            elif dm.symmetrize == 2:
+                dm_factor_l0, dm_factor_r0 = (
+                    cp.hstack([dm_factor_l0, dm_factor_r0]),
+                    cp.hstack([dm_factor_r0, -dm_factor_l0]))
+        nocc0 = dm_factor_l0.shape[1]
+        assert nocc0 == nocc and dm_factor_l0.shape[0] == nao0
+        nF = cderi.shape[0]
+        # GRAD-P1F32-01 opt-in fp32 phase-1 lane (armed path only; see
+        # _p1_f32 for the sqrt-conditioning distinction vs the verbatim
+        # path's metric-solve discipline): fp32 scatter destination, GEMM
+        # operands and X buffer; the aux_coef einsum below stays fp64.
+        if _p1_f32() and not _strict_fp64_reference_active():
+            _note_p1_f32_engaged()
+            p1_dt = cp.float32
+            dm_factor_r_g = dm_factor_r0.astype(cp.float32)
+            dm_factor_l_g = (dm_factor_r_g if dm_factor_l0 is dm_factor_r0
+                             else dm_factor_l0.astype(cp.float32))
+        else:
+            p1_dt = cp.float64
+            dm_factor_r_g = dm_factor_r0
+            dm_factor_l_g = dm_factor_l0
+        blksize0 = max(1, min(nF, int(mem_avail*.4/(nao0*nao0*2*8))//8*8))
+        X = cp.empty((nF, nocc, nocc), dtype=p1_dt)
+        j3c_full = cp.zeros((nao0, nao0, blksize0), dtype=p1_dt)
+        buf1 = cp.empty((blksize0, nocc, nao0), dtype=p1_dt)
+        for k0, k1 in lib.prange(0, nF, blksize0):
+            dk = k1 - k0
+            j3c = j3c_full[:,:,:dk]
+            # cderi is stored F-major (nF, nao_pair); the transposed view
+            # feeds the same symmetric scatter the verbatim path uses
+            # (on the fp32 lane the assignment converts in-kernel)
+            j3c[j_addr0,i_addr0] = j3c[i_addr0,j_addr0] = cderi[k0:k1].T
+            tmp = ndarray((nocc, nao0, dk), buffer=buf1, dtype=p1_dt)
+            contract('pqr,pi->iqr', j3c, dm_factor_r_g, out=tmp)
+            contract('iqr,qj->rij', tmp, dm_factor_l_g, out=X[k0:k1])
+        j3c_full = buf1 = j3c = tmp = None
+        t0 = log.timer_debug1('contract dm (j3c-reuse)', *t0)
+        if p1_dt != cp.float64:
+            X = X.astype(cp.float64)
+        dm_oo = cp.einsum('kv,vij->kij', aux_coef, X)
+        X = None
     if j_factor != 0:
         auxvec = dm_oo.trace(axis1=1, axis2=2)
 
@@ -150,8 +569,13 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, hermi=0,
     laux = auxmol.uniq_l_ctr[:,0].max()
     shm_size_max = shm_size[:laux+1,:lmax+1,:lmax+1].max()
 
+    # DF-GRAD-TASKGRAN-01 (a): GPU4PYSCF_DF_TASKGRAN=1 (and 2) caps the
+    # ip1 sum-kernel pair blocks at min(nsp*4, max(nsp//4, 16))
+    # (upstream #970) instead of the verbatim nsp*4; knob-off lanes are
+    # value-identical.  len(shl_pair_offsets)-1 is this launch's grid
+    # x-dimension (the launch-count instrumentation knob).
     bas_ij_idx, shl_pair_offsets = mol.aggregate_shl_pairs(
-        int3c2e_opt.bas_ij_cache, nsp_per_block[0]*4)
+        int3c2e_opt.bas_ij_cache, _taskgran_pair_batch(nsp_per_block[0], 4))
     ao_pair_loc = get_ao_pair_loc(mol.uniq_l_ctr[:,0], int3c2e_opt.bas_ij_cache)
     aux_loc = auxmol.ao_loc
 
@@ -168,39 +592,102 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, hermi=0,
         dm = dm_factor_l.dot(dm_factor_r.T)
 
     int3c2e_envs = int3c2e_opt.int3c2e_envs
-    fp32 = precision.get_precision() == 'fp32'
+    # LC-86: the opt-in ip1-f32 prototype selects the fp32 kernel on the
+    # fp64 lane too; the fp32 discipline (fp64 pre-contractions and metric
+    # solve, fp32 kernel + pseudo-DM) is the one the global fp32 mode
+    # already uses -- see _ip1_f32().
+    fp32 = precision.get_precision() == 'fp32' or _ip1_f32()
     if fp32:
         kern = libvhf_rys.sum_ejk_int3c2e_ip1_f32
     else:
         kern = libvhf_rys.sum_ejk_int3c2e_ip1
     assert lr_factor is None and sr_factor is None
+    # DFJK-RESPGEMM-IMPL-01: opt-in fp32 PHASE-2 response chain (BENCH-03
+    # V1, entry 368: 19.92x/28.83x per-chain at 819/1042; one-time operand
+    # casts 2.8 ms at 819, excluded from the chain wall there and counted
+    # into t_grad here).  The fp32 casts below plus the fp32 tmp/dm_tensor
+    # buffers are the entire armed delta; phase-1, the metric solve, the
+    # J-part elementwise build and auxresp keep their fp64 operands and
+    # buffers (deployed amplification discipline).  dm_oo stays fp64 for
+    # auxresp; dm_oo32 coexists for one grad call (~52 MB at the 819
+    # cell, measured feasible at both bench cells).
+    dm_oo32, dm_factor_l32, dm_factor_r32 = _arm_resp_f32(
+        dm_oo, dm_factor_l, dm_factor_r)
+    resp32 = dm_oo32 is not None
+    # LC-42: fused-launch guard.  The per-batch path allocates
+    # nao_pair*batch_size and reuses it batch by batch; the fused path
+    # needs the full nao_pair*naux compressed matrix resident at once.
+    # Require it to fit in 25% of the currently available device memory,
+    # else keep the upstream per-batch behavior exactly.
+    fused = _ip1_fused() and aux_batches > 1 and \
+        nao_pair*naux*(4 if fp32 else 8) < get_avail_mem()*0.25
     aux0 = aux1 = 0
-    buf = cp.empty((nao_pair*batch_size), dtype=cp.float32 if fp32 else cp.float64)
-    buf1 = cp.empty((blksize, nao, nao))
-    buf2 = cp.empty((blksize, nocc, nao))
+    if fused:
+        buf = cp.empty((nao_pair*naux), dtype=cp.float32 if fp32 else cp.float64)
+    else:
+        buf = cp.empty((nao_pair*batch_size), dtype=cp.float32 if fp32 else cp.float64)
+    buf1 = cp.empty((blksize, nao, nao),
+                    dtype=cp.float32 if resp32 else cp.float64)
+    buf2 = cp.empty((blksize, nocc, nao),
+                    dtype=cp.float32 if resp32 else cp.float64)
     ejk = cp.zeros((mol.natm, 3))
     ejk_aux = cp.zeros((mol.natm, 3))
-    for kbatch in range(aux_batches):
-        naux_in_batch = aux_offsets[kbatch+1] - aux_offsets[kbatch]
-        aux_ao_offset = aux_loc[ksh_offsets_cpu[kbatch]]
-        compressed = ndarray((nao_pair, naux_in_batch),
-                             dtype=cp.float32 if fp32 else cp.float64, buffer=buf)
+    # DF-GRAD-TASKGRAN-967-01 (c): armed level 2 packs consecutive aux
+    # groups up to batch_size functions per launch (upstream #967) and
+    # passes the packed group count to the kernel; knob-off lanes
+    # iterate value-identically (kend == kbatch+1, group count 1).  The
+    # fused path already covers all groups in one launch, so the
+    # packing is skipped there.  len(aux_splits)-1 is the armed launch
+    # count vs the verbatim aux_batches (launch-count instrumentation).
+    if fused:
+        launch_units = [(0, aux_batches)]
+    else:
+        aux_splits = _taskgran_resplit_splits(aux_offsets, batch_size)
+        launch_units = list(zip(aux_splits[:-1], aux_splits[1:]))
+    for kbatch, kend in launch_units:
+        if fused:
+            naux_in_batch = naux
+            aux_ao_offset = 0
+            compressed = ndarray((nao_pair, naux),
+                                 dtype=cp.float32 if fp32 else cp.float64, buffer=buf)
+        else:
+            naux_in_batch = aux_offsets[kend] - aux_offsets[kbatch]
+            aux_ao_offset = aux_loc[ksh_offsets_cpu[kbatch]]
+            compressed = ndarray((nao_pair, naux_in_batch),
+                                 dtype=cp.float32 if fp32 else cp.float64, buffer=buf)
         for k0, k1 in lib.prange(0, naux_in_batch, blksize):
             dk = k1 - k0
             aux0, aux1 = aux1, aux1 + dk
-            dm_tensor = ndarray((nao,nao,dk), buffer=buf1)
-            tmp = ndarray((nocc,nao,dk), buffer=buf2)
+            dm_tensor = ndarray((nao,nao,dk), dtype=buf1.dtype, buffer=buf1)
+            tmp = ndarray((nocc,nao,dk), dtype=buf2.dtype, buffer=buf2)
             beta = 0
             if j_factor != 0:
+                # fp64 inputs into the (possibly fp32) tensor: one rounding
+                # of the exact fp64 product, at least as accurate as casting
+                # the inputs first
                 cp.multiply(dm[:,:,None], auxvec[aux0:aux1], out=dm_tensor)
                 beta = j_factor
-            contract('rji,qj->iqr', dm_oo[aux0:aux1], dm_factor_l, out=tmp)
-            contract('iqr,pi->pqr', tmp, dm_factor_r, -.5*k_factor, beta, out=dm_tensor)
+            if resp32:
+                # the fp32 response chain (bench V1 mechanism verbatim:
+                # fp32 operands, fp32 tmp/dm_tensor buffers)
+                contract('rji,qj->iqr', dm_oo32[aux0:aux1], dm_factor_l32,
+                         out=tmp)
+                contract('iqr,pi->pqr', tmp, dm_factor_r32, -.5*k_factor,
+                         beta, out=dm_tensor)
+            else:
+                contract('rji,qj->iqr', dm_oo[aux0:aux1], dm_factor_l, out=tmp)
+                contract('iqr,pi->pqr', tmp, dm_factor_r, -.5*k_factor, beta, out=dm_tensor)
             # the pseudo-DM handed to the integral kernel is cast to float32
             # when the kernel runs in fp32; the pre-contractions above stay
-            # float64 for accuracy
-            if fp32:
+            # float64 for accuracy.  The armed resp32 chain already holds
+            # dm_tensor in the fp32 lane's dtype; on the fp64 kernel lane it
+            # reassembles to fp64 so the pair compression and the kernel
+            # consume their exact dtypes (a dtype leak raises in cp.take,
+            # fail-closed).
+            if fp32 and not resp32:
                 dm_tensor = dm_tensor.astype(cp.float32)
+            elif resp32 and not fp32:
+                dm_tensor = dm_tensor.astype(cp.float64)
             if hermi == 1:
                 cp.take(dm_tensor.reshape(-1,dk), pair_addresses, axis=0,
                         out=compressed[:,k0:k1])
@@ -209,7 +696,7 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, hermi=0,
                 dm_tensor1 = dm_tensor1 + dm_tensor
                 cp.take(dm_tensor1.reshape(-1,dk), pair_addresses, axis=0,
                         out=compressed[:,k0:k1])
-            dm_tensor = ndarray((nao,nao,dk), buffer=buf1)
+            dm_tensor = ndarray((nao,nao,dk), dtype=buf1.dtype, buffer=buf1)
         err = kern(
             ctypes.cast(ejk.data.ptr, ctypes.c_void_p),
             ctypes.cast(ejk_aux.data.ptr, ctypes.c_void_p),
@@ -219,10 +706,11 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, hermi=0,
             ctypes.byref(int3c2e_envs),
             ctypes.c_int(shm_size_max),
             ctypes.c_int(len(shl_pair_offsets) - 1),
-            ctypes.c_int(1),
+            ctypes.c_int(len(ksh_offsets_cpu) - 1 if fused else kend-kbatch),
             ctypes.cast(shl_pair_offsets.data.ptr, ctypes.c_void_p),
             ctypes.cast(bas_ij_idx.data.ptr, ctypes.c_void_p),
-            ctypes.cast(ksh_offsets_gpu[kbatch:].data.ptr, ctypes.c_void_p),
+            ctypes.cast(ksh_offsets_gpu.data.ptr if fused
+                        else ksh_offsets_gpu[kbatch:].data.ptr, ctypes.c_void_p),
             ctypes.cast(gout_stride.data.ptr, ctypes.c_void_p),
             ctypes.cast(ao_pair_loc.data.ptr, ctypes.c_void_p),
             ctypes.c_int(aux_ao_offset),
@@ -231,6 +719,8 @@ def _jk_energy_per_atom(int3c2e_opt, dm, j_factor=1, k_factor=1, hermi=0,
         if err != 0:
             raise RuntimeError('int3c2e_ejk_ip1 failed')
     buf = buf1 = buf2 = compressed = dm_tensor = dm_tensor1 = tmp = None
+    # release the armed fp32 twins before the fp64 auxresp contraction
+    dm_oo32 = dm_factor_l32 = dm_factor_r32 = None
     if hermi == 1:
         ejk *= 2
         ejk_aux *= 2
@@ -291,14 +781,20 @@ def _j_energy_per_atom(int3c2e_opt, dm, hermi=0, auxbasis_response=True, verbose
     shm_size_max = shm_size[:laux+1,:lmax+1,:lmax+1].max()
     bas_ij_idx, shl_pair_offsets = mol.aggregate_shl_pairs(
         int3c2e_opt.bas_ij_cache, nsp_per_block[0]*16)
-    ksh_offsets_cpu = np.append(0, np.cumsum(auxmol.l_ctr_counts))
+    # DF-GRAD-TASKGRAN-01 (b): GPU4PYSCF_DF_TASKGRAN=1 subdivides the
+    # homogeneous aux groups into <=16-shell tasks (upstream #970) for
+    # this launch's y-grid; knob-off lanes are value-identical.
+    # len(ksh_offsets_cpu)-1 is the y-grid dimension.
+    ksh_offsets_cpu = _taskgran_aux16_offsets(auxmol, laux)
     ksh_offsets_gpu = cp.asarray(ksh_offsets_cpu+mol.nbas, dtype=np.int32)
 
     int3c2e_envs = int3c2e_opt.int3c2e_envs
     # Only the integral kernel runs in float32; the dm contraction and the
     # j2c metric solve above stay in float64 (see the note in
     # _jk_energy_per_atom on the metric solve amplifying float32 error).
-    fp32 = precision.get_precision() == 'fp32'
+    # LC-86: the opt-in ip1-f32 prototype applies the same selection on
+    # the fp64 lane (see _ip1_f32()).
+    fp32 = precision.get_precision() == 'fp32' or _ip1_f32()
     if fp32:
         kern = libvhf_rys.sum_ejk_int3c2e_ip1_f32
         dm_kern = cp.asarray(dm, dtype=cp.float32, order='C')
@@ -423,13 +919,31 @@ class Gradients(rhf_grad.Gradients):
         if dm is None: dm = mf.make_rdm1()
         mol = mf.with_df.mol
         auxmol = mf.with_df.auxmol
-        mf.with_df.reset() # Release GPU memory
+        # GRAD-J3C-REUSE-01: capture the retained cderi BEFORE the reset
+        # releases it; when the knob cannot arm (off/strict-reference/
+        # missing or host-resident cderi/shape or VRAM-admission failure)
+        # the pack is None and the verbatim reset + re-evaluation runs.
+        j3c_reuse = None
+        if (_j3c_reuse() and not _strict_fp64_reference_active()
+                and isinstance(dm, cp.ndarray) and dm.ndim == 2):
+            j3c_reuse = _capture_grad_j3c_reuse(mf, omega)
+        if j3c_reuse is None:
+            mf.with_df.reset() # Release GPU memory
         with mol.with_range_coulomb(omega), auxmol.with_range_coulomb(omega):
-            sorted_mol = SortedMole.from_mol(mol, decontract=True)
-            int3c2e_opt = Int3c2eOpt(sorted_mol, auxmol).build()
+            # CDERI-B2D-HOSTPATH-01 (C1): the identity-keyed cache serves the
+            # opt the SCF DF.build already constructed for this Mole/auxmol
+            # pair (decontracted variant).  The token is read inside the
+            # range-coulomb context, so an active omega context (RSH cells)
+            # fails closed to the verbatim fresh build below.
+            int3c2e_opt = _molecular_int3c2e_opt(
+                mol, auxmol, decontract=True)
+            if int3c2e_opt is None:
+                sorted_mol = SortedMole.from_mol(mol, decontract=True)
+                int3c2e_opt = Int3c2eOpt(sorted_mol, auxmol).build()
         return _jk_energy_per_atom(
             int3c2e_opt, dm, j_factor, k_factor, hermi=hermi,
             auxbasis_response=self.auxbasis_response, verbose=verbose,
-            omega=omega, lr_factor=lr_factor, sr_factor=sr_factor)
+            omega=omega, lr_factor=lr_factor, sr_factor=sr_factor,
+            j3c_reuse=j3c_reuse)
 
 Grad = Gradients
