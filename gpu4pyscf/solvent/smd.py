@@ -257,7 +257,12 @@ import ctypes
 from gpu4pyscf.lib.cupy_helper import load_library
 try:
     libsolvent = load_library('libsolvent')
-except OSError:
+    # The Fortran (mnsol) objects are compiled only when a Fortran compiler
+    # was available at build time (GPU4PYSCF_SMD).  A pcm.cu-only library
+    # still serves the PCM family; without the mnsol_interface_ symbol SMD
+    # is unavailable, so gate the capability here rather than on loadability.
+    libsolvent.mnsol_interface_
+except (OSError, AttributeError):
     libsolvent = None
 
 def get_cds_legacy(smdobj):

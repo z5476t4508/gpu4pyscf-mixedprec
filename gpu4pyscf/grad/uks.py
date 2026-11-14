@@ -39,6 +39,27 @@ ALIGNED = getattr(__config__, 'grid_aligned', 16*16)
 libgdft = rks_grad.libgdft
 libgdft.GDFT_make_dR_dao_w.restype = ctypes.c_int
 
+_CONTR_F32_GRADS = 0    # armed UKS contr_f32 gradient engagements (evidence counter)
+
+def _note_contr_f32_engaged():
+    '''Bump the UKS contr_f32 engagement counter
+    (UKS-XCGRAD-CONTRF32-01).  Home-module helper so a future twin
+    (e.g. an RKS-side or NLC-side port) cannot silently fork the
+    counter with a module-local ``global`` (the df.grad counter-fork
+    lesson: a uhf-local ``global`` forked the rhf-defined counter).'''
+    global _CONTR_F32_GRADS
+    _CONTR_F32_GRADS += 1
+
+def _strict_fp64_reference_active():
+    '''Whether the current call runs under the strict fp64-reference
+    context (dft.numint.strict_fp64_reference_ctx).  The contr_f32 knob
+    stays inert there: the reference sibling must reproduce the plain
+    DEFAULT-lane solution.  Lazy import so grad.uks does not pay the
+    dft import at module load; attribute read at call time (the flag
+    flips inside the context manager).'''
+    from gpu4pyscf.dft import numint as _numint
+    return bool(_numint._strict_fp64_reference_active)
+
 def energy_ee(ks_grad, mol=None, dm=None, verbose=None):
     '''
     First-order derivatives of the two-electron energy contributions per atom
@@ -131,6 +152,34 @@ def _get_exc_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
         ngrids_local = grid_end - grid_start
         log.debug(f"{ngrids_local} grids on Device {device_id}")
 
+        # LC-22: opt-in larger grid blocks for the gradient XC loops (same
+        # knob and guard as the SCF side, dft.numint LC-11).  Probe
+        # (2026-10-06-lc21-grad-blocksize): whole-gradient 1.14x on the
+        # wb97m-v methoxy UKS cell at 16384, dg <= 3e-13 Eh/Bohr.
+        loop_blksize = numint._effective_scf_blksize(
+            numint._scf_grid_blksize(), grid_start, grid_end, ngrids_glob)
+
+        # UKS-XCGRAD-CONTRF32-01: opt-in UKS twin of the RKS
+        # grid-contraction precision discipline (LC-88/LC-101,
+        # GPU4PYSCF_GRAD_GRID_F32 -- shared knob, read through the home
+        # parser rks._grad_grid_f32 so one cached env value serves both
+        # spin structures).  Entry-400 measured this deriv=2 contraction
+        # pool at 0.9304/0.9454 of the UKS xc_grid family (573/819 AO,
+        # GEMM-bound per LC-87 >= ~222 AO, spin-doubled call counts
+        # 48/24 and 70/35); LC-89's negative (slower on all four
+        # configs) was measured at nao <= 118 and its scope-honesty
+        # clause required exactly these new in-scope cells to reopen.
+        # Contraction-only per the RKS discipline: rho keeps its fp64
+        # AO and buffer (bitwise-identical density), the contraction
+        # helpers run in the operands' fp32 dtype with dtype-sized
+        # buffers, the dm_mask einsum and the exc1 accumulator stay
+        # float64.  Default OFF; inert on the strict fp64-reference
+        # lane.
+        contr_f32 = rks_grad._grad_grid_f32() and not _strict_fp64_reference_active()
+        _gbuf = (lambda b: None) if contr_f32 else (lambda b: b)
+        if contr_f32:
+            _note_contr_f32_engaged()
+
         exc1 = cupy.zeros((nao, 3))
 
         if xctype == 'LDA':
@@ -139,7 +188,7 @@ def _get_exc_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
             ncomp = 4
         else:
             ncomp = 5
-        rho_buf = cupy.empty(2*ncomp*MIN_BLK_SIZE)
+        rho_buf = cupy.empty(2*ncomp*loop_blksize)
         mo_buf = cupy.empty_like(mo_coeff[0])
         vtmp_buf = cupy.empty((3, nao, nao))
 
@@ -147,9 +196,10 @@ def _get_exc_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
 
         if xctype == 'LDA':
             ao_deriv = 1
-            aow_buf = cupy.empty(MIN_BLK_SIZE * max(nao, 1*nocc))
+            aow_buf = cupy.empty(loop_blksize * max(nao, 1*nocc))
             for ao_mask, idx, weight, _ in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, None,
-                                                         grid_range=(grid_start, grid_end)):
+                                                         grid_range=(grid_start, grid_end),
+                                                         loop_blksize=loop_blksize):
                 blk_size = len(weight)
                 nao_sub = len(idx)
                 rho = ndarray((2, ncomp, blk_size), buffer=rho_buf)
@@ -160,19 +210,24 @@ def _get_exc_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
 
                 vxc = ni.eval_xc_eff(xc_code, rho, 1, xctype=xctype, spin=1)[1][:,0]
                 wv = cupy.multiply(weight, vxc, out=vxc)
-                aow = numint._scale_ao(ao_mask[0], wv[0], out=aow_buf)
-                vtmp = rks_grad._d1_dot_(ao_mask[1:4], aow.T, out=vtmp_buf)
+                if contr_f32:
+                    ao_contr = ao_mask.astype(cupy.float32)
+                else:
+                    ao_contr = ao_mask
+                aow = numint._scale_ao(ao_contr[0], wv[0], out=_gbuf(aow_buf))
+                vtmp = rks_grad._d1_dot_(ao_contr[1:4], aow.T, out=_gbuf(vtmp_buf))
                 dm_mask = take_last2d(dms[0], idx, out=dm_mask_buf)
                 exc1[idx] += cupy.einsum('nij,ij->ni', vtmp, dm_mask).T
-                aow = numint._scale_ao(ao_mask[0], wv[1], out=aow)
-                vtmp = rks_grad._d1_dot_(ao_mask[1:4], aow.T, out=vtmp_buf)
+                aow = numint._scale_ao(ao_contr[0], wv[1], out=aow)
+                vtmp = rks_grad._d1_dot_(ao_contr[1:4], aow.T, out=_gbuf(vtmp_buf))
                 dm_mask = take_last2d(dms[1], idx, out=dm_mask)
                 exc1[idx] += cupy.einsum('nij,ij->ni', vtmp, dm_mask).T
         elif xctype == 'GGA':
             ao_deriv = 2
-            aow_buf = cupy.empty(MIN_BLK_SIZE * max(nao * 3, 2*nocc))
+            aow_buf = cupy.empty(loop_blksize * max(nao * 3, 2*nocc))
             for ao_mask, idx, weight, _ in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, None,
-                                                         grid_range=(grid_start, grid_end)):
+                                                         grid_range=(grid_start, grid_end),
+                                                         loop_blksize=loop_blksize):
                 blk_size = len(weight)
                 nao_sub = len(idx)
                 rho = ndarray((2, ncomp, blk_size), buffer=rho_buf)
@@ -184,11 +239,15 @@ def _get_exc_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
                 vxc = ni.eval_xc_eff(xc_code, rho, 1, xctype=xctype, spin=1)[1]
                 wv = cupy.multiply(weight, vxc, out=vxc)
                 wv[:,0] *= .5
-                vtmp = rks_grad._gga_grad_sum_(ao_mask, wv[0], buf=aow_buf, out=vtmp_buf)
+                if contr_f32:
+                    ao_contr = ao_mask.astype(cupy.float32)
+                else:
+                    ao_contr = ao_mask
+                vtmp = rks_grad._gga_grad_sum_(ao_contr, wv[0], buf=_gbuf(aow_buf), out=_gbuf(vtmp_buf))
                 #add_sparse(vmat[0], vtmp, idx)
                 dm_mask = take_last2d(dms[0], idx, out=dm_mask_buf)
                 exc1[idx] += cupy.einsum('nij,ij->ni', vtmp, dm_mask).T
-                vtmp = rks_grad._gga_grad_sum_(ao_mask, wv[1], buf=aow_buf, out=vtmp_buf)
+                vtmp = rks_grad._gga_grad_sum_(ao_contr, wv[1], buf=_gbuf(aow_buf), out=_gbuf(vtmp_buf))
                 #add_sparse(vmat[1], vtmp, idx)
                 dm_mask = take_last2d(dms[1], idx, out=dm_mask)
                 exc1[idx] += cupy.einsum('nij,ij->ni', vtmp, dm_mask).T
@@ -197,9 +256,10 @@ def _get_exc_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
 
         elif xctype == 'MGGA':
             ao_deriv = 2
-            aow_buf = cupy.empty(MIN_BLK_SIZE * max(nao * 3, 2*nocc))
+            aow_buf = cupy.empty(loop_blksize * max(nao * 3, 2*nocc))
             for ao_mask, idx, weight, _ in ni.block_loop(_sorted_mol, grids, nao, ao_deriv, None,
-                                                         grid_range=(grid_start, grid_end)):
+                                                         grid_range=(grid_start, grid_end),
+                                                         loop_blksize=loop_blksize):
                 blk_size = len(weight)
                 nao_sub = len(idx)
                 rho = ndarray((2, ncomp, blk_size), buffer=rho_buf)
@@ -212,13 +272,17 @@ def _get_exc_task(ni, mol, grids, xc_code, dms, mo_coeff, mo_occ,
                 wv = cupy.multiply(weight, vxc, out=vxc)
                 wv[:,0] *= .5
                 wv[:,4] *= .5  # for the factor 1/2 in tau
-                vtmp = rks_grad._gga_grad_sum_(ao_mask, wv[0], buf=aow_buf, out=vtmp_buf)
-                vtmp = rks_grad._tau_grad_dot_(ao_mask, wv[0,4], accumulate=True, buf=aow_buf, out=vtmp)
+                if contr_f32:
+                    ao_contr = ao_mask.astype(cupy.float32)
+                else:
+                    ao_contr = ao_mask
+                vtmp = rks_grad._gga_grad_sum_(ao_contr, wv[0], buf=_gbuf(aow_buf), out=_gbuf(vtmp_buf))
+                vtmp = rks_grad._tau_grad_dot_(ao_contr, wv[0,4], accumulate=True, buf=_gbuf(aow_buf), out=vtmp)
                 #add_sparse(vmat[0], vtmp, idx)
                 dm_mask = take_last2d(dms[0], idx, out=dm_mask_buf)
                 exc1[idx] += cupy.einsum('nij,ij->ni', vtmp, dm_mask).T
-                vtmp = rks_grad._gga_grad_sum_(ao_mask, wv[1], buf=aow_buf, out=vtmp_buf)
-                vtmp = rks_grad._tau_grad_dot_(ao_mask, wv[1,4], accumulate=True, buf=aow_buf, out=vtmp)
+                vtmp = rks_grad._gga_grad_sum_(ao_contr, wv[1], buf=_gbuf(aow_buf), out=_gbuf(vtmp_buf))
+                vtmp = rks_grad._tau_grad_dot_(ao_contr, wv[1,4], accumulate=True, buf=_gbuf(aow_buf), out=vtmp)
                 #add_sparse(vmat[1], vtmp, idx)
                 dm_mask = take_last2d(dms[1], idx, out=dm_mask)
                 exc1[idx] += cupy.einsum('nij,ij->ni', vtmp, dm_mask).T
