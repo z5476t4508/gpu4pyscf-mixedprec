@@ -1,0 +1,27 @@
+{
+ "collected_utc": "2026-10-23T02:57:04Z",
+ "n_launches": 150,
+ "molecules": {
+  "dopamine_b3lyp_def2-tzvp": {
+   "ngrids": 262912,
+   "nbas": 165,
+   "consensus_sha": "aa8525d9bb6fac0a5f8c3f80c3f020d62cd1db57fe86e8b84470316c63d97713",
+   "consensus_count": 148,
+   "n_distinct": 2
+  },
+  "benzene_b3lyp_def2-tzvp": {
+   "ngrids": 143616,
+   "nbas": 90,
+   "consensus_sha": "90e56ca98a0199394d151603c6e52dba8fee83b136d4bb01f46c2a86663e3086",
+   "consensus_count": 150,
+   "n_distinct": 1
+  },
+  "water_b3lyp_def2-svp": {
+   "ngrids": 33792,
+   "nbas": 12,
+   "consensus_sha": "34db545211b85858a6c703c8a7f075b18e716a97651be6e714668feb3919f72f",
+   "consensus_count": 150,
+   "n_distinct": 1
+  }
+ }
+}

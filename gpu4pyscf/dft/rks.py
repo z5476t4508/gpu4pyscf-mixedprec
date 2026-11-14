@@ -26,9 +26,15 @@ __all__ = [
     'get_veff', 'RKS', 'KohnShamDFT',
 ]
 
-def prune_small_rho_grids_(ks, mol, dm, grids):
-    '''Prune grids if the electron density on the grid is small'''
-    threshold = ks.small_rho_cutoff
+def prune_small_rho_grids_(ks, mol, dm, grids, threshold=None):
+    '''Prune grids if the electron density on the grid is small.
+
+    The optional explicit ``threshold`` carries the per-grid prune
+    semantics (SCF-PRUNE-MAINGRID-ONLY-01): None (the default at every
+    pre-existing call) resolves to ``ks.small_rho_cutoff`` verbatim.
+    '''
+    if threshold is None:
+        threshold = ks.small_rho_cutoff
     rho = ks._numint.get_rho(mol, dm, grids, ks.max_memory, verbose=ks.verbose)
     return grids.prune_by_density_(rho, threshold)
 
@@ -53,9 +59,17 @@ def initialize_grids(ks, mol=None, dm=None):
         ks.nlcgrids.build()
         ks.nlcgrids.weights = asarray(ks.nlcgrids.weights)
         ks.nlcgrids.coords = asarray(ks.nlcgrids.coords)
-        if ks.small_rho_cutoff > 1e-20 and ground_state:
+        # Per-grid prune semantics (SCF-PRUNE-MAINGRID-ONLY-01):
+        # small_rho_cutoff_nlc None (default) inherits small_rho_cutoff
+        # (verbatim upstream both-prune behavior); 0 keeps the nlcgrids
+        # FULL; >0 prunes the nlcgrids at that independent threshold.
+        nlc_cutoff = ks.small_rho_cutoff_nlc
+        if nlc_cutoff is None:
+            nlc_cutoff = ks.small_rho_cutoff
+        if nlc_cutoff > 1e-20 and ground_state:
             # Filter grids the first time setup grids
-            ks.nlcgrids = prune_small_rho_grids_(ks, ks.mol, dm, ks.nlcgrids)
+            ks.nlcgrids = prune_small_rho_grids_(
+                ks, ks.mol, dm, ks.nlcgrids, threshold=nlc_cutoff)
         t0 = logger.timer_debug1(ks, 'setting up nlc grids', *t0)
     return ks
 
@@ -96,7 +110,9 @@ def get_veff(ks, mol=None, dm=None, dm_last=None, vhf_last=None, hermi=1):
         n, exc, vxc = 0, 0, 0
     else:
         n, exc, vxc = ni.nr_rks(mol, ks.grids, ks.xc, dm)
-        if ks.do_nlc():
+        # SP-31: the opt-in auto-head NLC skip (numint lane flag armed
+        # by scf.hf._kernel; default off = this block unchanged bitwise)
+        if ks.do_nlc() and not numint._scf_head_nlc_suppressed():
             if ni.libxc.is_nlc(ks.xc):
                 xc = ks.xc
             else:
@@ -176,7 +192,7 @@ def energy_elec(ks, dm=None, h1e=None, vhf=None):
 # which relies on pyscf.scf.dispersion.parse_dft. It does NOT use gpu4pyscf.scf.dispersion.parse_dft.
 class KohnShamDFT(rks.KohnShamDFT):
 
-    _keys = {'cphf_grids', *rks.KohnShamDFT._keys}
+    _keys = {'cphf_grids', 'small_rho_cutoff_nlc', *rks.KohnShamDFT._keys}
 
     to_rhf = NotImplemented
     to_uhf = NotImplemented
@@ -188,6 +204,11 @@ class KohnShamDFT(rks.KohnShamDFT):
 
     # Use rho to filter grids
     small_rho_cutoff = getattr(__config__, 'dft_rks_RKS_small_rho_cutoff', 0)
+    # Optional separate nlcgrids prune threshold (SCF-PRUNE-MAINGRID-ONLY-01):
+    # None = inherit small_rho_cutoff (verbatim upstream both-prune
+    # semantics); 0 = never prune nlcgrids; >0 = independent nlc cutoff.
+    small_rho_cutoff_nlc = getattr(
+        __config__, 'dft_rks_RKS_small_rho_cutoff_nlc', None)
 
     def __init__(self, xc='LDA,VWN'):
         self.xc = xc
