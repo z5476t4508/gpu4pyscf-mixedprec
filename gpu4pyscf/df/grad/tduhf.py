@@ -17,6 +17,7 @@ from gpu4pyscf.df import df
 from gpu4pyscf.tdscf import uhf as tduhf
 from gpu4pyscf.grad import tduhf as tduhf_grad
 from gpu4pyscf.df.grad.rhf import Int3c2eOpt
+from gpu4pyscf.df.int3c2e_bdiv import _molecular_int3c2e_opt
 from gpu4pyscf.df.grad.uhf import _jk_energy_per_atom
 
 class Gradients(tduhf_grad.Gradients):
@@ -36,7 +37,12 @@ class Gradients(tduhf_grad.Gradients):
         if dm is None: dm = mf.make_rdm1()
         auxmol = mf.with_df.auxmol
         with mol.with_range_coulomb(omega), auxmol.with_range_coulomb(omega):
-            int3c2e_opt = Int3c2eOpt(mol, auxmol).build()
+            # CDERI-B2D-UHFTD-EXT-01: identity-keyed cache, plain variant.
+            # The token is read inside the range-coulomb context, so an
+            # active omega context fails closed to the fresh build below.
+            int3c2e_opt = _molecular_int3c2e_opt(mol, auxmol)
+            if int3c2e_opt is None:
+                int3c2e_opt = Int3c2eOpt(mol, auxmol).build()
             return _jk_energy_per_atom(
                 int3c2e_opt, dm, j_factor, k_factor, hermi,
                 auxbasis_response=self.auxbasis_response, verbose=verbose) * .5

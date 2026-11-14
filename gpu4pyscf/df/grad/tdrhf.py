@@ -23,7 +23,7 @@ from gpu4pyscf.lib.cupy_helper import (
 from gpu4pyscf.df.grad.rhf import (
     _split_l_ctr_pattern, get_ao_pair_loc, libvhf_rys, Int3c2eOpt, int2c2e,
     int3c2e_scheme, _gen_metric_solver, _factorize_dm)
-from gpu4pyscf.df.int3c2e_bdiv import int2c2e_ip1_per_atom
+from gpu4pyscf.df.int3c2e_bdiv import int2c2e_ip1_per_atom, _molecular_int3c2e_opt
 from gpu4pyscf.df import df
 from gpu4pyscf.tdscf import rhf as tdrhf
 from gpu4pyscf.grad import tdrhf as tdrhf_grad
@@ -817,8 +817,16 @@ class Gradients(tdrhf_grad.Gradients):
         auxmol = mf.with_df.auxmol
         mf.with_df.reset() # Release GPU memory
         with mol.with_range_coulomb(omega), auxmol.with_range_coulomb(omega):
-            sorted_mol = SortedMole.from_mol(mol, decontract=True)
-            int3c2e_opt = Int3c2eOpt(sorted_mol, auxmol).build()
+            # CDERI-B2D-UHFTD-EXT-01: the identity-keyed cache serves the
+            # opt the SCF DF.build already constructed for this Mole/auxmol
+            # pair (decontracted variant).  The token is read inside the
+            # range-coulomb context, so an active omega context (RSH cells)
+            # fails closed to the verbatim fresh build below.
+            int3c2e_opt = _molecular_int3c2e_opt(
+                mol, auxmol, decontract=True)
+            if int3c2e_opt is None:
+                sorted_mol = SortedMole.from_mol(mol, decontract=True)
+                int3c2e_opt = Int3c2eOpt(sorted_mol, auxmol).build()
 
         if (sum_results and
             # When the input is a list, each density matrix is applied twice in
