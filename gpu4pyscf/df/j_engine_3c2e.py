@@ -14,6 +14,8 @@
 
 import ctypes
 import math
+import os
+import time
 import numpy as np
 import cupy as cp
 from pyscf.gto.mole import ANG_OF, ATOM_OF, PTR_EXP, PTR_COORD, conc_env
@@ -24,6 +26,16 @@ from gpu4pyscf.scf.jk import _scale_sp_ctr_coeff, _nearest_power2, SHM_SIZE
 from gpu4pyscf.df.int3c2e_bdiv import _conc_locs, LMAX, L_AUX_MAX, THREADS
 from gpu4pyscf.scf.j_engine import (
     libvhf_md, _cache_q_cond_and_non0pairs, _dm_to_Rt, _Rt_to_dm)
+
+libvhf_md.fill_3c_table.restype = ctypes.c_int
+
+# J3C-RTCACHE-01 Phase B opt-in within-run cache of the screened-pair
+# geometry-invariant 3c J-contraction table (default off).
+def _j3c_table_cache_enabled():
+    value = os.environ.get('GPU4PYSCF_DF_J_3C_CACHE', '')
+    return value == '1'
+
+_J3C_CACHE_HEADROOM_MIB = 2048.0  # m3prof-01 headroom policy (entry 336)
 
 def contract_int3c2e_dm(mol, auxmol, dm, hermi=0, int3c2e_opt=None):
     if int3c2e_opt is None:
@@ -44,6 +56,12 @@ class Int3c2eOpt:
         self.mol = mol
         self.auxmol = auxmol
         self.int3c2e_envs = None
+        # J3C-RTCACHE-01 Phase B (GPU4PYSCF_DF_J_3C_CACHE, default off):
+        # _j3c_cache_state latches at the first contract_dm call:
+        # unlatched -> ready | fallback | off (never re-read per object).
+        self._j3c_table = None
+        self._j3c_cache_state = 'unlatched'
+        self._j3c_fill_wall_s = None
 
     def build(self, cutoff=1e-12):
         log = logger.new_logger(self.mol)
@@ -95,9 +113,71 @@ class Int3c2eOpt:
         self.pair_loc = np.cumsum(np.append(np.int32(0), xyz_size.ravel()), dtype=np.int32)
         return self
 
+    def _ensure_j3c_table(self):
+        '''J3C-RTCACHE-01 Phase B (opt-in GPU4PYSCF_DF_J_3C_CACHE, default
+        off).  Fill the screened-pair geometry-invariant 3c table
+        T[pair_xyz, aux_cart] once per Int3c2eOpt object at the first
+        contract_dm call, replacing both per-cycle Rys contraction kernels
+        with one GEMV each.  Fail-closed: on any allocation risk or fill
+        error the object latches to the unmodified on-the-fly path (never
+        retried per object, never raises).'''
+        if self._j3c_cache_state != 'unlatched':
+            return
+        if not _j3c_table_cache_enabled():
+            self._j3c_cache_state = 'off'
+            return
+        log = logger.new_logger(self.mol)
+        try:
+            mol = self.mol
+            auxmol = self.auxmol
+            dm_xyz_size = int(self.pair_loc[-1])
+            naux = auxmol.nao_nr(cart=True)
+            table_bytes = dm_xyz_size * naux * 8
+            free, _total = cp.cuda.runtime.memGetInfo()
+            headroom = _J3C_CACHE_HEADROOM_MIB * 2**20
+            if free < table_bytes + headroom:
+                log.warn('J3C table cache fallback: table %.2f GiB + %.0f MiB '
+                         'headroom exceeds free %.2f GiB',
+                         table_bytes/2**30, _J3C_CACHE_HEADROOM_MIB, free/2**30)
+                self._j3c_cache_state = 'fallback'
+                return
+            t0 = time.perf_counter()
+            table = cp.zeros((dm_xyz_size, naux), order='C')
+            nsp_lookup, shm_size = _int3c2e_dm_scheme()
+            shl_pair_idx = asarray(self.shl_pair_idx, dtype=np.int32)
+            pair_ij_offsets = cp.asarray(self.shl_pair_offsets, dtype=np.int32)
+            sp_blocks = len(pair_ij_offsets) - 1
+            pair_loc = cp.asarray(self.pair_loc, dtype=np.int32)
+            err = libvhf_md.fill_3c_table(
+                ctypes.cast(table.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(naux),
+                ctypes.byref(self.int3c2e_envs), ctypes.c_int(shm_size),
+                ctypes.c_int(sp_blocks),
+                ctypes.c_int(auxmol.nbas),
+                ctypes.cast(pair_ij_offsets.data.ptr, ctypes.c_void_p),
+                ctypes.cast(shl_pair_idx.data.ptr, ctypes.c_void_p),
+                ctypes.cast(pair_loc.data.ptr, ctypes.c_void_p),
+                ctypes.cast(nsp_lookup.data.ptr, ctypes.c_void_p),
+                ctypes.c_double(mol.omega))
+            if err != 0:
+                raise RuntimeError('fill_3c_table kernel failed')
+            cp.cuda.runtime.deviceSynchronize()
+            self._j3c_fill_wall_s = time.perf_counter() - t0
+            self._j3c_table = table
+            self._j3c_cache_state = 'ready'
+            log.debug1('J3C table cache ready: %dx%d fp64 %.2f GiB in %.1f ms',
+                       dm_xyz_size, naux, table_bytes/2**30,
+                       self._j3c_fill_wall_s*1000)
+        except Exception as e:
+            self._j3c_table = None
+            self._j3c_cache_state = 'fallback'
+            log.warn('J3C table cache fallback: %s', e)
+
     def contract_dm(self, dm, hermi=0):
         if self.int3c2e_envs is None:
             self.build()
+        if self._j3c_cache_state == 'unlatched':
+            self._ensure_j3c_table()
         log = logger.new_logger(self.mol)
         t0 = log.init_timer()
         mol = self.mol
@@ -129,6 +209,9 @@ class Int3c2eOpt:
         vj_aux = cp.zeros((n_dm, naux))
         for i_dm in range(n_dm):
             _dm_to_Rt(mol, dm[i_dm], shl_pair_idx, pair_loc, int3c2e_envs, out=dm_xyz)
+            if self._j3c_table is not None:
+                vj_aux[i_dm] = dm_xyz.dot(self._j3c_table)
+                continue
             err = libvhf_md.contract_int3c2e_dm(
                 ctypes.cast(vj_aux[i_dm].data.ptr, ctypes.c_void_p),
                 ctypes.cast(dm_xyz.data.ptr, ctypes.c_void_p),
@@ -198,29 +281,32 @@ class Int3c2eOpt:
         aux_xyz_loc = asarray(aux_xyz_loc)
         pair_loc = asarray(self.pair_loc)
         for i_dm in range(n_dm):
-            libvhf_md.aux_to_Rt(
-                ctypes.cast(aux_xyz.data.ptr, ctypes.c_void_p),
-                ctypes.cast(auxvec[i_dm].data.ptr, ctypes.c_void_p),
-                ctypes.byref(int3c2e_envs),
-                ctypes.cast(aux_loc.data.ptr, ctypes.c_void_p),
-                ctypes.cast(aux_xyz_loc.data.ptr, ctypes.c_void_p),
-                ctypes.c_int(auxmol.nbas))
-            err = libvhf_md.contract_int3c2e_auxvec(
-                ctypes.cast(vj_xyz[i_dm].data.ptr, ctypes.c_void_p),
-                ctypes.cast(aux_xyz.data.ptr, ctypes.c_void_p),
-                ctypes.c_int(1), ctypes.c_int(naux),
-                ctypes.byref(int3c2e_envs), ctypes.c_int(shm_size),
-                ctypes.c_int(sp_blocks),
-                ctypes.c_int(ksh_blocks),
-                ctypes.cast(pair_ij_offsets.data.ptr, ctypes.c_void_p),
-                ctypes.cast(ksh_offsets.data.ptr, ctypes.c_void_p),
-                ctypes.cast(shl_pair_idx.data.ptr, ctypes.c_void_p),
-                ctypes.cast(pair_loc.data.ptr, ctypes.c_void_p),
-                ctypes.cast(aux_xyz_loc.data.ptr, ctypes.c_void_p),
-                ctypes.cast(nsp_lookup.data.ptr, ctypes.c_void_p),
-                ctypes.c_double(omega))
-            if err != 0:
-                raise RuntimeError('contract_int3c2e_auxvec kernel failed')
+            if self._j3c_table is not None:
+                vj_xyz[i_dm] = self._j3c_table.dot(auxvec[i_dm])
+            else:
+                libvhf_md.aux_to_Rt(
+                    ctypes.cast(aux_xyz.data.ptr, ctypes.c_void_p),
+                    ctypes.cast(auxvec[i_dm].data.ptr, ctypes.c_void_p),
+                    ctypes.byref(int3c2e_envs),
+                    ctypes.cast(aux_loc.data.ptr, ctypes.c_void_p),
+                    ctypes.cast(aux_xyz_loc.data.ptr, ctypes.c_void_p),
+                    ctypes.c_int(auxmol.nbas))
+                err = libvhf_md.contract_int3c2e_auxvec(
+                    ctypes.cast(vj_xyz[i_dm].data.ptr, ctypes.c_void_p),
+                    ctypes.cast(aux_xyz.data.ptr, ctypes.c_void_p),
+                    ctypes.c_int(1), ctypes.c_int(naux),
+                    ctypes.byref(int3c2e_envs), ctypes.c_int(shm_size),
+                    ctypes.c_int(sp_blocks),
+                    ctypes.c_int(ksh_blocks),
+                    ctypes.cast(pair_ij_offsets.data.ptr, ctypes.c_void_p),
+                    ctypes.cast(ksh_offsets.data.ptr, ctypes.c_void_p),
+                    ctypes.cast(shl_pair_idx.data.ptr, ctypes.c_void_p),
+                    ctypes.cast(pair_loc.data.ptr, ctypes.c_void_p),
+                    ctypes.cast(aux_xyz_loc.data.ptr, ctypes.c_void_p),
+                    ctypes.cast(nsp_lookup.data.ptr, ctypes.c_void_p),
+                    ctypes.c_double(omega))
+                if err != 0:
+                    raise RuntimeError('contract_int3c2e_auxvec kernel failed')
             _Rt_to_dm(mol, vj_xyz[i_dm], shl_pair_idx, pair_loc, int3c2e_envs, out=vj[i_dm])
         log.timer_debug1('processing contract_int3c2e_auxvec', *t0)
 
