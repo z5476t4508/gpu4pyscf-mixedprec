@@ -1,0 +1,276 @@
+{
+ "schema": "benchv1-snt2-fd-v1",
+ "created_utc": "2026-10-30T21:56:15Z",
+ "diagnostic_only": true,
+ "energy_source": "gradient_runner auto-lane rows, result.e_tot (worst-repeat aggregate); per-repeat spread feeds the measured noise floor",
+ "criterion": "max|g_fd - g_analytic| <= 3.0x the nominal floor 1e-04 Eh/Bohr (card conservative end; band may be re-decided at first view); NOT the 3e-5 mixed-precision gate",
+ "cells": [
+  {
+   "tag": "cytosine_b3lyp_def2-svp",
+   "atoms": [
+    {
+     "index": 8,
+     "element": "H",
+     "rule": "H on the ring N (N1) that bears exactly one H and >=2 C",
+     "norms_considered": null
+    },
+    {
+     "index": 12,
+     "element": "H",
+     "rule": "ammonium-class (NH2) H with largest |g| atom-norm on the auto-lane gradient",
+     "norms_considered": {
+      "11": 0.003953244503444574,
+      "12": 0.006322687486651249
+     }
+    }
+   ],
+   "steps": {
+    "0.0010": {
+     "components": [
+      {
+       "atom": 8,
+       "element": "H",
+       "axis": "x",
+       "fd": -0.008574668669325547,
+       "analytic": -0.008586842294484393,
+       "abs_delta": 1.2173625158845569e-05
+      },
+      {
+       "atom": 8,
+       "element": "H",
+       "axis": "y",
+       "fd": -0.0005169827659301518,
+       "analytic": -0.0005162522703447969,
+       "abs_delta": 7.304955853548734e-07
+      },
+      {
+       "atom": 8,
+       "element": "H",
+       "axis": "z",
+       "fd": 8.597851319791516e-07,
+       "analytic": 8.620168598610749e-07,
+       "abs_delta": 2.2317278819232456e-09
+      },
+      {
+       "atom": 12,
+       "element": "H",
+       "axis": "x",
+       "fd": 0.006208793138284818,
+       "analytic": 0.006214328228634769,
+       "abs_delta": 5.5350903499507e-06
+      },
+      {
+       "atom": 12,
+       "element": "H",
+       "axis": "y",
+       "fd": 0.0011675840312364016,
+       "analytic": 0.0011655448802625479,
+       "abs_delta": 2.039150973853765e-06
+      },
+      {
+       "atom": 12,
+       "element": "H",
+       "axis": "z",
+       "fd": 2.621789008117048e-06,
+       "analytic": 2.6177744562141166e-06,
+       "abs_delta": 4.014551902931443e-09
+      }
+     ],
+     "max_abs_delta": 1.2173625158845569e-05,
+     "measured_noise_floor": 0.0,
+     "threshold": 0.00030000000000000003,
+     "within_3x_nominal_floor": true
+    },
+    "0.0020": {
+     "components": [
+      {
+       "atom": 8,
+       "element": "H",
+       "axis": "x",
+       "fd": -0.00857460837266899,
+       "analytic": -0.008586842294484393,
+       "abs_delta": 1.2233921815402171e-05
+      },
+      {
+       "atom": 8,
+       "element": "H",
+       "axis": "y",
+       "fd": -0.0005177558222158041,
+       "analytic": -0.0005162522703447969,
+       "abs_delta": 1.5035518710071472e-06
+      },
+      {
+       "atom": 8,
+       "element": "H",
+       "axis": "z",
+       "fd": 8.601261924923165e-07,
+       "analytic": 8.620168598610749e-07,
+       "abs_delta": 1.8906673687583975e-09
+      },
+      {
+       "atom": 12,
+       "element": "H",
+       "axis": "x",
+       "fd": 0.006208735769064333,
+       "analytic": 0.006214328228634769,
+       "abs_delta": 5.59245957043597e-06
+      },
+      {
+       "atom": 12,
+       "element": "H",
+       "axis": "y",
+       "fd": 0.001166769280303015,
+       "analytic": 0.0011655448802625479,
+       "abs_delta": 1.2244000404670885e-06
+      },
+      {
+       "atom": 12,
+       "element": "H",
+       "axis": "z",
+       "fd": 2.621632688715181e-06,
+       "analytic": 2.6177744562141166e-06,
+       "abs_delta": 3.858232501064221e-09
+      }
+     ],
+     "max_abs_delta": 1.2233921815402171e-05,
+     "measured_noise_floor": 0.0,
+     "threshold": 0.00030000000000000003,
+     "within_3x_nominal_floor": true
+    }
+   }
+  },
+  {
+   "tag": "acetaminophen_wb97mv_def2-svp",
+   "atoms": [
+    {
+     "index": 19,
+     "element": "H",
+     "rule": "H on the single hydroxyl O (phenolic H)",
+     "norms_considered": null
+    },
+    {
+     "index": 2,
+     "element": "N",
+     "rule": "the single N of acetaminophen (the amide N)",
+     "norms_considered": null
+    }
+   ],
+   "steps": {
+    "0.0010": {
+     "components": [
+      {
+       "atom": 19,
+       "element": "H",
+       "axis": "x",
+       "fd": 0.0018543465785114677,
+       "analytic": 0.0018306696442698112,
+       "abs_delta": 2.367693424165651e-05
+      },
+      {
+       "atom": 19,
+       "element": "H",
+       "axis": "y",
+       "fd": 0.009418593322152446,
+       "analytic": 0.009415632102781846,
+       "abs_delta": 2.9612193706007872e-06
+      },
+      {
+       "atom": 19,
+       "element": "H",
+       "axis": "z",
+       "fd": 8.565223197365412e-06,
+       "analytic": 8.564809241742594e-06,
+       "abs_delta": 4.1395562281817955e-10
+      },
+      {
+       "atom": 2,
+       "element": "N",
+       "axis": "x",
+       "fd": 0.022659423052573402,
+       "analytic": 0.022667414279315956,
+       "abs_delta": 7.991226742554147e-06
+      },
+      {
+       "atom": 2,
+       "element": "N",
+       "axis": "y",
+       "fd": -0.007832799440166127,
+       "analytic": -0.007853227478908487,
+       "abs_delta": 2.0428038742359433e-05
+      },
+      {
+       "atom": 2,
+       "element": "N",
+       "axis": "z",
+       "fd": -7.636174359504366e-05,
+       "analytic": -7.616215180742021e-05,
+       "abs_delta": 1.9959178762345153e-07
+      }
+     ],
+     "max_abs_delta": 2.367693424165651e-05,
+     "measured_noise_floor": 0.0,
+     "threshold": 0.00030000000000000003,
+     "within_3x_nominal_floor": true
+    },
+    "0.0020": {
+     "components": [
+      {
+       "atom": 19,
+       "element": "H",
+       "axis": "x",
+       "fd": 0.001854350358598822,
+       "analytic": 0.0018306696442698112,
+       "abs_delta": 2.3680714329010755e-05
+      },
+      {
+       "atom": 19,
+       "element": "H",
+       "axis": "y",
+       "fd": 0.009417586397830746,
+       "analytic": 0.009415632102781846,
+       "abs_delta": 1.954295048900434e-06
+      },
+      {
+       "atom": 19,
+       "element": "H",
+       "axis": "z",
+       "fd": 8.564228437535348e-06,
+       "analytic": 8.564809241742594e-06,
+       "abs_delta": 5.808042072459607e-10
+      },
+      {
+       "atom": 2,
+       "element": "N",
+       "axis": "x",
+       "fd": 0.022659573204464323,
+       "analytic": 0.022667414279315956,
+       "abs_delta": 7.841074851633323e-06
+      },
+      {
+       "atom": 2,
+       "element": "N",
+       "axis": "y",
+       "fd": -0.00783333666731778,
+       "analytic": -0.007853227478908487,
+       "abs_delta": 1.9890811590705937e-05
+      },
+      {
+       "atom": 2,
+       "element": "N",
+       "axis": "z",
+       "fd": -7.636438681402069e-05,
+       "analytic": -7.616215180742021e-05,
+       "abs_delta": 2.022350066004791e-07
+      }
+     ],
+     "max_abs_delta": 2.3680714329010755e-05,
+     "measured_noise_floor": 0.0,
+     "threshold": 0.00030000000000000003,
+     "within_3x_nominal_floor": true
+    }
+   }
+  }
+ ],
+ "max_abs_delta_overall": 2.3680714329010755e-05,
+ "all_within_3x_nominal_floor": true
+}
