@@ -39,13 +39,18 @@ def init_timer(rec):
 def timer(rec, msg, cpu0=None, wall0=None, gpu0=None):
     timer_level = getattr(rec, 'TIMER_LEVEL', TIMER_LEVEL)
     if gpu0:
-        t0, w0, e0 = process_clock(), perf_counter(), cupy.cuda.Event()
-        e0.record()
         if rec.verbose >= timer_level:
+            t0, w0, e0 = process_clock(), perf_counter(), cupy.cuda.Event()
+            e0.record()
             e0.synchronize()
             flush(rec, '    CPU time for %-50s %9.2f sec, wall time %9.2f sec, GPU time %9.2f ms'
                   % (msg, t0-cpu0, w0-wall0, cupy.cuda.get_elapsed_time(gpu0,e0)))
-        return t0, w0, e0
+            return t0, w0, e0
+        else:
+            # Below the level the event is never read here; skip the no-op
+            # creation+record and return a chain-consistent tuple whose None
+            # event degrades the next chained call to the wall/cpu branch.
+            return process_clock(), perf_counter(), None
     elif wall0:
         t0, w0 = process_clock(), perf_counter()
         if rec.verbose >= timer_level:
@@ -76,6 +81,9 @@ def _timer_debug1(rec, msg, cpu0=None, wall0=None, gpu0=None, sync=True):
     if rec.verbose >= DEBUG1:
         return timer(rec, msg, cpu0, wall0, gpu0)
     elif gpu0:
+        # Unlike timer/_timer_debug2, the below-level event IS read here:
+        # _TimingCollector (scf/jk.py) wraps timer_debug1 and consumes the
+        # chained events via get_elapsed_time(t1p[2], t1[2]) at any verbosity.
         t0, w0, e0 = process_clock(), perf_counter(), cupy.cuda.Event()
         e0.record()
         return t0, w0, e0
@@ -90,9 +98,9 @@ def _timer_debug2(rec, msg, cpu0=None, wall0=None, gpu0=None, sync=True):
     if rec.verbose >= DEBUG2:
         return timer(rec, msg, cpu0, wall0, gpu0)
     elif gpu0:
-        t0, w0, e0 = process_clock(), perf_counter(), cupy.cuda.Event()
-        e0.record()
-        return t0, w0, e0
+        # Below the level the event is never read (timer_debug2 chains are
+        # star-rebind only); return a chain-consistent tuple with no event.
+        return process_clock(), perf_counter(), None
     elif wall0:
         t0, w0 = process_clock(), perf_counter()
         return t0, w0

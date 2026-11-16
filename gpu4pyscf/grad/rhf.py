@@ -15,6 +15,7 @@
 import time
 import ctypes
 import math
+import os
 import numpy as np
 import cupy as cp
 import cupy
@@ -37,7 +38,8 @@ from gpu4pyscf.scf.jk import (
     _nearest_power2, _TimingCollector)
 from gpu4pyscf.gto.mole import groupby, extract_pgto_params, SortedMole
 from gpu4pyscf.df.int3c2e_bdiv import (
-    Int3c2eOpt, _int3c2e_ip1_evaluator, int3c2e_scheme, int3c2e_scheme_ip1)
+    Int3c2eOpt, _int3c2e_ip1_evaluator, int3c2e_scheme, int3c2e_scheme_ip1,
+    _molecular_int3c2e_opt)
 
 __all__ = [
     'SCF_GradScanner',
@@ -244,6 +246,67 @@ def int1e_ipnuc(mol):
     out = sorted_mol.apply_CT_mat_C(out.reshape(3, nao, nao))
     return out
 
+_NUCIP1_F32 = None       # cached env value; None = not yet read
+_NUCIP1_F32_GRADS = 0    # armed nuc-ip1-f32 grad engagements (evidence counter)
+_NUCIP1_F32_STATS = {}   # realized armed/natm/nao state of the last call either lane
+
+def _nuc_ip1_f32():
+    '''Whether the nuclear-attraction response ip1 kernel of
+    _grad_nuc_without_ecp may run the fp32 twin on the fp64 lane
+    (opt-in precision-policy prototype, D1-ARMGRAD-NUCIP1-F32-01).
+
+    GPU4PYSCF_DF_GRAD_NUC_IP1_F32=1 selects sum_ejk_int3c2e_ip1_f32 for
+    the nuclear-response call of the RHF/RKS/UKS gradient -- the
+    sum_ejk_int3c2e_ip1 launch outside the jk guard box, over the
+    decontracted-sorted mol and the fakemol charge aux (the core of the
+    arm.grad.resid.gint band, entry 636: 0.034/0.045/0.061 s at the
+    434/537/687 production cells).  The entry-113/496 f32-ip1 discipline
+    is preserved exactly: only the integral kernel and its pseudo-DM and
+    charge operands go float32 (the dm cast is the only rounding site --
+    the nuclear charges are exact small integers in fp32); the de/de_aux
+    accumulation targets and everything else stay the deployed verbatim.
+    The strict fp64-reference context forces the knob inert.  The global
+    fp32 mode keeps the deployed fp64 call here (this knob is the only
+    arming path; changing the global-mode composition is not this
+    experiment's variable).  Default OFF.
+    '''
+    global _NUCIP1_F32
+    if _NUCIP1_F32 is None:
+        raw = os.environ.get('GPU4PYSCF_DF_GRAD_NUC_IP1_F32', '')
+        if raw == '1':
+            _NUCIP1_F32 = True
+        elif raw in ('', '0'):
+            _NUCIP1_F32 = False
+        else:
+            import warnings
+            warnings.warn(f'GPU4PYSCF_DF_GRAD_NUC_IP1_F32={raw!r} ignored; '
+                          'expected 1 to enable the fp32 nuclear-response '
+                          'ip1 kernel or 0 (fp64, the default)')
+            _NUCIP1_F32 = False
+    return _NUCIP1_F32
+
+def _strict_fp64_reference_active():
+    '''Whether the current call runs under the strict fp64-reference
+    context (dft.numint.strict_fp64_reference_ctx, armed by
+    stability_verify around its exact-fp64 sibling trajectories).  The
+    nuc-ip1-f32 knob stays inert there: the sibling must reproduce the
+    plain DEFAULT-lane solution.  Lazy import so this module does not
+    pay the dft import at load; attribute read at call time (the flag
+    flips inside the context manager) -- the same home-module pattern
+    as df/grad/rhf.py and grad/rks.py.'''
+    from gpu4pyscf.dft import numint as _numint
+    return bool(_numint._strict_fp64_reference_active)
+
+def _note_nuc_ip1_f32(armed, natm, nao):
+    '''Record the realized armed/natm/nao state of the last
+    _grad_nuc_without_ecp kernel call either lane and bump the
+    engagement counter on the armed lane (a ``global`` in a caller's
+    local scope would not rebind this module's attribute).'''
+    global _NUCIP1_F32_GRADS
+    if armed:
+        _NUCIP1_F32_GRADS += 1
+    _NUCIP1_F32_STATS.update(armed=bool(armed), natm=int(natm), nao=int(nao))
+
 def _grad_nuc_without_ecp(mol, dm0):
     from gpu4pyscf.pbc.gto.int1e import int1e_ipkin
     coords = mol.atom_coords()
@@ -251,7 +314,14 @@ def _grad_nuc_without_ecp(mol, dm0):
     fakemol = gto.fakemol_for_charges(coords)
 
     sorted_mol = SortedMole.from_mol(mol, decontract=True)
-    int3c2e_opt = Int3c2eOpt(sorted_mol, fakemol).build()
+    # CDERI-B2D-HOSTPATH-01 (C1): identity-keyed cache for the
+    # decontracted-sorted mol + fakemol pair (the SCF get_hcore site
+    # populated the plain variant; this decontracted variant is shared with
+    # nothing else, so the first gradient call builds it once and later
+    # calls hit).  Token mismatch fails closed to the verbatim build.
+    int3c2e_opt = _molecular_int3c2e_opt(mol, fakemol, decontract=True)
+    if int3c2e_opt is None:
+        int3c2e_opt = Int3c2eOpt(sorted_mol, fakemol).build()
     dm = sorted_mol.apply_C_mat_CT(dm0)
 
     nsp_per_block, gout_stride, shm_size = int3c2e_scheme(
@@ -265,15 +335,33 @@ def _grad_nuc_without_ecp(mol, dm0):
     ksh_offsets_gpu = cp.asarray(ksh_offsets_cpu+sorted_mol.nbas, dtype=np.int32)
 
     int3c2e_envs = int3c2e_opt.int3c2e_envs
-    kern = libvhf_rys.sum_ejk_int3c2e_ip1
+    # D1-ARMGRAD-NUCIP1-F32-01: the entry-113/496 f32-ip1 discipline applied
+    # to the nuclear-response call (opt-in GPU4PYSCF_DF_GRAD_NUC_IP1_F32,
+    # default off; the strict fp64-reference context forces it inert): only
+    # the integral kernel and its pseudo-DM and charge operands go float32
+    # (the dm cast is the only rounding site -- the nuclear charges are
+    # exact small integers in fp32); the de/de_aux accumulation targets and
+    # everything else stay the deployed verbatim.  _NUCIP1_F32_STATS
+    # records the realized armed/natm/nao state of the last call either
+    # lane.
+    fp32 = _nuc_ip1_f32() and not _strict_fp64_reference_active()
+    if fp32:
+        kern = libvhf_rys.sum_ejk_int3c2e_ip1_f32
+        dm_kern = cp.asarray(dm, dtype=cp.float32, order='C')
+        charges_kern = cp.asarray(charges, dtype=cp.float32)
+    else:
+        kern = libvhf_rys.sum_ejk_int3c2e_ip1
+        dm_kern = dm
+        charges_kern = charges
+    _note_nuc_ip1_f32(fp32, mol.natm, sorted_mol.nao)
     de = cp.zeros((mol.natm, 3))
     # de_aux * 2 is identical to the results of int3c2e.get_dh1e
     de_aux = cp.zeros((mol.natm, 3))
     err = kern(
         ctypes.cast(de.data.ptr, ctypes.c_void_p),
         ctypes.cast(de_aux.data.ptr, ctypes.c_void_p),
-        ctypes.cast(dm.data.ptr, ctypes.c_void_p),
-        ctypes.cast(charges.data.ptr, ctypes.c_void_p),
+        ctypes.cast(dm_kern.data.ptr, ctypes.c_void_p),
+        ctypes.cast(charges_kern.data.ptr, ctypes.c_void_p),
         ctypes.c_int(1),
         ctypes.byref(int3c2e_envs),
         ctypes.c_int(shm_size_max),
@@ -384,9 +472,12 @@ def get_grad_hcore(mf_grad, mo_coeff=None, mo_occ=None):
     # `work` below is batch_size x 3 x nao^2 fp64; a fixed batch of 32
     # allocates 27.6 GB at ~3370 AO (measured 2026-09-13, Azadirachtin
     # def2-qzvp) and OOMs. Cap it by available memory: at most ~1/8 of
-    # free VRAM, at least 1.
+    # free VRAM, at least 1. The factor 8 is the fp64 itemsize: without
+    # it the cap bounds the tensor to 100% of free VRAM instead of the
+    # documented 1/8 (found by the issue-#11 chunk audit, 2026-10-04;
+    # the original fix omitted the itemsize conversion).
     mem_avail = get_avail_mem(exclude_memory_pool=True)
-    batch_size = min(32, natm, max(1, int(mem_avail * .125) // (3 * nao1 * nao1)))
+    batch_size = min(32, natm, max(1, int(mem_avail * .125) // (3 * nao1 * nao1 * 8)))
     omega = 0.
     eval_ip1, _, aux_offsets = _int3c2e_ip1_evaluator(
         opt, int3c2e_scheme_ip1(omega, 27), batch_size, 'fill_int3c2e_ip1', omega)
@@ -585,19 +676,40 @@ class GradientsBase(lib.StreamObject):
     def _resolve_precision(self):
         '''The precision lane this gradient runs in.
 
-        'auto' on the mean-field object means "fp32 early iterations, fp64
-        for the converged energy".  A gradient has no iteration to converge,
-        so there is no fp64 tail to fall back to and 'auto' simply selects
-        fp32 here.  That is the intended reading for a geometry
-        optimisation: the measured fp32 gradient error is ~1e-5 Eh/Bohr, an
-        order of magnitude below geomeTRIC's 3e-4 convergence threshold, so
-        it does not move where the optimiser stops.  Set precision_mode on
-        the gradient object itself to override.
+        'auto' on the mean-field object means "fp32 early iterations,
+        fp64 for the converged energy" -- the mixed precision lives in
+        the SCF head.  For the gradient itself, plain 'auto' resolves
+        fp64: the fp32 gradient casts were measured NEVER faster at any
+        size (SP-21 same-head paired A/B: t_grad fp64/fp32 = 0.971 /
+        1.000 / 0.942 / 0.952 at 270/318/348/522 AO, median 0.961;
+        SP-16's below-gate measurement 0.99-1.15; SP-10's NLC
+        falsification 0.86-1.04 vs a <=0.50 bar) while costing
+        3.2e-7..8.6e-7 Eh/Bohr of isolated gradient error, so riding
+        the exact fp64 kernels is faster-or-equal AND numerically
+        cleaner at every nao (SP-22 extends SP-16's below-gate
+        resolution to all sizes).  Set precision_mode='fp32' on the
+        gradient object to force the fp32 kernels.
+
+        'auto+verify' (the UKS solution-stability policy,
+        gpu4pyscf.scf.stability_verify) keeps fp32 gradient kernels:
+        the verification pass resolves the *solution* selection, not
+        the kernel precision.  'auto+strict' (the strict fp64-reference
+        matching route, stability_verify.verify_reference_match)
+        likewise: it selects the solution (override with
+        precision_mode on this gradient object).
         '''
         mode = self.precision_mode
         if mode is None:
             mode = getattr(self.base, 'precision_mode', None)
         if mode == 'auto':
+            # (SP-22) the fp32 gradient casts are measured non-winners
+            # at every nao (SP-21: 0.942-1.000 above gate, SP-16:
+            # 0.99-1.15 below, SP-10 falsification), so plain auto
+            # resolves the exact fp64 gradient path unconditionally
+            mode = 'fp64'
+        elif mode == 'auto+verify':
+            mode = 'fp32'
+        elif mode == 'auto+strict':
             mode = 'fp32'
         if mode is not None and mode not in ('fp64', 'fp32'):
             raise ValueError(
