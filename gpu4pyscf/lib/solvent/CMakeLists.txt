@@ -19,12 +19,18 @@
 
 set(CMAKE_Fortran_FLAGS "${CMAKE_Fortran_FLAGS} -std=legacy -fPIC")
 set(CMAKE_VERBOSE_MAKEFILE ON)
-add_library(solvent SHARED
-mnsol_interface.f90
-mnsol_mem.F
-mnsol.F
-pcm.cu
-)
+if(GPU4PYSCF_SMD)
+  add_library(solvent SHARED
+    mnsol_interface.f90
+    mnsol_mem.F
+    mnsol.F
+    pcm.cu
+  )
+else()
+  add_library(solvent SHARED
+    pcm.cu
+  )
+endif()
 
 #option(BUILD_SHARED_LIBS "build shared libraries" 1)
 #option(ENABLE_STATIC "Enforce static library build" 0)
