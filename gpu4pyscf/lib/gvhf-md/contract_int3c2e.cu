@@ -28,6 +28,30 @@
 #define THREADS         256
 #define L_AUX_MAX       6
 
+/*
+ * CONTRACTDM-DET-REDUCTION-01 deterministic variant (2026-11-16).
+ *
+ * AUXVEC-WOBBLE-ATTRIB-01 (entry 654) measured that the gvhf-rys twin
+ * of this contraction reassociates at the cross-block atomicAdd of its
+ * per-thread values (the rho wobble origin); this kernel's addends are
+ * the per-(kp, k) block-reduced values thread 0 atomicAdds at the end
+ * of every k-primitive iteration, and the same cross-block arrival
+ * order makes them reassociate run-to-run too.  The template
+ * parameter DET selects an atomic-free lane with the identical
+ * arithmetic: thread 0 accumulates each iteration's block-reduced
+ * value into a private register row det_acc[k] (the kp loop is
+ * sequential, so the intra-block order is the loop order by
+ * construction), and writes the block's PRIVATE partial[block*28+k]
+ * row once at the end; a trailing single-block kernel then folds, for
+ * every aux slot, the partial rows of the slot's own ksh blocks in
+ * ascending by order into the (zeroed) output.  The multiset of
+ * addends is exactly the atomicAdd multiset, so the only arithmetic
+ * delta is the deterministic reassociation.  DET=false (the deployed
+ * contract_int3c2e_dm entry) compiles the det path out and keeps the
+ * atomicAdd lane bit-for-bit.  No extra shared memory on the det lane.
+ */
+#define DET_MD_ROW ((L_AUX_MAX+1)*(L_AUX_MAX+2)/2)
+
 template <int RT_SIZE> __device__ inline
 void iter_Rt_n(double *Rt, double rx, double ry, double rz, int l,
                int nsq_per_block, int gout_id, int gout_stride)
@@ -329,10 +353,11 @@ void _dot_aux(double& out, double *Rt, double *auxvec,
     }
 }
 
-template <int LK, int RT_SIZE> __device__ inline
+template <int LK, int RT_SIZE, bool DET> __device__ inline
 void unrolled_contract_int3c2e(RysIntEnvVars& envs, JKMatrix& jk,
                                int *shl_pair_offsets, uint32_t *bas_ij_idx,
-                               int *pair_ij_loc, int *nsp_lookup)
+                               int *pair_ij_loc, int *nsp_lookup,
+                               double *partial)
 {
     constexpr int lk = LK;
     constexpr int nfk = (lk + 1) * (lk + 2) / 2;
@@ -377,6 +402,16 @@ void unrolled_contract_int3c2e(RysIntEnvVars& envs, JKMatrix& jk,
     double *Rt = shared_memory + (order+1) * nsp_per_block + sp_id;
     uint16_t *p1_ij = Rt2_kl_ij + Rt2_idx_offsets[lij*RT2_MAX+lk];
     int8_t *efg_phase = c_Rt2_efg_phase + Rt2_idx_offsets[lk];
+    // CONTRACTDM-DET-REDUCTION-01: thread 0's private accumulation row
+    // (one register per aux component of this ksh); DET=false compiles
+    // the det path out (no cost on the deployed lane).
+    double det_acc[nfk];
+    if (DET) {
+#pragma unroll
+        for (int k = 0; k < nfk; ++k) {
+            det_acc[k] = 0.;
+        }
+    }
     for (int kp = 0; kp < kprim; ++kp) {
         __syncthreads();
         __shared__ double ak, ck;
@@ -528,28 +563,49 @@ void unrolled_contract_int3c2e(RysIntEnvVars& envs, JKMatrix& jk,
                 val += __shfl_down_sync(0xff, val, offset);
             }
             if (thread_id == 0) {
-                atomicAdd(jk.vj+k0+k, val);
+                if (DET) {
+                    // CONTRACTDM-DET-REDUCTION-01: the deterministic
+                    // lane consumes the same block-reduced value this
+                    // iteration would atomicAdd, into the private row
+                    // (kp loop order = fixed order).
+                    det_acc[k] += val;
+                } else {
+                    atomicAdd(jk.vj+k0+k, val);
+                }
             }
             __syncthreads();
         }
     }
+    if (DET && thread_id == 0) {
+        // CONTRACTDM-DET-REDUCTION-01: the block's private partial row
+        // (one entry per aux component of this ksh); the trailing
+        // det_reduce_contract_md kernel folds the rows in fixed block
+        // order into the (zeroed) output.
+        size_t det_blk = (size_t)blockIdx.x + (size_t)blockIdx.y*gridDim.x;
+#pragma unroll
+        for (int k = 0; k < nfk; ++k) {
+            partial[det_blk*DET_MD_ROW + k] = det_acc[k];
+        }
+    }
 }
 
+template <bool DET>
 __global__ static
 void contract_int3c2e_kernel(RysIntEnvVars envs, JKMatrix jk,
                              int *shl_pair_offsets, uint32_t *bas_ij_idx,
-                             int *pair_ij_loc, int *nsp_lookup)
+                             int *pair_ij_loc, int *nsp_lookup,
+                             double *partial)
 {
     int ksh = gridDim.x - blockIdx.x - 1 + envs.nbas;
     int lk = envs.bas[ANG_OF + ksh*BAS_SLOTS];
     switch (lk) {
-    case 0: unrolled_contract_int3c2e<0,42>(envs, jk, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup); break;
-    case 1: unrolled_contract_int3c2e<1,42>(envs, jk, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup); break;
-    case 2: unrolled_contract_int3c2e<2,42>(envs, jk, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup); break;
-    case 3: unrolled_contract_int3c2e<3,42>(envs, jk, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup); break;
-    case 4: unrolled_contract_int3c2e<4,42>(envs, jk, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup); break;
-    case 5: unrolled_contract_int3c2e<5,42>(envs, jk, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup); break;
-    case 6: unrolled_contract_int3c2e<6,30>(envs, jk, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup); break;
+    case 0: unrolled_contract_int3c2e<0,42,DET>(envs, jk, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup, partial); break;
+    case 1: unrolled_contract_int3c2e<1,42,DET>(envs, jk, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup, partial); break;
+    case 2: unrolled_contract_int3c2e<2,42,DET>(envs, jk, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup, partial); break;
+    case 3: unrolled_contract_int3c2e<3,42,DET>(envs, jk, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup, partial); break;
+    case 4: unrolled_contract_int3c2e<4,42,DET>(envs, jk, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup, partial); break;
+    case 5: unrolled_contract_int3c2e<5,42,DET>(envs, jk, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup, partial); break;
+    case 6: unrolled_contract_int3c2e<6,30,DET>(envs, jk, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup, partial); break;
     }
 }
 
@@ -730,6 +786,211 @@ void unroll_contract_auxvec(RysIntEnvVars& envs, JKMatrix& jk,
     }
 }
 
+/*
+ * J3C-RTCACHE-01 Phase B (opt-in GPU4PYSCF_DF_J_3C_CACHE, default off):
+ * fill the geometry-invariant screened-pair 3c table
+ * T[pair_xyz, aux_cart] (row-major, fp64) once per Int3c2eOpt object.
+ * Mirrors unrolled_contract_int3c2e verbatim in its Rys machinery (same
+ * envs, shl_pair screening, p1_ij gather, efg_phase and _dot_Et<LK> aa-fold
+ * with ck folded through the boys fac).  Instead of contracting with dm_xyz,
+ * the folded per-primitive values are atomicAdd-ed into the table; the
+ * aux-shell primitive loop kp is the only accumulation axis, so the fill
+ * cost is one dm-contraction Rys sweep plus the table write.
+ */
+template <int LK, int RT_SIZE> __device__ inline
+void unrolled_fill_3c_table(RysIntEnvVars& envs, double *table, int naux,
+                            double omega, int *shl_pair_offsets,
+                            uint32_t *bas_ij_idx, int *pair_ij_loc,
+                            int *nsp_lookup)
+{
+    constexpr int lk = LK;
+    constexpr int nfk = (lk + 1) * (lk + 2) / 2;
+    constexpr int nf3k = nfk * (lk + 3) / 3;
+    int sp_block_id = gridDim.y - blockIdx.y - 1;
+    int ksh = gridDim.x - blockIdx.x - 1 + envs.nbas;
+    int thread_id = threadIdx.x;
+    int *bas = envs.bas;
+    double *env = envs.env;
+    __shared__ int shl_pair0, shl_pair1;
+    if (thread_id == 0) {
+        shl_pair0 = shl_pair_offsets[sp_block_id];
+        shl_pair1 = shl_pair_offsets[sp_block_id+1];
+    }
+    __syncthreads();
+    int bas_ij0 = bas_ij_idx[shl_pair0];
+    int ish0 = bas_ij0 / envs.nbas;
+    int jsh0 = bas_ij0 % envs.nbas;
+    int li = bas[ANG_OF + ish0*BAS_SLOTS];
+    int lj = bas[ANG_OF + jsh0*BAS_SLOTS];
+    int lij = li + lj;
+    __shared__ int order, nf3ij, kprim;
+    __shared__ int nsp_per_block, Rt_stride;
+    __shared__ double rk[3];
+    if (thread_id == 0) {
+        order = lij + lk;
+        nf3ij = (lij+1)*(lij+2)*(lij+3) / 6;
+        kprim = bas[ksh*BAS_SLOTS+NPRIM_OF];
+        int rk_ptr = bas[ksh*BAS_SLOTS+PTR_BAS_COORD];
+        rk[0] = env[rk_ptr+0];
+        rk[1] = env[rk_ptr+1];
+        rk[2] = env[rk_ptr+2];
+        nsp_per_block = nsp_lookup[lij*(L_AUX_MAX+1)+lk];
+        Rt_stride = blockDim.x / nsp_per_block;
+    }
+    __syncthreads();
+    int sp_id = thread_id % nsp_per_block;
+    int Rt_id = thread_id / nsp_per_block;
+
+    extern __shared__ double shared_memory[];
+    double *gamma_inc = shared_memory + sp_id;
+    double *Rt = shared_memory + (order+1) * nsp_per_block + sp_id;
+    uint16_t *p1_ij = Rt2_kl_ij + Rt2_idx_offsets[lij*RT2_MAX+lk];
+    int8_t *efg_phase = c_Rt2_efg_phase + Rt2_idx_offsets[lk];
+    int *ao_loc = envs.ao_loc;
+    int k0 = ao_loc[ksh] - ao_loc[envs.nbas];
+    for (int kp = 0; kp < kprim; ++kp) {
+        __syncthreads();
+        __shared__ double ak, ck;
+        if (thread_id == 0) {
+            ck = env[bas[ksh*BAS_SLOTS+PTR_COEFF] + kp] * PI_FAC;
+            ak = env[bas[ksh*BAS_SLOTS+PTR_EXP] + kp];
+        }
+        for (int pair_ij = shl_pair0+sp_id; pair_ij < shl_pair1+sp_id; pair_ij += nsp_per_block) {
+            __syncthreads();
+            int bas_ij;
+            if (pair_ij < shl_pair1) {
+                bas_ij = bas_ij_idx[pair_ij];
+            } else {
+                bas_ij = bas_ij_idx[shl_pair0];
+            }
+            int ish = bas_ij / envs.nbas;
+            int jsh = bas_ij % envs.nbas;
+            double ai = env[bas[ish*BAS_SLOTS+PTR_EXP]];
+            double aj = env[bas[jsh*BAS_SLOTS+PTR_EXP]];
+            double *ri = env + bas[ish*BAS_SLOTS+PTR_BAS_COORD];
+            double *rj = env + bas[jsh*BAS_SLOTS+PTR_BAS_COORD];
+            double aij = ai + aj;
+            double xij = (ai * ri[0] + aj * rj[0]) / aij;
+            double yij = (ai * ri[1] + aj * rj[1]) / aij;
+            double zij = (ai * ri[2] + aj * rj[2]) / aij;
+            double xpq = xij - rk[0];
+            double ypq = yij - rk[1];
+            double zpq = zij - rk[2];
+            double rr = xpq*xpq + ypq*ypq + zpq*zpq;
+            double theta = aij * ak / (aij + ak);
+            if (Rt_id == 0) {
+                double fac = ck/(aij*ak*sqrt(aij+ak));
+                if (pair_ij >= shl_pair1) {
+                    fac = 0;
+                }
+                boys_fn(gamma_inc, theta, rr, omega, fac, order, 0, nsp_per_block);
+                Rt[0] = gamma_inc[order*nsp_per_block];
+                if (order >= 1) {
+                    double _Rt_0 = Rt[0];
+                    Rt[1*nsp_per_block] = zpq * _Rt_0;
+                    Rt[2*nsp_per_block] = ypq * _Rt_0;
+                    Rt[3*nsp_per_block] = xpq * _Rt_0;
+                    Rt[0] = gamma_inc[(order-1)*nsp_per_block];
+                }
+                if (order >= 2) {
+                    double _Rt_0 = Rt[0];
+                    double _Rt_1 = Rt[1*nsp_per_block];
+                    double _Rt_2 = Rt[2*nsp_per_block];
+                    double _Rt_3 = Rt[3*nsp_per_block];
+                    Rt[1*nsp_per_block] = zpq * _Rt_0;
+                    Rt[2*nsp_per_block] = zpq * _Rt_1 + _Rt_0;
+                    Rt[3*nsp_per_block] = ypq * _Rt_0;
+                    Rt[4*nsp_per_block] = ypq * _Rt_1;
+                    Rt[5*nsp_per_block] = ypq * _Rt_2 + _Rt_0;
+                    Rt[6*nsp_per_block] = xpq * _Rt_0;
+                    Rt[7*nsp_per_block] = xpq * _Rt_1;
+                    Rt[8*nsp_per_block] = xpq * _Rt_2;
+                    Rt[9*nsp_per_block] = xpq * _Rt_3 + _Rt_0;
+                    Rt[0] = gamma_inc[(order-2)*nsp_per_block];
+                }
+                if (order >= 3) {
+                    double _Rt_0 = Rt[0];
+                    double _Rt_1 = Rt[1*nsp_per_block];
+                    double _Rt_2 = Rt[2*nsp_per_block];
+                    double _Rt_3 = Rt[3*nsp_per_block];
+                    double _Rt_4 = Rt[4*nsp_per_block];
+                    double _Rt_5 = Rt[5*nsp_per_block];
+                    double _Rt_6 = Rt[6*nsp_per_block];
+                    double _Rt_7 = Rt[7*nsp_per_block];
+                    double _Rt_8 = Rt[8*nsp_per_block];
+                    double _Rt_9 = Rt[9*nsp_per_block];
+                    Rt[1 *nsp_per_block] = zpq * _Rt_0;
+                    Rt[2 *nsp_per_block] = zpq * _Rt_1 + _Rt_0;
+                    Rt[3 *nsp_per_block] = zpq * _Rt_2 + _Rt_1 * 2;
+                    Rt[4 *nsp_per_block] = ypq * _Rt_0;
+                    Rt[5 *nsp_per_block] = ypq * _Rt_1;
+                    Rt[6 *nsp_per_block] = ypq * _Rt_2;
+                    Rt[7 *nsp_per_block] = ypq * _Rt_3 + _Rt_0;
+                    Rt[8 *nsp_per_block] = ypq * _Rt_4 + _Rt_1;
+                    Rt[9 *nsp_per_block] = ypq * _Rt_5 + _Rt_3 * 2;
+                    Rt[10*nsp_per_block] = xpq * _Rt_0;
+                    Rt[11*nsp_per_block] = xpq * _Rt_1;
+                    Rt[12*nsp_per_block] = xpq * _Rt_2;
+                    Rt[13*nsp_per_block] = xpq * _Rt_3;
+                    Rt[14*nsp_per_block] = xpq * _Rt_4;
+                    Rt[15*nsp_per_block] = xpq * _Rt_5;
+                    Rt[16*nsp_per_block] = xpq * _Rt_6 + _Rt_0;
+                    Rt[17*nsp_per_block] = xpq * _Rt_7 + _Rt_1;
+                    Rt[18*nsp_per_block] = xpq * _Rt_8 + _Rt_3;
+                    Rt[19*nsp_per_block] = xpq * _Rt_9 + _Rt_6 * 2;
+                    Rt[0] = gamma_inc[(order-3)*nsp_per_block];
+                }
+            }
+            for (int n = 4; n <= order; ++n) {
+                __syncthreads();
+                iter_Rt_n<RT_SIZE>(Rt, xpq, ypq, zpq, n, nsp_per_block, Rt_id, Rt_stride);
+                if (Rt_id == 0) {
+                    Rt[0] = gamma_inc[(order-n)*nsp_per_block];
+                }
+            }
+            __syncthreads();
+
+            if (pair_ij < shl_pair1) {
+                int ij_loc0 = pair_ij_loc[pair_ij];
+                for (int i = Rt_id; i < nf3ij; i += Rt_stride) {
+                    double vj_xyz[nf3k];
+#pragma unroll
+                    for (int k = 0; k < nf3k; ++k) {
+                        vj_xyz[k] = Rt[p1_ij[k*nf3ij+i]*nsp_per_block]
+                                  * efg_phase[k];
+                    }
+                    double vj_aux[nfk];
+                    _dot_Et<LK>(vj_aux, vj_xyz, ak);
+#pragma unroll
+                    for (int k = 0; k < nfk; ++k) {
+                        atomicAdd(table + (size_t)(ij_loc0+i)*naux + k0 + k,
+                                  vj_aux[k]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+__global__ static
+void fill_3c_table_kernel(RysIntEnvVars envs, double *table, int naux,
+                          double omega, int *shl_pair_offsets,
+                          uint32_t *bas_ij_idx, int *pair_ij_loc,
+                          int *nsp_lookup)
+{
+    int ksh = gridDim.x - blockIdx.x - 1 + envs.nbas;
+    int lk = envs.bas[ANG_OF + ksh*BAS_SLOTS];
+    switch (lk) {
+    case 0: unrolled_fill_3c_table<0,42>(envs, table, naux, omega, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup); break;
+    case 1: unrolled_fill_3c_table<1,42>(envs, table, naux, omega, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup); break;
+    case 2: unrolled_fill_3c_table<2,42>(envs, table, naux, omega, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup); break;
+    case 3: unrolled_fill_3c_table<3,42>(envs, table, naux, omega, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup); break;
+    case 4: unrolled_fill_3c_table<4,42>(envs, table, naux, omega, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup); break;
+    case 5: unrolled_fill_3c_table<5,42>(envs, table, naux, omega, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup); break;
+    case 6: unrolled_fill_3c_table<6,30>(envs, table, naux, omega, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup); break;
+    }
+}
+
 __global__ static
 void contract_auxvec_kernel(RysIntEnvVars envs, JKMatrix jk,
                             int *shl_pair_offsets, int *ksh_offsets,
@@ -751,6 +1012,29 @@ void contract_auxvec_kernel(RysIntEnvVars envs, JKMatrix jk,
 }
 
 extern "C" {
+// J3C-RTCACHE-01 Phase B (opt-in GPU4PYSCF_DF_J_3C_CACHE, default off):
+// fill T[pair_xyz, naux] (row-major fp64) with the screened-pair
+// geometry-invariant 3c table.  T must be zero-initialized by the caller;
+// the kernel accumulates over aux-shell primitives with atomicAdd.
+int fill_3c_table(double *table, int naux, RysIntEnvVars *envs, int shm_size,
+                  int nbatches_shl_pair, int nksh,
+                  int *shl_pair_offsets, uint32_t *bas_ij_idx,
+                  int *pair_ij_loc, int *nsp_lookup, double omega)
+{
+    cudaFuncSetAttribute(fill_3c_table_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    dim3 threads(THREADS);
+    dim3 blocks(nksh, nbatches_shl_pair);
+    fill_3c_table_kernel<<<blocks, threads, shm_size>>>(
+        *envs, table, naux, omega, shl_pair_offsets, bas_ij_idx,
+        pair_ij_loc, nsp_lookup);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error in fill_3c_table, error message = %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
 // contract('ijP,ji->P', int3c2e, dm)
 int contract_int3c2e_dm(double *vj, double *dm, int n_dm, int naux,
                         RysIntEnvVars *envs, int shm_size,
@@ -759,15 +1043,83 @@ int contract_int3c2e_dm(double *vj, double *dm, int n_dm, int naux,
                         int *pair_ij_loc, int *nsp_lookup, double omega)
 {
     assert(n_dm == 1);
-    cudaFuncSetAttribute(contract_int3c2e_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    cudaFuncSetAttribute(contract_int3c2e_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
     JKMatrix jk = {vj, NULL, dm, n_dm, 0, omega};
     dim3 threads(THREADS);
     dim3 blocks(nksh, nbatches_shl_pair);
-    contract_int3c2e_kernel<<<blocks, threads, shm_size>>>(
-        *envs, jk, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup);
+    contract_int3c2e_kernel<false><<<blocks, threads, shm_size>>>(
+        *envs, jk, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup, NULL);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA Error in contract_int3c2e_dm, error message = %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
+// CONTRACTDM-DET-REDUCTION-01: fixed-order block reduction of the
+// per-block partial rows into the (zeroed) vj accumulation target.
+// One block; the owner of aux slot a (thread a % THREADS, strided)
+// locates a's aux shell via ao_loc (the ksh<->blockIdx.x mapping is
+// reversed in this kernel: bx = nksh-1-ish), then sums the partial
+// rows of that shell's blocks in ascending by order -- a single
+// writer per slot and a fixed summation order, so the result is
+// bitwise reproducible run-to-run for identical inputs.
+__global__ static
+void det_reduce_contract_md(double *vj, double *partial, int naux,
+                            int nksh, int nbatches_shl_pair,
+                            RysIntEnvVars envs)
+{
+    int nbas = envs.nbas;
+    int *ao_loc = envs.ao_loc;
+    // the conc ao_loc is absolute (offset by the mol AO count); the
+    // output slots are aux-relative, so search in the relative frame
+    int aux0 = ao_loc[nbas];
+    for (int a = threadIdx.x; a < naux; a += THREADS) {
+        // a's aux shell: smallest ish with aux_end(ish) > a
+        // (correct also in the presence of empty shells)
+        int lo = 0, hi = nksh - 1;
+        while (lo < hi) {
+            int mid = (lo + hi) >> 1;
+            if (ao_loc[nbas+mid+1] - aux0 > a) hi = mid; else lo = mid + 1;
+        }
+        int k0 = ao_loc[nbas+lo] - aux0;
+        int k = a - k0;
+        int bx = nksh - 1 - lo;
+        double acc = 0.;
+        for (int by = 0; by < nbatches_shl_pair; ++by) {
+            acc += partial[(size_t)(bx + by*nksh)*DET_MD_ROW + k];
+        }
+        vj[a] += acc;
+    }
+}
+
+// CONTRACTDM-DET-REDUCTION-01 deterministic entry: identical arithmetic
+// to contract_int3c2e_dm (same kernel body, same operands, same
+// per-addend values -- only the accumulation order is fixed); the
+// caller provides a ZEROED partial buffer of (nksh*nbatches_shl_pair,
+// 28) doubles and the entry folds it into vj with the fixed-order
+// det_reduce_contract_md kernel on the same stream.  No extra shared
+// memory on the det lane.
+int contract_int3c2e_dm_det(double *vj, double *dm, int n_dm, int naux,
+                            RysIntEnvVars *envs, int shm_size,
+                            int nbatches_shl_pair, int nksh,
+                            int *shl_pair_offsets, uint32_t *bas_ij_idx,
+                            int *pair_ij_loc, int *nsp_lookup, double omega,
+                            double *partial)
+{
+    assert(n_dm == 1);
+    cudaFuncSetAttribute(contract_int3c2e_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    JKMatrix jk = {vj, NULL, dm, n_dm, 0, omega};
+    dim3 threads(THREADS);
+    dim3 blocks(nksh, nbatches_shl_pair);
+    contract_int3c2e_kernel<true><<<blocks, threads, shm_size>>>(
+        *envs, jk, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup, partial);
+    det_reduce_contract_md<<<1, THREADS>>>(
+        vj, partial, naux, nksh, nbatches_shl_pair, *envs);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error in contract_int3c2e_dm_det, error message = %s\n", cudaGetErrorString(err));
         return 1;
     }
     return 0;
