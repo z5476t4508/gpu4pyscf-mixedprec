@@ -170,9 +170,13 @@ class KnownValues(unittest.TestCase):
         self.assertLess(float(np.abs(got-ref).max()), 1e-5)
 
     def test_gradient_inherits_the_scf_precision_mode(self):
-        '''an SCF's 'auto' carries into the gradient as fp32: the gradient has
-        no iteration to converge, so there is no fp64 tail to fall back to.
-        The global mode must still be restored to fp64 afterwards.'''
+        '''an SCF's 'auto' carries into the gradient: above
+        _AUTO_HEAD_MIN_AO it resolves fp32 (no iteration to converge, no
+        fp64 tail); below the gate (SP-16, this 24-AO mol) the whole
+        plain-auto lane rides the exact fp64 path, gradient included --
+        the fp32 gradient casts are measured non-winners there (SP-10/
+        SP-15).  The global mode must still be restored to fp64
+        afterwards.'''
         mf = dft.RKS(mol, xc='r2scan').density_fit()
         mf.conv_tol = 1e-10
         mf.precision_mode = 'auto'
@@ -180,7 +184,7 @@ class KnownValues(unittest.TestCase):
         self.assertEqual(precision.get_precision(), 'fp64')
         g = mf.nuc_grad_method()
         g.auxbasis_response = True
-        self.assertEqual(g._resolve_precision(), 'fp32')
+        self.assertEqual(g._resolve_precision(), 'fp64')
         de = g.kernel()
         self.assertEqual(precision.get_precision(), 'fp64')
 
