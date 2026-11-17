@@ -535,7 +535,7 @@ def get_eda_electrostatic_energy(mf_list, _make_mf, eda_cache, build_orbital_hes
             E_en_ji = V1e_i.T @ nucleus_charge_i
 
             nucleus_rij = nucleus_position_i[:, np.newaxis, :] - nucleus_position_j[np.newaxis, :, :]
-            nucleus_rij = np.linalg.norm(nucleus_rij, axis = -1)
+            nucleus_rij = cp.linalg.norm(nucleus_rij, axis = -1)
             nucleus_qiqj_rij = nucleus_charge_i[:, np.newaxis] * nucleus_charge_j[np.newaxis, :] / nucleus_rij
             E_nn_ij = cp.sum(nucleus_qiqj_rij)
 
@@ -915,7 +915,8 @@ def get_eda_polarization_energy(mf_list, _make_mf, eda_cache, G_projector_list):
             F_stoll_i = None
             S_stoll_i = None
 
-            F_S_list.append((F_stoll_i_ii, S_stoll_i_ii))
+            F_S_list.append((cp.asarray(F_stoll_i_ii, order='C'),
+                             cp.asarray(S_stoll_i_ii, order='C')))
             F_stoll_i_ii = None
             S_stoll_i_ii = None
 
