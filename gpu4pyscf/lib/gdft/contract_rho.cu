@@ -287,6 +287,62 @@ void fscale_ao_kernel(float *out, float *ket, float *wv,
     out[ixy] = val;
 }
 
+// VMAT-CASTSCALE-F32-01 (2026-11-17): the fused twin of the contr_f32
+// vmat loop's two staging passes.  The deployed lane runs the fp64->fp32
+// AO cast (ao.astype(float32), the s.ao_f32 stage) and then
+// fscale_ao_kernel on the cast twin (the s.scale stage) -- two full
+// passes over the (nvar,nao,ngrids) block.  Only the VALUE component
+// (n==0) feeds the Fock dot; the derivative components are read by the
+// contraction alone (GGA, write_all_comps == 0: they never touch global
+// memory on the fused path) or additionally by the tau dot (MGGA,
+// write_all_comps == 1: all nvar planes written for its consumers).
+// Each component is cast in-register with the same round-to-nearest
+// conversion the astype pass uses ((float)double == cvt.rn.f32.f64) and
+// the contraction accumulates in the same ascending-n fp32 order as
+// fscale_ao_kernel, so the outputs are bitwise identical to the
+// deployed two-pass; only the memory traffic changes.  wv_stride is the
+// row stride of the wv slices (the caller passes full-grid slices, not
+// contiguous copies); wv_b/aow_b serve the UKS dual-spin variant (both
+// spins' contractions from the same fp64 read, cast once).
+static __global__
+void fcast_scale_ao_kernel(const double *ket, const double *wv_a,
+                           const double *wv_b, float *ao32,
+                           float *aow_a, float *aow_b,
+                           int ngrids, int nao, int nvar,
+                           int wv_stride, int write_all_comps)
+{
+    int grid_id = blockIdx.x * blockDim.x + threadIdx.x;
+    int ao_id = blockIdx.y * blockDim.y + threadIdx.y;
+    if (grid_id >= ngrids || ao_id >= nao) {
+        return;
+    }
+
+    size_t Ngrids = ngrids;
+    size_t Nag = nao * Ngrids;
+    size_t ixy = grid_id + ao_id * Ngrids;
+    size_t wv_off = grid_id;
+    float val_a = 0;
+    float val_b = 0;
+    int n;
+    for (n = 0; n < nvar; ++n) {
+        float a32 = (float)ket[ixy + Nag * n];
+        if (write_all_comps) {
+            ao32[ixy + Nag * n] = a32;
+        } else if (n == 0) {
+            ao32[ixy] = a32;
+        }
+        val_a += a32 * (float)wv_a[wv_off];
+        if (wv_b != NULL) {
+            val_b += a32 * (float)wv_b[wv_off];
+        }
+        wv_off += wv_stride;
+    }
+    aow_a[ixy] = val_a;
+    if (aow_b != NULL) {
+        aow_b[ixy] = val_b;
+    }
+}
+
 static __global__
 void zscale_ao_kernel(double *out, double *ket, double *wv,
                       int ngrids, int nao, int nvar)
@@ -467,6 +523,30 @@ int GDFTscale_ao_f32(float *out, float *ket, float *wv,
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA Error of GDFTscale_ao_f32: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
+// VMAT-CASTSCALE-F32-01: fused cast+scale entry (see the kernel comment
+// above).  ao32 layout: write_all_comps != 0 -> (nvar,nao,ngrids); == 0
+// -> the value component only, (nao,ngrids).  wv_a/wv_b are full-grid
+// row slices of stride wv_stride; wv_b/aow_b may be NULL (single-spin).
+int GDFTcast_scale_ao_f32(float *ao32, float *aow_a, float *aow_b,
+                          double *ket, double *wv_a, double *wv_b,
+                          int ngrids, int nao, int nvar, int wv_stride,
+                          int write_all_comps)
+{
+    dim3 threads(BLKSIZEX, BLKSIZEY);
+    dim3 blocks((ngrids+BLKSIZEX-1)/BLKSIZEX, (nao+BLKSIZEY-1)/BLKSIZEY);
+    fcast_scale_ao_kernel<<<blocks, threads>>>(ket, wv_a, wv_b, ao32,
+                                               aow_a, aow_b, ngrids, nao,
+                                               nvar, wv_stride,
+                                               write_all_comps);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error of GDFTcast_scale_ao_f32: %s\n",
+                cudaGetErrorString(err));
         return 1;
     }
     return 0;
