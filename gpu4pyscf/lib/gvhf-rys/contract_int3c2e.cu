@@ -33,6 +33,43 @@
 #define IJ_WIDTH        36
 #define DM_BATCH_SIZE   4
 
+/*
+ * CONTRACTDM-DET-REDUCTION-01 deterministic variant (2026-11-16).
+ *
+ * AUXVEC-WOBBLE-ATTRIB-01 (entry 654) measured that this kernel's
+ * cross-block atomicAdd reassociation of _store_vj_aux (lines below) is
+ * the origin of the auxvec-pipeline wobble: the per-thread vj_xyz values
+ * land in arrival order, so consecutive identical launches differ on
+ * ~2423-2425/3080 aux slots (max 9.1e-13) at the drifted cell, and the
+ * near-singular CD metric amplifies that 1e-12-class rho wobble ~1e6x
+ * into the 6-8e-7 k-repeat total drift.  The template parameter DET
+ * selects an atomic-free segmented reduction with the identical
+ * arithmetic: every per-thread vj_xyz addend of the dm pass is staged
+ * conflict-free in shared memory (chunks of DET_STAGE_CHUNK threads at
+ * AUX_CACHE_SIZE-wide rows, above every transient shared region the
+ * kernel touches), and the single owner thread of each output slot
+ * (slot index == threadIdx.x, < NF*n_dm_remaining) consumes the entries
+ * in ascending source-thread order into a register accumulator; the
+ * owner writes the block's PRIVATE partial[block, M*AUX_CACHE_SIZE+k]
+ * row (M = the global dm row).  A trailing single-block kernel then
+ * folds, for every (M, aux slot) pair, the partial rows of the slot's
+ * own ksh blocks in ascending by order into the (zeroed) output.  The
+ * multiset of addends is exactly the atomicAdd multiset (every thread's
+ * final vj_xyz value per pass, staged at the same program point), so
+ * the only arithmetic delta is the deterministic reassociation.
+ * DET=false (the deployed contract_int3c2e_dm entry) compiles the whole
+ * det path out and keeps the atomicAdd lane bit-for-bit.
+ */
+
+// threads staged per chunk of the deterministic fold: 8*30 doubles
+// (1920 B) of shared memory above the transient regions -- sized so
+// the worst int3c2e_scheme class (shm 97832 B at lk=5,li=3,lj=4) plus
+// DET_STAGE_BYTES stays inside the 101376 B per-block opt-in limit;
+// the host adds DET_STAGE_BYTES to the launch's dynamic shared size
+// on the det entry
+#define DET_STAGE_CHUNK  8
+#define DET_STAGE_BYTES  (DET_STAGE_CHUNK*AUX_CACHE_SIZE*8 + 64)
+
 template <int NF, int N_DM> __device__ __forceinline__
 void _dot_dm(double *vj_xyz, double *gout, double *dm, int n_dm, size_t nao2)
 {
@@ -57,6 +94,45 @@ void _store_vj_aux(double *out, double *vj_xyz, int n_dm, int naux)
         for (uint32_t k = 0; k < NF; k++) {
             atomicAdd(out+m*naux+k, vj_xyz[m*NF+k]);
         }
+    }
+}
+
+// CONTRACTDM-DET-REDUCTION-01: deterministic replacement of _store_vj_aux
+// for the det lane.  row points at this block's PRIVATE partial row
+// (width n_dm_total*AUX_CACHE_SIZE); stage is the shared staging region
+// above every transient shared region.  Every thread's vj_xyz addend is
+// staged in chunks of DET_STAGE_CHUNK threads; the owner of slot s
+// (thread s < NF*n_dm) consumes the staged entries in ascending
+// source-thread order and writes the block's partial-row entry for
+// (dm row dm_id0+s/NF, aux component s%NF).  No atomics.
+template <int NF, int N_DM> __device__ __forceinline__
+void _store_vj_aux_det(double *vj_xyz, int n_dm, int dm_id0,
+                       int n_dm_total, double *row, double *stage)
+{
+    int thread_id = threadIdx.x;
+    // the deployed _store_vj_aux consumes m < min(n_dm, N_DM) (the
+    // register cache only holds that many dm slots); match it exactly
+    int n_dm_eff = n_dm < N_DM ? n_dm : N_DM;
+    int nslots = NF * n_dm_eff;
+    double acc = 0.;
+    for (int c = 0; c < THREADS; c += DET_STAGE_CHUNK) {
+        if (thread_id >= c && thread_id < c + DET_STAGE_CHUNK) {
+            for (int s = 0; s < nslots; ++s) {
+                stage[(thread_id - c)*AUX_CACHE_SIZE + s] = vj_xyz[s];
+            }
+        }
+        __syncthreads();
+        if (thread_id < nslots) {
+#pragma unroll 8
+            for (int e = 0; e < DET_STAGE_CHUNK; ++e) {
+                acc += stage[e*AUX_CACHE_SIZE + thread_id];
+            }
+        }
+        __syncthreads();
+    }
+    if (thread_id < nslots) {
+        int M = dm_id0 + thread_id / NF;
+        row[(size_t)M*AUX_CACHE_SIZE + thread_id % NF] = acc;
     }
 }
 
@@ -114,10 +190,12 @@ void _store_vj(double *out, double *vj_cache, int li, int lj, size_t nao,
     }
 }
 
+template <bool DET>
 __global__ static
 void contract_int3c2e_dm_kernel(double *out, double *dm, int n_dm, int naux,
                                 RysIntEnvVars envs, int *shl_pair_offsets,
-                                uint32_t *bas_ij_idx, int *gout_stride_lookup)
+                                uint32_t *bas_ij_idx, int *gout_stride_lookup,
+                                double *partial)
 {
     int thread_id = threadIdx.x;
     int nbas = envs.nbas;
@@ -168,6 +246,20 @@ void contract_int3c2e_dm_kernel(double *out, double *dm, int n_dm, int naux,
     int nfi = c_nf[li];
     int nfj = c_nf[lj];
     int nfk = c_nf[lk];
+    // CONTRACTDM-DET-REDUCTION-01 staging base: above every transient
+    // shared region this kernel touches (rjri/Rpq/gx/rw plus the
+    // idx_i/idx_j/idx_k int arrays); DET=false compiles the whole det
+    // path out (dead computation, no cost on the deployed lane).
+    double *stage = NULL;
+    double *det_row = NULL;
+    if (DET) {
+        int idx_bytes = (nfi*3 + nfj*3 + nfk*3) * 4;
+        int stage_off = nst_per_block*(g_size*3 + nroots*2 + 6)
+                        + (idx_bytes + 7) / 8;
+        stage = shared_memory + stage_off;
+        det_row = partial + (size_t)(blockIdx.x + blockIdx.y*gridDim.x)
+                          * (n_dm*AUX_CACHE_SIZE);
+    }
     int stride_j = li + 1;
     int stride_k = stride_j * (lj + 1);
     int gx_len = g_size * nst_per_block;
@@ -326,16 +418,32 @@ while (dm_id0 < n_dm) {
         }
     }
     int k0 = ao_loc[ksh] - ao_loc[nbas];
-    double *vj = out + k0 + dm_id0 * naux;
     int dm_remaining = n_dm - dm_id0;
-    switch (lk) {
-    case 0: _store_vj_aux<1,10>(vj, vj_xyz, dm_remaining, naux); break;
-    case 1: _store_vj_aux<3,10>(vj, vj_xyz, dm_remaining, naux); break;
-    case 2: _store_vj_aux<6, 5>(vj, vj_xyz, dm_remaining, naux); break;
-    case 3: _store_vj_aux<10,3>(vj, vj_xyz, dm_remaining, naux); break;
-    case 4: _store_vj_aux<15,2>(vj, vj_xyz, dm_remaining, naux); break;
-    case 5: _store_vj_aux<21,1>(vj, vj_xyz, dm_remaining, naux); break;
-    case 6: _store_vj_aux<28,1>(vj, vj_xyz, dm_remaining, naux); break;
+    if (DET) {
+        // CONTRACTDM-DET-REDUCTION-01: the deterministic fold into this
+        // block's private partial row (same vj_xyz addends, fixed
+        // source-thread order); the trailing det_reduce_contract_dm
+        // kernel folds the rows into out in fixed block order.
+        switch (lk) {
+        case 0: _store_vj_aux_det<1,10>(vj_xyz, dm_remaining, dm_id0, n_dm, det_row, stage); break;
+        case 1: _store_vj_aux_det<3,10>(vj_xyz, dm_remaining, dm_id0, n_dm, det_row, stage); break;
+        case 2: _store_vj_aux_det<6, 5>(vj_xyz, dm_remaining, dm_id0, n_dm, det_row, stage); break;
+        case 3: _store_vj_aux_det<10,3>(vj_xyz, dm_remaining, dm_id0, n_dm, det_row, stage); break;
+        case 4: _store_vj_aux_det<15,2>(vj_xyz, dm_remaining, dm_id0, n_dm, det_row, stage); break;
+        case 5: _store_vj_aux_det<21,1>(vj_xyz, dm_remaining, dm_id0, n_dm, det_row, stage); break;
+        case 6: _store_vj_aux_det<28,1>(vj_xyz, dm_remaining, dm_id0, n_dm, det_row, stage); break;
+        }
+    } else {
+        double *vj = out + k0 + dm_id0 * naux;
+        switch (lk) {
+        case 0: _store_vj_aux<1,10>(vj, vj_xyz, dm_remaining, naux); break;
+        case 1: _store_vj_aux<3,10>(vj, vj_xyz, dm_remaining, naux); break;
+        case 2: _store_vj_aux<6, 5>(vj, vj_xyz, dm_remaining, naux); break;
+        case 3: _store_vj_aux<10,3>(vj, vj_xyz, dm_remaining, naux); break;
+        case 4: _store_vj_aux<15,2>(vj, vj_xyz, dm_remaining, naux); break;
+        case 5: _store_vj_aux<21,1>(vj, vj_xyz, dm_remaining, naux); break;
+        case 6: _store_vj_aux<28,1>(vj, vj_xyz, dm_remaining, naux); break;
+        }
     }
     __syncthreads();
     if (thread_id == 0) {
@@ -561,13 +669,90 @@ int contract_int3c2e_dm(double *out, double *dm, int n_dm, int naux,
                         int nbas_aux, int nbatches_shl_pair, int *shl_pair_offsets,
                         uint32_t *bas_ij_idx, int *gout_stride_lookup)
 {
-    cudaFuncSetAttribute(contract_int3c2e_dm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    cudaFuncSetAttribute(contract_int3c2e_dm_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
     dim3 blocks(nbas_aux, nbatches_shl_pair);
-    contract_int3c2e_dm_kernel<<<blocks, THREADS, shm_size>>>(
-            out, dm, n_dm, naux, *envs, shl_pair_offsets, bas_ij_idx, gout_stride_lookup);
+    contract_int3c2e_dm_kernel<false><<<blocks, THREADS, shm_size>>>(
+            out, dm, n_dm, naux, *envs, shl_pair_offsets, bas_ij_idx, gout_stride_lookup, NULL);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA Error in contract_int3c2e_dm: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
+// CONTRACTDM-DET-REDUCTION-01: fixed-order block reduction of the
+// per-block partial rows into the (zeroed) out accumulation target.
+// One block; the owner of flat slot f = M*naux + a (thread f %
+// THREADS, strided) locates a's aux shell via ao_loc, then sums the
+// partial rows of that shell's blocks (flat ids lo + by*gridDim.x,
+// ascending by) -- a single writer per slot and a fixed summation
+// order, so the result is bitwise reproducible run-to-run for
+// identical inputs.
+__global__ static
+void det_reduce_contract_dm(double *out, double *partial, int n_dm, int naux,
+                            int nbas_aux, int nbatches_shl_pair,
+                            RysIntEnvVars envs)
+{
+    int nbas = envs.nbas;
+    int *ao_loc = envs.ao_loc;
+    // the conc ao_loc is absolute (offset by the mol AO count); the
+    // output slots are aux-relative, so search in the relative frame
+    int aux0 = ao_loc[nbas];
+    int nblocks = nbas_aux * nbatches_shl_pair;
+    size_t row_dbl = (size_t)n_dm * AUX_CACHE_SIZE;
+    for (int f = threadIdx.x; f < n_dm*naux; f += THREADS) {
+        int M = f / naux;
+        int a = f - M*naux;
+        // a's aux shell: smallest ish with aux_end(ish) > a
+        // (correct also in the presence of empty shells)
+        int lo = 0, hi = nbas_aux - 1;
+        while (lo < hi) {
+            int mid = (lo + hi) >> 1;
+            if (ao_loc[nbas+mid+1] - aux0 > a) hi = mid; else lo = mid + 1;
+        }
+        int k0 = ao_loc[nbas+lo] - aux0;
+        int k = a - k0;
+        double acc = 0.;
+        for (int b = lo; b < nblocks; b += nbas_aux) {
+            acc += partial[(size_t)b*row_dbl + (size_t)M*AUX_CACHE_SIZE + k];
+        }
+        out[f] += acc;
+    }
+}
+
+// CONTRACTDM-DET-REDUCTION-01 deterministic entry: identical arithmetic
+// to contract_int3c2e_dm (same kernel body, same operands, same
+// per-addend values -- only the accumulation order is fixed); the
+// caller provides a ZEROED partial buffer of
+// (nbas_aux*nbatches_shl_pair, n_dm*30) doubles and the entry folds it
+// into out with the fixed-order det_reduce_contract_dm kernel on the
+// same stream.  The staging region needs DET_STAGE_BYTES of shared
+// memory above the transient regions; if the attribute raise fails at
+// the cell's shm budget the entry returns 1 (the caller raises -- no
+// silent fallback to the atomic lane).
+int contract_int3c2e_dm_det(double *out, double *dm, int n_dm, int naux,
+                            RysIntEnvVars *envs, int shm_size,
+                            int nbas_aux, int nbatches_shl_pair, int *shl_pair_offsets,
+                            uint32_t *bas_ij_idx, int *gout_stride_lookup,
+                            double *partial)
+{
+    int det_shm = shm_size + DET_STAGE_BYTES;
+    cudaError_t err = cudaFuncSetAttribute(contract_int3c2e_dm_kernel<true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, det_shm);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error in contract_int3c2e_dm_det (shm %d): %s\n",
+                det_shm, cudaGetErrorString(err));
+        return 1;
+    }
+    dim3 blocks(nbas_aux, nbatches_shl_pair);
+    contract_int3c2e_dm_kernel<true><<<blocks, THREADS, det_shm>>>(
+            out, dm, n_dm, naux, *envs, shl_pair_offsets, bas_ij_idx, gout_stride_lookup, partial);
+    det_reduce_contract_dm<<<1, THREADS>>>(
+            out, partial, n_dm, naux, nbas_aux, nbatches_shl_pair, *envs);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error in contract_int3c2e_dm_det: %s\n", cudaGetErrorString(err));
         return 1;
     }
     return 0;
