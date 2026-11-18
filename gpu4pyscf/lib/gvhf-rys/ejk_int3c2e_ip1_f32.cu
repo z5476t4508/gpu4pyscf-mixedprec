@@ -29,6 +29,35 @@
  * around 1e-9 absolute on the gradient.
  */
 
+/*
+ * GRADAUX-DET-REDUCTION-01 deterministic variant (2026-11-16).
+ *
+ * M5-DRIFT-ATTRIB-01 (entry 645) measured that this kernel's cross-block
+ * atomicAdd reassociation of the ejk/ejk_aux accumulation targets is the
+ * wobble carrier behind the ~1e-6 Eh/Bohr k-repeat gradient drift at the
+ * drifted cell class, and that on the fp64 lane the same wobble cancels
+ * elementwise against the 2-center response only when both sides
+ * reassociate identically -- which the f32-quantized accumulation of this
+ * kernel does not.  The template parameter DET selects an atomic-free
+ * segmented reduction with the identical arithmetic: every per-iteration
+ * block-reduction result is staged conflict-free at its own st_id shared
+ * slot, consumed in ascending st_id order by the single owner thread of
+ * each gradient slot (slot % THREADS), and accumulated into this block's
+ * PRIVATE partial[block, slot] row (first natm*3 slots = ejk, next
+ * natm*3 = ejk_aux); a trailing single-block kernel then sums the rows in
+ * fixed block order into ejk/ejk_aux.  The multiset of addends is exactly
+ * the atomicAdd multiset (same staged values at the same program points),
+ * so the only arithmetic delta is the deterministic reassociation.
+ * DET=false (the deployed sum_ejk_int3c2e_ip1_f32 entry) compiles the
+ * staging out and keeps the atomicAdd lane bit-for-bit.
+ *
+ * The staging lives in the shared-memory over-provision the double-based
+ * int3c2e_scheme already reserves for this float32 kernel: the det region
+ * starts above every transient region the kernel touches (the rw tail or
+ * the block-reduction scratch, whichever is higher), and nst*10 floats
+ * always fit in the free half (unit >= 14 for every (lk,li,lj) class).
+ */
+
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -231,12 +260,14 @@ static void rys_roots_rs_f32(int nroots, float theta, float rr, double omega,
         } \
         __syncthreads()
 
+template <bool DET>
 __global__ static
 void sum_ejk_int3c2e_ip1_kernel_f32(double *ejk, double *ejk_aux,
                             float *dm, float *density_auxvec, int n_dm,
                             RysIntEnvVars envs, int *shl_pair_offsets, uint32_t *bas_ij_idx,
                             int *ksh_offsets, int *gout_stride_lookup,
-                            int *ao_pair_loc, int aux_offset, int naux)
+                            int *ao_pair_loc, int aux_offset, int naux,
+                            double *partial)
 {
     // For better load balance, consume blocks in the reversed order
     int thread_id = threadIdx.x;
@@ -304,6 +335,25 @@ void sum_ejk_int3c2e_ip1_kernel_f32(double *ejk, double *ejk_aux,
     int idx_i = lex_xyz_offset(li);
     int idx_j = lex_xyz_offset(lj);
     int idx_k = lex_xyz_offset(lk);
+    // GRADAUX-DET-REDUCTION-01 staging for the deterministic lane: the det
+    // region starts above every transient shared region this kernel
+    // touches (the rw tail or the block-reduction scratch at nsp*3 +
+    // 6*THREADS, whichever is higher); see the file header.  DET=false
+    // compiles the whole block out (dead computation, no register cost on
+    // the deployed lane).
+    int ns = 0, ns2 = 0, blk = 0;
+    float *stage_v = NULL;
+    int *stage_atm = NULL;
+    if (DET) {
+        int stage_off = nst_per_block*(g_size*3 + 6 + nroots*2);
+        int reduce_top = nsp_per_block*3 + 6*THREADS;
+        if (reduce_top > stage_off) stage_off = reduce_top;
+        stage_v = shared_memory + stage_off;
+        stage_atm = (int *)(shared_memory + stage_off + nst_per_block*8);
+        ns = envs.natm*3;
+        ns2 = ns*2;
+        blk = blockIdx.x + blockIdx.y*gridDim.x;
+    }
 
     for (int pair_ij = shl_pair0+sp_id; pair_ij < shl_pair1+sp_id; pair_ij += nsp_per_block) {
         // The cross-thread reduction below runs through a float shared-memory
@@ -539,10 +589,42 @@ void sum_ejk_int3c2e_ip1_kernel_f32(double *ejk, double *ejk_aux,
                         }
                     }
                 }
-                if (gout_id == 0 && pair_ij < shl_pair1 && kidx < ksh1) {
-                    atomicAdd(ejk_aux+ka*3+0, reduce[0*THREADS]);
-                    atomicAdd(ejk_aux+ka*3+1, reduce[1*THREADS]);
-                    atomicAdd(ejk_aux+ka*3+2, reduce[2*THREADS]);
+                if (gout_id == 0) {
+                    int active = pair_ij < shl_pair1 && kidx < ksh1;
+                    if (DET) {
+                        // stage the block-reduced aux contributions at the
+                        // issuer's own st_id slot (inactive padding entries
+                        // carry the -1 sentinel); the scan below is the
+                        // only reader, separated by barriers
+                        stage_atm[st_id*2+0] = active ? ka : -1;
+                        stage_atm[st_id*2+1] = -1;
+                        for (int m = 0; m < 3; ++m) {
+                            stage_v[st_id*8+m] = active ? reduce[m*THREADS] : 0.f;
+                        }
+                    } else if (active) {
+                        atomicAdd(ejk_aux+ka*3+0, reduce[0*THREADS]);
+                        atomicAdd(ejk_aux+ka*3+1, reduce[1*THREADS]);
+                        atomicAdd(ejk_aux+ka*3+2, reduce[2*THREADS]);
+                    }
+                }
+                if (DET) {
+                    __syncthreads();
+                    // deterministic segmented reduction: each gradient slot
+                    // has exactly one owner thread (slot % THREADS) inside
+                    // this block; every entry is consumed in ascending
+                    // st_id order into the block's PRIVATE partial row --
+                    // no atomics, a fixed summation order run-to-run
+                    for (int e = 0; e < nst_per_block; ++e) {
+                        int a = stage_atm[e*2+0];
+                        if (a < 0) continue;
+                        for (int m = 0; m < 3; ++m) {
+                            int s = a*3+m;
+                            if (s % THREADS == thread_id) {
+                                partial[(size_t)blk*ns2 + ns + s] += stage_v[e*8+m];
+                            }
+                        }
+                    }
+                    __syncthreads();
                 }
             }
         }
@@ -566,13 +648,75 @@ void sum_ejk_int3c2e_ip1_kernel_f32(double *ejk, double *ejk_aux,
                 }
             }
         }
-        if (gout_id == 0 && pair_ij < shl_pair1) {
-            atomicAdd(ejk+ia*3+0, reduce[0*THREADS]);
-            atomicAdd(ejk+ia*3+1, reduce[1*THREADS]);
-            atomicAdd(ejk+ia*3+2, reduce[2*THREADS]);
-            atomicAdd(ejk+ja*3+0, reduce[3*THREADS]);
-            atomicAdd(ejk+ja*3+1, reduce[4*THREADS]);
-            atomicAdd(ejk+ja*3+2, reduce[5*THREADS]);
+        if (gout_id == 0) {
+            int active = pair_ij < shl_pair1;
+            if (DET) {
+                // same staging scheme as the aux site: ia contributions in
+                // stage_v[.6..0..2], ja contributions in [3..5]
+                stage_atm[st_id*2+0] = active ? ia : -1;
+                stage_atm[st_id*2+1] = active ? ja : -1;
+                for (int m = 0; m < 6; ++m) {
+                    stage_v[st_id*8+m] = active ? reduce[m*THREADS] : 0.f;
+                }
+            } else if (active) {
+                atomicAdd(ejk+ia*3+0, reduce[0*THREADS]);
+                atomicAdd(ejk+ia*3+1, reduce[1*THREADS]);
+                atomicAdd(ejk+ia*3+2, reduce[2*THREADS]);
+                atomicAdd(ejk+ja*3+0, reduce[3*THREADS]);
+                atomicAdd(ejk+ja*3+1, reduce[4*THREADS]);
+                atomicAdd(ejk+ja*3+2, reduce[5*THREADS]);
+            }
+        }
+        if (DET) {
+            __syncthreads();
+            for (int e = 0; e < nst_per_block; ++e) {
+                int a0 = stage_atm[e*2+0];
+                if (a0 >= 0) {
+                    for (int m = 0; m < 3; ++m) {
+                        int s = a0*3+m;
+                        if (s % THREADS == thread_id) {
+                            partial[(size_t)blk*ns2 + s] += stage_v[e*8+m];
+                        }
+                    }
+                }
+                int a1 = stage_atm[e*2+1];
+                if (a1 >= 0) {
+                    for (int m = 0; m < 3; ++m) {
+                        int s = a1*3+m;
+                        if (s % THREADS == thread_id) {
+                            partial[(size_t)blk*ns2 + s] += stage_v[e*8+3+m];
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+// GRADAUX-DET-REDUCTION-01: fixed-order block reduction of the per-block
+// partial rows into the ejk/ejk_aux accumulation targets.  One block; the
+// owner of slot s (thread s % THREADS) sums the rows in ascending block
+// order -- a single writer per slot and a fixed summation order, so the
+// result is bitwise reproducible run-to-run for identical inputs.
+__global__ static
+void det_reduce_ip1_f32(double *ejk, double *ejk_aux, double *partial,
+                        int nblocks, int natm)
+{
+    int ns = natm*3;
+    int row = ns*2;
+    for (int s = threadIdx.x; s < ns; s += THREADS) {
+        double acc = 0.;
+        double acc_aux = 0.;
+        for (int b = 0; b < nblocks; ++b) {
+            acc += partial[(size_t)b*row + s];
+            acc_aux += partial[(size_t)b*row + ns + s];
+        }
+        if (ejk != NULL) {
+            ejk[s] += acc;
+        }
+        if (ejk_aux != NULL) {
+            ejk_aux[s] += acc_aux;
         }
     }
 }
@@ -589,15 +733,46 @@ int sum_ejk_int3c2e_ip1_f32(double *ejk, double *ejk_aux,
                     int *ao_pair_loc, int aux_offset,
                     int nao, int npairs, int naux, int natm)
 {
-    cudaFuncSetAttribute(sum_ejk_int3c2e_ip1_kernel_f32, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    cudaFuncSetAttribute(sum_ejk_int3c2e_ip1_kernel_f32<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
     dim3 blocks(nbatches_shl_pair, nbatches_ksh);
-    sum_ejk_int3c2e_ip1_kernel_f32<<<blocks, THREADS, shm_size>>>(
+    sum_ejk_int3c2e_ip1_kernel_f32<false><<<blocks, THREADS, shm_size>>>(
             ejk, ejk_aux, dm, density_auxvec, n_dm, *envs,
             shl_pair_offsets, bas_ij_idx, ksh_offsets, gout_stride_lookup,
-            ao_pair_loc, aux_offset, naux);
+            ao_pair_loc, aux_offset, naux, NULL);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA Error in sum_ejk_int3c2e_ip1_f32: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
+// GRADAUX-DET-REDUCTION-01 deterministic entry: identical arithmetic to
+// sum_ejk_int3c2e_ip1_f32 (same kernel, same operands, same per-addend
+// values -- only the accumulation order is fixed); the caller provides a
+// ZEROED partial buffer of (nbatches_shl_pair*nbatches_ksh, 2*natm*3)
+// doubles and the wrapper folds it into ejk/ejk_aux with the fixed-order
+// det_reduce_ip1_f32 kernel on the same stream.
+int sum_ejk_int3c2e_ip1_f32_det(double *ejk, double *ejk_aux,
+                    float *dm, float *density_auxvec, int n_dm,
+                    RysIntEnvVars *envs, int shm_size, int nbatches_shl_pair,
+                    int nbatches_ksh, int *shl_pair_offsets, uint32_t *bas_ij_idx,
+                    int *ksh_offsets, int *gout_stride_lookup,
+                    int *ao_pair_loc, int aux_offset,
+                    int nao, int npairs, int naux, int natm,
+                    double *partial)
+{
+    cudaFuncSetAttribute(sum_ejk_int3c2e_ip1_kernel_f32<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    dim3 blocks(nbatches_shl_pair, nbatches_ksh);
+    sum_ejk_int3c2e_ip1_kernel_f32<true><<<blocks, THREADS, shm_size>>>(
+            ejk, ejk_aux, dm, density_auxvec, n_dm, *envs,
+            shl_pair_offsets, bas_ij_idx, ksh_offsets, gout_stride_lookup,
+            ao_pair_loc, aux_offset, naux, partial);
+    det_reduce_ip1_f32<<<1, THREADS>>>(ejk, ejk_aux, partial,
+            nbatches_shl_pair*nbatches_ksh, natm);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error in sum_ejk_int3c2e_ip1_f32_det: %s\n", cudaGetErrorString(err));
         return 1;
     }
     return 0;
