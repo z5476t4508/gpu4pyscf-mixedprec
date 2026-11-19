@@ -1,0 +1,57 @@
+{
+ "schema": "benchv1-daily-comparisons-v1",
+ "generated_at_utc": "2026-10-30T20:06:13Z",
+ "arms_source_commit": "8d144edf6ff16211147cb149ffe6dfdc38478e0f",
+ "schedule_sha256": "1387f51be84d0276aaf8a041b17f2db12e9fb955e03b54ef275b1ccecbca1bbc",
+ "stats_generated_at_utc": "2026-10-30T20:06:12Z",
+ "stats_tool_commit": "d898e96",
+ "counts": {
+  "planned": 64,
+  "gate_pass": 64,
+  "gate_fail_or_missing": 0,
+  "actual_scf_fp32_C": 35,
+  "gated_fallback_C": 29
+ },
+ "full_cohort_available": true,
+ "comparisons": {
+  "O_to_B": {
+   "n": 64,
+   "primary_geomean": 2.35813442556311,
+   "median_speedup": 1.7456648641776749,
+   "total_time_ratio": 3.941489260764332,
+   "ci95_bootstrap": [
+    2.318837351977726,
+    2.3988611365542862
+   ]
+  },
+  "B_to_C": {
+   "n": 64,
+   "primary_geomean": 0.9989195833164284,
+   "median_speedup": 1.004443114550082,
+   "total_time_ratio": 1.0070356128294264,
+   "ci95_bootstrap": [
+    0.9844249219812655,
+    1.014959556532275
+   ]
+  },
+  "O_to_C": {
+   "n": 64,
+   "primary_geomean": 2.3555866577876268,
+   "median_speedup": 1.7393486308130428,
+   "total_time_ratio": 3.969220053174412,
+   "ci95_bootstrap": [
+    2.302383167096209,
+    2.412857588458231
+   ]
+  }
+ },
+ "legacy_reference": {
+  "policy_figures": {
+   "O_to_B": 1.785,
+   "B_to_C": 1.01,
+   "O_to_C": 1.819
+  },
+  "note": "SP32 11-cell full-policy medians at 9bf27a3 (historical context, NOT new acceptance and NOT bench-v1 results)"
+ },
+ "auto_strict": "kept separate: the S route reports its own verification/fallback costs in its own batch"
+}
