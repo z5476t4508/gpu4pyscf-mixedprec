@@ -16,6 +16,7 @@
 Second order SCF solver
 '''
 
+import os
 import sys
 import math
 import numpy as np
@@ -30,6 +31,314 @@ from gpu4pyscf.lib import logger
 from gpu4pyscf.scf import hf, rohf, uhf, _response_functions
 from gpu4pyscf.lib.cupy_helper import transpose_sum, contract
 from gpu4pyscf.lib import utils
+
+_AH_TOL_FLOOR = None    # cached env value; None = not yet read
+_AH_TOL_FLOOR_BINDS = 0  # keyframes where the floor actually loosened the AH tol
+
+def _note_ah_tol_floor_bind():
+    '''Bump the AH tol-floor engagement counter (home module:
+    _rotate_orb_cc is shared by every second-order lane, so one home
+    counter covers RHF/ROHF/UHF; counting only keyframes where the floor
+    strictly loosened ah_conv_tol, i.e. real engagements, not knob
+    presence).'''
+    global _AH_TOL_FLOOR_BINDS
+    _AH_TOL_FLOOR_BINDS += 1
+
+def _ah_tol_floor():
+    '''Optional floor on the augmented-Hessian davidson tolerance
+    (opt-in inner-solve truncation, CONV-UKS-NEWTON-INNERCUT-01).
+
+    GPU4PYSCF_SOSCF_AH_TOL_FLOOR=<float> bounds from below the inner
+    davidson convergence tolerance ``min(norm_gorb**2, ah_conv_tol)``
+    used at each keyframe: near the quadratic basin the default
+    ah_conv_tol (1e-12) demands the AH eigenvalue be resolved ~7 orders
+    below the outer conv_tol_grad target, which entry 416 measured as
+    pure davidson CALL-COUNT mass (the 18-vind grind macro, flat
+    ~3.22 s/call, 70.1% of t_newton) rather than response-build mass.
+    A floor keeps the eigenvalue-stability and |dx|<sqrt(tol) criteria
+    within ~1-2 orders of the outer gradient target; the outer
+    keyframe/restore machinery re-evaluates the true gradient and
+    remains the accuracy authority.  Accepted values are floats in
+    (0, 1e-4]; anything else warns and is ignored (verbatim path).
+    Strict fp64-reference lanes never arm.  Default OFF.'''
+    global _AH_TOL_FLOOR
+    if _AH_TOL_FLOOR is None:
+        raw = os.environ.get('GPU4PYSCF_SOSCF_AH_TOL_FLOOR', '')
+        _AH_TOL_FLOOR = 0.0
+        if raw not in ('', '0'):
+            try:
+                val = float(raw)
+            except ValueError:
+                val = None
+            if val is None or not (0.0 < val <= 1e-4):
+                import warnings
+                warnings.warn('GPU4PYSCF_SOSCF_AH_TOL_FLOOR=%r ignored; '
+                              'expected a float in (0, 1e-4] or 0 (no '
+                              'floor, the default)' % (raw))
+            else:
+                _AH_TOL_FLOOR = val
+    return _AH_TOL_FLOOR
+
+def _ah_tol_floor_armed(mf):
+    '''True when the tol floor is set AND this solver is not a strict
+    fp64-reference lane (the flag may live on the newton wrapper or on
+    the wrapped base mf).'''
+    if _ah_tol_floor() <= 0.0:
+        return False
+    for obj in (mf, getattr(mf, '_scf', None)):
+        if getattr(obj, '_strict_fp64_reference', False):
+            return False
+    return True
+
+_PRECOND_BLOCK = None    # cached env value; None = not yet read
+_PRECOND_BLOCK_BUILDS = 0  # keyframes where the block precond data was built
+
+def _note_precond_block_engaged():
+    '''Bump the block-precond engagement counter (home module:
+    _rotate_orb_cc is shared by every second-order lane, so one home
+    counter covers RHF/ROHF/UHF; counting only keyframes where the
+    block factors were actually built, i.e. real engagements, not knob
+    presence).'''
+    global _PRECOND_BLOCK_BUILDS
+    _PRECOND_BLOCK_BUILDS += 1
+
+def _soscf_precond():
+    '''Optional block/Schur (Sylvester-class) preconditioner for the
+    augmented-Hessian davidson (opt-in, CONV-UKS-NEWTON-PRECOND-01).
+
+    GPU4PYSCF_SOSCF_PRECOND=block replaces the deployed DIAGONAL
+    preconditioner (the h_diag-e solve with the 1e-8 lindep clamp in
+    _rotate_orb_cc) with a per-spin block-diagonal solve of the SAME
+    diagonal-block problem the h_op itself applies first
+    (fvva x - x fooa, gen_g_hop_uhf): with Schur/eigh factors of the
+    MO-space fock blocks, Y = Vv [(Vv^T X Vo)/(lv - lo - e_eff)] Vo^T
+    per davidson expansion.  Entry 416 measured the grind macro as
+    pure davidson CALL-COUNT mass at near-degenerate rotations
+    (the class a diagonal precond under-resolves); the tol floor
+    (truncation) closed NEGATIVE in entry 417 because it relaxes the
+    acceptance event, while this knob must NOT alter any acceptance
+    criterion -- it only accelerates the subspace convergence rate at
+    UNCHANGED tol.  Accepted value: 'block'; '' (unset), '0', 'off'
+    keep the verbatim diagonal preconditioner; anything else warns
+    and is ignored.  Non-UHF layouts (mo_occ.ndim != 2) warn and keep
+    the verbatim diagonal path (UKS lane first; RHF/ROHF layouts are
+    out of scope).  Strict fp64-reference lanes never arm.  The eigh
+    factors cost O(block^3) once per keyframe, negligible against the
+    measured ~3.22 s per vind application.  Default OFF.'''
+    global _PRECOND_BLOCK
+    if _PRECOND_BLOCK is None:
+        raw = os.environ.get('GPU4PYSCF_SOSCF_PRECOND', '')
+        _PRECOND_BLOCK = 'block' if raw == 'block' else False
+        if _PRECOND_BLOCK is False and raw not in ('', '0', 'off'):
+            import warnings
+            warnings.warn('GPU4PYSCF_SOSCF_PRECOND=%r ignored; expected '
+                          "'block' (or unset/0/off = the default diagonal "
+                          'preconditioner)' % (raw,))
+    return _PRECOND_BLOCK
+
+def _precond_block_armed(mf):
+    '''True when the block preconditioner is requested AND this solver
+    is not a strict fp64-reference lane (the flag may live on the
+    newton wrapper or on the wrapped base mf).'''
+    if _soscf_precond() != 'block':
+        return False
+    for obj in (mf, getattr(mf, '_scf', None)):
+        if getattr(obj, '_strict_fp64_reference', False):
+            return False
+    return True
+
+_SOSCF_RESP_F32 = None    # cached env value; None = not yet read
+_RESP_F32_CALLS = 0  # vind invocations that ran with the lane flags armed
+
+def _note_resp_f32_engaged():
+    '''Bump the vind-scope f32 engagement counter (home module:
+    gen_g_hop_uhf is the sole arming site, shared by UHF/UKS and the
+    ROHF delegation; counting only vind invocations that actually ran
+    under the armed lane flags, i.e. real engagements, not knob
+    presence).'''
+    global _RESP_F32_CALLS
+    _RESP_F32_CALLS += 1
+
+def _soscf_resp_f32():
+    '''Optional f32 discipline for the newton vind response
+    applications (opt-in, CONV-UKS-NEWTON-RESPF32-01).
+
+    GPU4PYSCF_SOSCF_RESP_F32=1 arms the EXISTING numint/df_jk f32
+    lane flags -- the same flags scf.hf._kernel arms for plain-SCF
+    cycles -- around EACH vind invocation of the h_op scope in
+    gen_g_hop_uhf ONLY.  Structural basis (entry 421 source audit +
+    the Phase A reachability audit of this unit): the flags are set
+    solely inside the plain-SCF kernel wrapper (hf.py kernel/finally),
+    so the newton interior -- entry 416: 29 vind calls, 81.4% of
+    t_newton, flat ~3.22 s/call -- runs pure fp64 even when the same
+    process arms GPU4PYSCF_SCF_VMAT_F32=headtail for its plain
+    cycles.  The vind response evaluates the XC kernel via
+    nr_rks_fxc/nr_uks_fxc (which has no f32 cast hooks) plus the DF
+    J/K builds of get_jk/get_k, so within the armed triplet the
+    OPERATIVE existing cast site is the df_jk K-transform fp32 branch
+    (_scf_jk_f32_lane, SCFJK-KBUILD-IMPL-01); the numint vmat/rho
+    cast sites live in the veff tasks _nr_rks_task/_nr_uks_task,
+    which the vind response never calls, so those two flags are
+    structurally inert in this scope (armed for deployed-discipline
+    parity and future-proofing, documented inert here).  The keyframe
+    get_veff / acceptance event (soscf._rotate_orb_cc's direct
+    mf._scf.get_veff call) is structurally OUTSIDE the wrapper and
+    keeps the exact fp64 map.  There is no in-vind cycle-end trigger;
+    each vind call is one atomic response application whose output
+    discipline is entirely the existing cast sites'.  Accepted
+    values: '1' or 'on'; '' (unset), '0', 'off' keep the verbatim
+    fp64 response; anything else warns and is ignored.  Strict
+    fp64-reference lanes never arm.  Default OFF.'''
+    global _SOSCF_RESP_F32
+    if _SOSCF_RESP_F32 is None:
+        raw = os.environ.get('GPU4PYSCF_SOSCF_RESP_F32', '')
+        _SOSCF_RESP_F32 = raw in ('1', 'on')
+        if not _SOSCF_RESP_F32 and raw not in ('', '0', 'off'):
+            import warnings
+            warnings.warn('GPU4PYSCF_SOSCF_RESP_F32=%r ignored; expected '
+                          '1 (arm the deployed f32 lane flags around vind '
+                          'only) or 0/off (the default fp64 response)'
+                          % (raw,))
+    return _SOSCF_RESP_F32
+
+def _resp_f32_armed(mf):
+    '''True when the vind-scope f32 response knob is set AND this
+    solver is not a strict fp64-reference lane (the flag may live on
+    the newton wrapper or on the wrapped base mf).'''
+    if not _soscf_resp_f32():
+        return False
+    for obj in (mf, getattr(mf, '_scf', None)):
+        if getattr(obj, '_strict_fp64_reference', False):
+            return False
+    return True
+
+def _wrap_vind_resp_f32(vind):
+    '''Per-vind-call lane-flag arming: flip the three deployed lane
+    flags on for the duration of ONE h_op response application,
+    restore exactly in finally (the flags are module globals read per
+    call by the numint/df_jk cast sites; every consumer inside the
+    vind closure -- the DF K/J transforms of the hybrid response's
+    get_jk/get_k -- sees them armed; every caller outside the wrapper
+    -- keyframe get_veff, eig, rotations -- sees the saved fp64-lane
+    values).'''
+    from gpu4pyscf.dft import numint as _numint_mod
+    from gpu4pyscf.df import df_jk as _df_jk_mod
+
+    def vind_f32(dm1):
+        saved = (_numint_mod._scf_vmat_f32_lane,
+                 _numint_mod._scf_rho_f32_lane,
+                 _df_jk_mod._scf_jk_f32_lane)
+        _numint_mod._scf_vmat_f32_lane = True
+        _numint_mod._scf_rho_f32_lane = True
+        _df_jk_mod._scf_jk_f32_lane = True
+        _note_resp_f32_engaged()
+        try:
+            return vind(dm1)
+        finally:
+            (_numint_mod._scf_vmat_f32_lane,
+             _numint_mod._scf_rho_f32_lane,
+             _df_jk_mod._scf_jk_f32_lane) = saved
+
+    return vind_f32
+
+_SOSCF_KEYVEFF_F32 = None   # cached env value; None = not yet read
+_KEYVEFF_F32_CALLS = 0  # keyframe get_veff invocations that ran armed
+
+def _note_keyveff_f32_engaged():
+    '''Bump the keyframe-scope f32 engagement counter (home module:
+    _rotate_orb_cc's in-micro keyframe refresh is the sole arming
+    site, shared by every second-order lane; counting only keyframe
+    get_veff invocations that actually ran under the armed lane
+    flags, i.e. real engagements, not knob presence).'''
+    global _KEYVEFF_F32_CALLS
+    _KEYVEFF_F32_CALLS += 1
+
+def _soscf_keyveff_f32():
+    '''Optional f32 discipline for the newton keyframe get_veff builds
+    (opt-in, CONV-UKS-NEWTON-KEYVEFF-F32-01).
+
+    GPU4PYSCF_SOSCF_KEYVEFF_F32=1 arms the EXISTING numint/df_jk f32
+    lane flags -- the same flags scf.hf._kernel arms for plain-SCF
+    cycles and GPU4PYSCF_SOSCF_RESP_F32 arms around vind -- around
+    the in-micro keyframe get_veff refresh inside _rotate_orb_cc ONLY
+    (its direct mf._scf.get_veff call feeding the keyframe gradient
+    correction and the trust-region decisions).  kernel()'s
+    post-rotation macro acceptance get_veff stays VERBATIM fp64: it
+    computes the accepted/returned e_tot and the convergence checks,
+    and the Phase A two-site variant measured that arming the triplet
+    there displaces the returned energy by the full lane-class
+    deviation (sentinel |dE| 6.2e-7 > the 1e-8 same-basin gate) --
+    the LC-115 head/tail discipline applied to the newton interior
+    (fp32 iterative interior, exact acceptance/energy map).
+    Structural basis (entry 416 attribution + the entry-421/422
+    source audits): the lane flags are set solely inside the
+    plain-SCF kernel wrapper (hf.py kernel/finally) and the RESPF32
+    vind wrapper, so the keyframe veff builds -- entry 416: 19.57 s
+    of the 114.69 s fp64 t_newton at 573, veff walls [4.35, 4.34,
+    8.70, 2.18] s per macro, untouched by the RESPF32/FXCF32
+    composition -- run pure fp64 even in arms carrying
+    GPU4PYSCF_SCF_VMAT_F32=headtail for their plain cycles.  Unlike
+    the vind scope, the numint vmat/rho cast sites ARE reachable here
+    (the keyframe veff runs the _nr_uks_task/_nr_rks_task veff tasks),
+    so within the armed triplet BOTH the df_jk K-transform branch and
+    the numint vmat/rho casts are operative.  The one-time
+    initial-guess veff builds at kernel() entry and the macro
+    acceptance build stay verbatim fp64 (outside the armed iterative
+    class; minimal-diff discipline).  Acceptance tolerances are
+    NEVER touched -- PRECISION only, never a tolerance change (the
+    entry-417 lesson).
+    Accepted values: '1' or 'on'; '' (unset), '0', 'off' keep the
+    verbatim fp64 keyframe map; anything else warns and is ignored.
+    Strict fp64-reference lanes never arm.  Default OFF.'''
+    global _SOSCF_KEYVEFF_F32
+    if _SOSCF_KEYVEFF_F32 is None:
+        raw = os.environ.get('GPU4PYSCF_SOSCF_KEYVEFF_F32', '')
+        _SOSCF_KEYVEFF_F32 = raw in ('1', 'on')
+        if not _SOSCF_KEYVEFF_F32 and raw not in ('', '0', 'off'):
+            import warnings
+            warnings.warn('GPU4PYSCF_SOSCF_KEYVEFF_F32=%r ignored; '
+                          'expected 1 (arm the deployed f32 lane flags '
+                          'around the newton keyframe get_veff builds '
+                          'only) or 0/off (the default fp64 keyframe '
+                          'map)' % (raw,))
+    return _SOSCF_KEYVEFF_F32
+
+def _keyveff_f32_armed(mf):
+    '''True when the keyframe-scope f32 knob is set AND this solver is
+    not a strict fp64-reference lane (the flag may live on the newton
+    wrapper or on the wrapped base mf).'''
+    if not _soscf_keyveff_f32():
+        return False
+    for obj in (mf, getattr(mf, '_scf', None)):
+        if getattr(obj, '_strict_fp64_reference', False):
+            return False
+    return True
+
+def _keyveff_get_veff(mf, dm, dm_last, vhf_last):
+    '''One keyframe get_veff build under the armed lane triplet: flip
+    the three deployed lane flags on for ONE mf._scf.get_veff
+    invocation, restore exactly in finally (the flags are module
+    globals read per call by the numint/df_jk cast sites; every
+    consumer inside this veff build -- the vmat/rho contractions of
+    the veff tasks and the DF K/J transforms -- sees them armed;
+    every caller outside -- vind (unless RESPF32 arms it), eig,
+    rotations -- sees the saved fp64-lane values).'''
+    from gpu4pyscf.dft import numint as _numint_mod
+    from gpu4pyscf.df import df_jk as _df_jk_mod
+    saved = (_numint_mod._scf_vmat_f32_lane,
+             _numint_mod._scf_rho_f32_lane,
+             _df_jk_mod._scf_jk_f32_lane)
+    _numint_mod._scf_vmat_f32_lane = True
+    _numint_mod._scf_rho_f32_lane = True
+    _df_jk_mod._scf_jk_f32_lane = True
+    _note_keyveff_f32_engaged()
+    try:
+        return mf._scf.get_veff(mf._scf.mol, dm, dm_last=dm_last,
+                                vhf_last=vhf_last)
+    finally:
+        (_numint_mod._scf_vmat_f32_lane,
+         _numint_mod._scf_rho_f32_lane,
+         _df_jk_mod._scf_jk_f32_lane) = saved
 
 def gen_g_hop_rhf(mf, mo_coeff, mo_occ, fock_ao=None, h1e=None):
     assert mo_coeff.dtype == np.float64
@@ -135,6 +444,12 @@ def gen_g_hop_uhf(mf, mo_coeff, mo_occ, fock_ao=None, h1e=None):
     h_diag = cp.hstack((h_diaga.reshape(-1), h_diagb.reshape(-1)))
 
     vind = mf.gen_response(mo_coeff, mo_occ, hermi=1, with_nlc=False)
+    if _resp_f32_armed(mf):
+        # opt-in vind-scope f32 response discipline
+        # (CONV-UKS-NEWTON-RESPF32-01): arm the EXISTING cast sites
+        # around each h_op vind invocation only; the keyframe
+        # get_veff / acceptance path never passes through here
+        vind = _wrap_vind_resp_f32(vind)
 
     def h_op(x):
         x1a = x[:nvira*nocca].reshape(nvira,nocca)
@@ -156,6 +471,64 @@ def gen_g_hop_uhf(mf, mo_coeff, mo_occ, fock_ao=None, h1e=None):
     return g, h_op, h_diag
 
 
+def _build_block_precond_uhf(mf, mo_coeff, mo_occ, fock_ao, log=None):
+    '''Per-keyframe block/Schur factors for the UHF/UKS AH-davidson
+    preconditioner: per spin, the eigh factors of the MO-space
+    diagonal fock blocks fooa/foob (occupied) and fvva/fvvb (virtual)
+    derived EXACTLY as gen_g_hop_uhf derives them (same occ/vir masks
+    from mo_occ, same MO transform of fock_ao; real symmetric blocks
+    for real MOs, so eigh gives the real Schur factors).  Returns a
+    list of per-spin tuples (Vv, lv, Vo, lo, nvir, nocc, offset)
+    matching the concatenated [a: nvira*nocca, b: nvirb*noccb] layout
+    h_op expects, or None when the layout is not the UHF 2-spin layout
+    (mo_occ.ndim != 2; warn + keep the verbatim diagonal precond --
+    RHF/ROHF layouts are out of scope for this opt-in knob).'''
+    if getattr(mo_occ, 'ndim', 1) != 2:
+        import warnings
+        warnings.warn('GPU4PYSCF_SOSCF_PRECOND=block: mo_occ layout is '
+                      'not UHF (ndim %s); using the verbatim diagonal '
+                      'preconditioner' % (getattr(mo_occ, 'ndim', None),))
+        return None
+    blocks = []
+    off = 0
+    for s in (0, 1):
+        occidx = cp.nonzero(mo_occ[s] > 0)[0]
+        viridx = cp.nonzero(mo_occ[s] == 0)[0]
+        nocc = int(occidx.size)
+        nvir = int(viridx.size)
+        fock_mo = mo_coeff[s].conj().T.dot(fock_ao[s]).dot(mo_coeff[s])
+        foo = fock_mo[occidx[:, None], occidx]
+        fvv = fock_mo[viridx[:, None], viridx]
+        lv, Vv = cp.linalg.eigh(fvv)
+        lo, Vo = cp.linalg.eigh(foo)
+        if log is not None:
+            log.debug1('block precond spin %d: nvir=%d nocc=%d '
+                       '(Schur factors built)', s, nvir, nocc)
+        blocks.append((Vv, lv, Vo, lo, nvir, nocc, off))
+        off += nvir * nocc
+    return blocks
+
+def _apply_block_precond(blocks, x, e, level_shift):
+    '''Block/Schur (Sylvester-class) solve of the diagonal-block AH
+    problem per spin: with fvva = Vv diag(lv) Vv^T and fooa =
+    Vo diag(lo) Vo^T, Y = Vv [(Vv^T X Vo)/(lv - lo - e_eff)] Vo^T with
+    e_eff = e - level_shift and the deployed 1e-8 lindep clamp on the
+    denominator -- the block generalization of the deployed diagonal
+    x/(h_diag - e_eff) (reduces to it exactly when the blocks are
+    diagonal; the sign/scale convention matches the deployed solve).
+    O(block^2) per davidson expansion.'''
+    e_eff = e - level_shift
+    out = []
+    for (Vv, lv, Vo, lo, nvir, nocc, off) in blocks:
+        X = x[off:off + nvir * nocc].reshape(nvir, nocc)
+        Xt = Vv.conj().T.dot(X).dot(Vo)
+        denom = lv[:, None].real - lo[None, :].real - e_eff
+        denom[abs(denom) < 1e-8] = 1e-8
+        Y = Vv.dot(Xt / denom).dot(Vo.conj().T)
+        out.append(Y.ravel())
+    return cp.hstack(out)
+
+
 def _rotate_orb_cc(mf, h1e, s1e, conv_tol_grad=None, verbose=None):
     log = logger.new_logger(mf, verbose)
 
@@ -164,6 +537,13 @@ def _rotate_orb_cc(mf, h1e, s1e, conv_tol_grad=None, verbose=None):
         #TODO: dynamically adjust max_stepsize, as done in mc1step.py
 
     def precond(x, e):
+        # opt-in block/Schur preconditioner (CONV-UKS-NEWTON-PRECOND-01):
+        # the None-guard keeps the OFF path instruction-identical to the
+        # verbatim diagonal solve below (block_pc lives in this scope with
+        # the same per-keyframe lifecycle as h_diag)
+        if block_pc is not None:
+            return _apply_block_precond(block_pc, x, e,
+                                        mf.ah_level_shift)
         hdiagd = h_diag-(e-mf.ah_level_shift)
         hdiagd[abs(hdiagd)<1e-8] = 1e-8
         x = x/hdiagd
@@ -172,12 +552,23 @@ def _rotate_orb_cc(mf, h1e, s1e, conv_tol_grad=None, verbose=None):
     t3m = log.init_timer()
     u = g_kf = g_orb = norm_gorb = dxi = kfcount = jkcount = None
     dm0 = vhf0 = None
+    block_pc = None
     g_op = lambda: g_orb
     while True:
         mo_coeff, mo_occ, dm0, vhf0, e_tot = (yield u, g_kf, kfcount, jkcount, dm0, vhf0)
         fock_ao = mf.get_fock(h1e, s1e, vhf0, dm0)
 
         g_kf, h_op, h_diag = mf.gen_g_hop(mo_coeff, mo_occ, fock_ao)
+        if _precond_block_armed(mf):
+            # opt-in block preconditioner: Schur factors from the SAME
+            # MO fock blocks gen_g_hop_uhf derives (tol UNCHANGED; the
+            # verbatim diagonal path below stays the default)
+            block_pc = _build_block_precond_uhf(mf, mo_coeff, mo_occ,
+                                                fock_ao, log)
+            if block_pc is not None:
+                _note_precond_block_engaged()
+        else:
+            block_pc = None
         norm_gkf = cp.linalg.norm(g_kf)
         if g_orb is None:
             log.debug('    |g|= %4.3g (keyframe)', norm_gkf)
@@ -196,6 +587,14 @@ def _rotate_orb_cc(mf, h1e, s1e, conv_tol_grad=None, verbose=None):
 
         ah_conv_tol = min(norm_gorb**2, mf.ah_conv_tol)
         # increase the AH accuracy when approach convergence
+        if _ah_tol_floor_armed(mf):
+            # opt-in inner-solve truncation: never tighten the davidson
+            # tol below the floor (float() syncs one 0-d device scalar
+            # per keyframe; absent knob takes the identical verbatim path)
+            ah_eff = float(ah_conv_tol)
+            if _ah_tol_floor() > ah_eff:
+                _note_ah_tol_floor_bind()
+                ah_conv_tol = _ah_tol_floor()
         ah_start_cycle = mf.ah_start_cycle
         imic = 0
         dr = 0.
@@ -264,7 +663,13 @@ def _rotate_orb_cc(mf, h1e, s1e, conv_tol_grad=None, verbose=None):
                     mo1 = mf.rotate_mo(mo_coeff, u)
                     dm = mf.make_rdm1(mo1, mo_occ)
                     # use mf._scf.get_veff to avoid density-fit mf polluting get_veff
-                    vhf0 = mf._scf.get_veff(mf._scf.mol, dm, dm_last=dm0, vhf_last=vhf0)
+                    if _keyveff_f32_armed(mf):
+                        # CONV-UKS-NEWTON-KEYVEFF-F32-01: the keyframe
+                        # #2 site (in-micro refresh) under the armed
+                        # lane triplet; verbatim line below otherwise
+                        vhf0 = _keyveff_get_veff(mf, dm, dm0, vhf0)
+                    else:
+                        vhf0 = mf._scf.get_veff(mf._scf.mol, dm, dm_last=dm0, vhf_last=vhf0)
                     dm0 = dm
                     # Use API to compute fock instead of "fock=h1e+vhf0". This is because get_fock
                     # is the hook being overloaded in many places.
@@ -303,6 +708,7 @@ def _rotate_orb_cc(mf, h1e, s1e, conv_tol_grad=None, verbose=None):
             log.debug('    tot inner=%d  %d JK  |g|= %4.3g  |u-1|= %4.3g',
                       imic, jkcount, norm_gorb, cp.linalg.norm(dr))
         h_op = h_diag = None
+        block_pc = None
         t3m = log.timer('aug_hess in %d inner iters' % imic, *t3m)
 
 def _davidson_cc(h_op, g_op, precond, x0, tol=1e-10, xs=[], ax=[],
