@@ -485,7 +485,7 @@ C2   -.3    .2     -.7''',
     ref = np.einsum('ijp,p->ij', j3c, scipy.linalg.solve(j2c, ref))
 
     opt = int3c2e_bdiv.Int3c2eOpt(SortedMole.from_mol(mol, decontract=True), auxmol)
-    cderi, (pair_address, diags) = df._cholesky_eri(opt)
+    cderi, (pair_address, diags), _aux_coef = df._cholesky_eri(opt)
     row, col = divmod(pair_address, nao)
     cderi = cp.vstack([cp.asarray(x) for x in cderi])
     cderi = _unpack(cderi, row, col)
@@ -493,7 +493,7 @@ C2   -.3    .2     -.7''',
     assert abs(dat.get() - ref).max() < 1e-10
 
     opt = int3c2e_bdiv.Int3c2eOpt(SortedMole.from_mol(mol, decontract=False), auxmol)
-    cderi, (pair_address, diags) = df._cholesky_eri(opt)
+    cderi, (pair_address, diags), _aux_coef = df._cholesky_eri(opt)
     row, col = divmod(pair_address, nao)
     cderi = cp.vstack([cp.asarray(x) for x in cderi])
     cderi = _unpack(cderi, row, col)
