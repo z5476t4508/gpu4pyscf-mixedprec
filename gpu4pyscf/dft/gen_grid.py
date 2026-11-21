@@ -24,7 +24,9 @@ Reference for Lebedev-Laikov grid:
 '''
 
 
+import os
 import sys
+import warnings
 import ctypes
 import numpy
 import numpy as np
@@ -199,6 +201,121 @@ def get_C_interface_scheme_id(becke_scheme):
         return 101
     else:
         raise ValueError(f"becke_scheme = {becke_scheme} not recognized")
+
+# Relative inertia-eigenvalue gap below which the principal frame is treated
+# as ill-defined and the molecular-frame knob falls back to lab-frame grids.
+_MOLFRAME_DEGENERACY_TOL = 1e-6
+
+# Relative magnitude of the in-plane 4th complex moment below which it is
+# treated as isotropic by the symmetric-top tie-breaker (same class as the
+# eigenvalue tolerance above).
+_MOLFRAME_SYMTOP_TOL = 1e-6
+
+def _symtop_inplane_axes(p, masses, u):
+    '''Covariant in-plane axes (v1, v2) for a symmetric top whose unique
+    inertia axis is the unit eigenvector u (rows v1, v2 of the frame, with
+    v2 = u x v1 so the frame is right-handed).
+
+    The in-plane second moments are isotropic by the degeneracy itself, so
+    the axes are resolved by the 4th complex moment
+    mu_4 = sum_i m_i (p_i . e1 + i p_i . e2)^4 over an arbitrary in-plane
+    working basis (e1, e2).  Under a rigid rotation |mu_4| is invariant and
+    arg(mu_4) shifts by 4 times the in-plane rotation component, so
+    v1 = cos(arg(mu_4)/4) e1 + sin(arg(mu_4)/4) e2 is covariant regardless
+    of the working-basis choice.  Returns (None, None, None) when |mu_4| is
+    too small (3-fold/5-fold/6-fold symmetric tops, linear molecules).
+
+    Only the 4-fold class is resolved, because its whole ambiguity class
+    {2*pi*m/4} lies inside the 48 signed permutations to which the Lebedev
+    tables are invariant: the selection is covariant at the grid-set level
+    for EVERY rotation.  The 3/5/6-fold classes are provably unresolvable by
+    any deterministic rule: the geometry's C_k symmetry makes the in-plane
+    angle observable only modulo 2*pi/k, while the branch-selection
+    discrepancy accumulates the rotation's winding in 2*pi/k units, giving
+    an exactly-covariant frame with probability 1/3 (k=3, 6) or 1/5 (k=5)
+    over uniform rotations, independent of the rule; those classes keep
+    the lab-frame fallback.  Row order and axis signs are benign for the
+    same reason (table symmetry under the 48 signed permutations).'''
+    # working basis: any completion of u; the 4-fold phase cancels its choice
+    j = int(numpy.argmin(abs(u)))
+    a = numpy.zeros(3)
+    a[j] = 1.0
+    e1 = a - numpy.dot(a, u) * u
+    e1 /= numpy.linalg.norm(e1)
+    e2 = numpy.cross(u, e1)
+    z = p @ e1 + 1j * p @ e2
+    norm = float(masses @ (abs(z) ** 4))
+    if norm <= 0:
+        return None, None
+    mu = masses @ (z ** 4)
+    if abs(mu) <= _MOLFRAME_SYMTOP_TOL * norm:
+        return None, None
+    phi = numpy.angle(mu) / 4
+    v1 = numpy.cos(phi) * e1 + numpy.sin(phi) * e2
+    return v1, numpy.cross(u, v1)
+
+def _principal_frame(mol):
+    '''Right-handed frame A (rows = inertia principal axes in lab
+    coordinates) for the molecular-frame grid scheme.  Returns None when no
+    covariant frame is available; spherical tops, linear molecules and
+    3/5/6-fold symmetric tops are in that class (the last provably so, see
+    _symtop_inplane_axes).  4-fold-resolvable symmetric tops (exactly one
+    degenerate inertia pair with a non-isotropic in-plane 4th moment:
+    D2d/D4h/C4v and accidental near-degeneracies) are resolved by the
+    tie-breaker.'''
+    coords = numpy.asarray(mol.atom_coords(), dtype=float)
+    masses = numpy.asarray(mol.atom_mass_list(), dtype=float)
+    if masses.sum() <= 0:
+        return None
+    com = numpy.einsum('i,ij->j', masses, coords) / masses.sum()
+    p = coords - com
+    # gyration tensor G = sum_i m_i p_i p_i^T; inertia = tr(G)*I - G
+    gyt = numpy.einsum('i,ij,ik->jk', masses, p, p)
+    inertia = numpy.trace(gyt) * numpy.eye(3) - gyt
+    scale = abs(inertia).max()
+    if scale <= 0:
+        return None
+    evals, evecs = numpy.linalg.eigh(inertia)
+    degenerate = numpy.diff(evals) <= _MOLFRAME_DEGENERACY_TOL * scale
+    if not degenerate.any():
+        # asymmetric top.  Any deterministic sign convention is fine: a
+        # discrepancy between the frames of a geometry and its rotated copy
+        # is a signed permutation, and the Lebedev-Laikov (node, weight)
+        # tables are invariant under all 48 signed permutations
+        # (tests/test_molframe_grids.py), so the placed grid set is
+        # unaffected.
+        for k in range(3):
+            i = numpy.argmax(abs(evecs[:, k]))
+            if evecs[i, k] < 0:
+                evecs[:, k] = -evecs[:, k]
+        if numpy.linalg.det(evecs) < 0:
+            evecs[:, 2] = -evecs[:, 2]
+        return evecs.T.copy()
+    if degenerate.all():
+        # spherical top: no unique axis at all
+        return None
+    # symmetric top: the eigenvalue separated from the degenerate pair has a
+    # well-defined covariant eigenvector (its separation exceeds the
+    # degeneracy tolerance by construction)
+    iu = 0 if degenerate[1] else 2
+    u = evecs[:, iu]
+    v1, v2 = _symtop_inplane_axes(p, masses, u)
+    if v1 is None:
+        return None
+    return numpy.vstack([v1, v2, u])
+
+def _molframe_enabled():
+    '''Opt-in GPU4PYSCF_GRID_MOLFRAME=1: generate the per-atom angular tables
+    in the molecule's inertia-principal frame instead of the lab frame, which
+    makes the weighted grid set rigid-rotation covariant (energies invariant
+    under rigid rotations to floating-point noise).  Near-degenerate inertia
+    tensors fall back to the standard lab-frame grids with a warning.'''
+    raw = os.environ.get('GPU4PYSCF_GRID_MOLFRAME', '')
+    if raw == '1':
+        return True
+    if raw:
+        warnings.warn(f'GPU4PYSCF_GRID_MOLFRAME={raw!r} ignored; expected 1')
+    return False
 
 def gen_atomic_grids(mol, atom_grid={}, radi_method=radi.gauss_chebyshev,
                      level=3, prune=nwchem_prune, **kwargs):
@@ -480,6 +597,19 @@ class Grids(lib.StreamObject):
         t0 = log.init_timer()
         atom_grids_tab = self.gen_atomic_grids(
             mol, self.atom_grid, self.radi_method, self.level, self.prune, **kwargs)
+        self._molframe_applied = None
+        if _molframe_enabled():
+            frame = _principal_frame(mol)
+            if frame is None:
+                logger.warn(mol, 'GPU4PYSCF_GRID_MOLFRAME ignored: '
+                            'no covariant principal frame (spherical top, '
+                            'linear molecule or unresolved in-plane moments); '
+                            'building lab-frame grids')
+            else:
+                frame_gpu = cupy.asarray(frame)
+                atom_grids_tab = {symb: (r @ frame_gpu, vol)
+                                  for symb, (r, vol) in atom_grids_tab.items()}
+                self._molframe_applied = frame
         self.coords, self.weights = self.get_partition(
             mol, atom_grids_tab, self.radii_adjust, self.atomic_radii, self.becke_scheme)
 
@@ -583,6 +713,9 @@ class Grids(lib.StreamObject):
 
         # (idx, non0shl_idx, ctr_offsets_slice, ao_loc_slice)
         self._non0ao_idx = None
+        # SP-30: the fp32 AO-twin cache is dropped with the
+        # sparsity cache (a twin can never serve rebuilt grids)
+        self._ao_f32_twins = None
         return self
 
     def kernel(self, mol=None, with_non0tab=False):
@@ -600,6 +733,10 @@ class Grids(lib.StreamObject):
         self.non0tab = None
         self.screen_index = None
         self._non0ao_idx = None
+        # SP-30: the fp32 AO-twin cache is dropped with the
+        # sparsity cache (a twin can never serve rebuilt grids)
+        self._ao_f32_twins = None
+        self._molframe_applied = None
         return self
 
     gen_atomic_grids = lib.module_method(
@@ -653,44 +790,111 @@ class Grids(lib.StreamObject):
 
         # The existing cache stores the indices for old grids, should be cleared.
         self._non0ao_idx = None
+        # SP-30: the fp32 AO-twin cache is dropped with the
+        # sparsity cache (a twin can never serve rebuilt grids)
+        self._ao_f32_twins = None
         return self
 
-    def _build_non0ao_idx_cache(self, opt=None):
-        '''cache ao indices'''
+    def _screen_shl_mask(self, opt, block_size):
+        '''MR-2 (2026-10-21, named follow-up to the MR1 guard-repro): raw
+        [nblocks, nbas] int8 shell-screen mask, evaluated ONLY at the default
+        partition (block_size == numint.MIN_BLK_SIZE) and DERIVED for any
+        coarser loop partition as the exact boolean union of the covered
+        default masks.
+
+        The screen kernel is per-(shell, grid point) deterministic, but the
+        guard-repro (2026-10-21-mr1-guard-repro-a) measured an intermittent
+        coarse-size evaluation that dropped a shell a fine block keeps (3/40
+        fresh processes, retry-clean; fail-closed under MR1's guard, never
+        silently wrong).  Deriving the coarse mask from the fine masks
+        removes the coarse kernel evaluation entirely, so the two partitions
+        cannot disagree: the coarse set is a union of fine sets BY
+        CONSTRUCTION, and the MR1 fail-closed guard (kept, defense-in-depth)
+        is unreachable.  In every previously-run case the derived mask
+        equals what the clean kernel evaluation produced; the default
+        (block_size == MIN_BLK_SIZE) path is untouched.
+
+        Memoized inside self._non0ao_idx under the non-integer key
+        ('shl_mask', block_size) -- the same pattern as ('partition_fix',
+        blksize) -- so every screening-cache reset (build/reset/prune here,
+        or an external grids._non0ao_idx = None) drops the masks with the
+        rest of the cache.  opt must be normalized (non-None) by the caller.
+        '''
+        from gpu4pyscf.dft import numint
+        MB = numint.MIN_BLK_SIZE
+        assert block_size % MB == 0
+        cache = self._non0ao_idx
+        if cache is None:
+            cache = self._non0ao_idx = {}
+        key = ('shl_mask', block_size)
+        mask = cache.get(key)
+        if mask is not None:
+            return mask
+        if block_size == MB:
+            stream = cp.cuda.get_current_stream()
+            _sorted_mol = opt._sorted_mol
+            nbas = len(_sorted_mol.ao_loc_nr()) - 1
+            ngrids = self.size
+            nblocks = (ngrids + block_size - 1) // block_size
+            mask = cp.zeros((nblocks, nbas), dtype=np.int8)
+            coords = cp.asarray(self.coords, order='F')
+            _atm_gpu = cp.asarray(_sorted_mol._atm, dtype=np.int32)
+            _bas_gpu = cp.asarray(_sorted_mol._bas, dtype=np.int32)
+            _env_gpu = cp.asarray(_sorted_mol._env, dtype=np.float64)
+            libgdft.GDFTscreen_index(
+                ctypes.cast(stream.ptr, ctypes.c_void_p),
+                ctypes.cast(mask.data.ptr, ctypes.c_void_p),
+                ctypes.c_double(np.log(numint.AO_THRESHOLD)),
+                ctypes.cast(coords.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(ngrids), ctypes.c_int(block_size),
+                ctypes.cast(_atm_gpu.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(len(_atm_gpu)),
+                ctypes.cast(_bas_gpu.data.ptr, ctypes.c_void_p),
+                ctypes.c_int(len(_bas_gpu)),
+                ctypes.cast(_env_gpu.data.ptr, ctypes.c_void_p))
+        else:
+            fine = self._screen_shl_mask(opt, MB)
+            nbas = fine.shape[1]
+            ngrids = self.size
+            n_coarse = (ngrids + block_size - 1) // block_size
+            ratio = block_size // MB
+            # every fine row index < n_coarse*ratio holds (a fine row beyond
+            # it would start past the grid end), so zero-padding the tail is
+            # exact: padding rows cannot add shells to any coarse block.
+            pad = n_coarse * ratio - fine.shape[0]
+            if pad > 0:
+                fine = cp.concatenate(
+                    [fine, cp.zeros((pad, nbas), dtype=fine.dtype)])
+            mask = fine.reshape(n_coarse, ratio, nbas).any(axis=1)
+            mask = cp.ascontiguousarray(mask.astype(np.int8))
+        cache[key] = mask
+        return mask
+
+    def _build_non0ao_idx_cache(self, opt=None, blksize=None):
+        '''cache ao indices
+
+        blksize keys the cache: entries built for different block
+        partitions of the same grid are not interchangeable, so callers
+        pass the loop block size (multiple of numint.MIN_BLK_SIZE).
+        '''
         from gpu4pyscf.dft import numint
         if opt is None:
             opt = numint._GDFTOpt.from_mol(self.mol)
         mol = opt._sorted_mol
         log = logger.new_logger(mol, mol.verbose)
         t1 = log.init_timer()
-        stream = cp.cuda.get_current_stream()
-
-        coords = cp.asarray(self.coords.T, order='C')
         _sorted_mol = opt._sorted_mol
         ao_loc = _sorted_mol.ao_loc_nr()
         nao = ao_loc[-1]
-        nbas = len(ao_loc) - 1
         ngrids = self.size
-        cutoff = numint.AO_THRESHOLD
-        block_size = numint.MIN_BLK_SIZE
+        block_size = numint.MIN_BLK_SIZE if blksize is None else blksize
+        assert block_size % numint.MIN_BLK_SIZE == 0
         nblocks = (ngrids + block_size - 1) // block_size
-        non0shl_mask = cp.zeros((nblocks, nbas), dtype=np.int8)
-        coords = cp.asarray(self.coords, order='F')
-        _atm_gpu = cp.asarray(_sorted_mol._atm, dtype=np.int32)
-        _bas_gpu = cp.asarray(_sorted_mol._bas, dtype=np.int32)
-        _env_gpu = cp.asarray(_sorted_mol._env, dtype=np.float64)
-
-        libgdft.GDFTscreen_index(
-            ctypes.cast(stream.ptr, ctypes.c_void_p),
-            ctypes.cast(non0shl_mask.data.ptr, ctypes.c_void_p),
-            ctypes.c_double(np.log(cutoff)),
-            ctypes.cast(coords.data.ptr, ctypes.c_void_p),
-            ctypes.c_int(ngrids), ctypes.c_int(block_size),
-            ctypes.cast(_atm_gpu.data.ptr, ctypes.c_void_p),
-            ctypes.c_int(len(_atm_gpu)),
-            ctypes.cast(_bas_gpu.data.ptr, ctypes.c_void_p),
-            ctypes.c_int(len(_bas_gpu)),
-            ctypes.cast(_env_gpu.data.ptr, ctypes.c_void_p))
+        # MR-2: the mask comes from the (only) default-partition kernel
+        # evaluation or its boolean-union derivation -- never from a kernel
+        # call at the coarse size (see _screen_shl_mask).  The downstream
+        # processing is read-only on the mask.
+        non0shl_mask = self._screen_shl_mask(opt, block_size)
 
         # offset of contraction pattern, used in eval_ao
         l_ctr_offsets = opt.l_ctr_offsets
@@ -732,19 +936,109 @@ class Grids(lib.StreamObject):
         t1 = log.timer_debug2('init ao sparsity', *t1)
         return non0ao_idx
 
-    def get_non0ao_idx(self, opt=None):
+    def get_non0ao_idx(self, opt=None, blksize=None):
         if self._non0ao_idx is None:
-            self._non0ao_idx = self._build_non0ao_idx_cache(opt)
+            self._non0ao_idx = {}
+        from gpu4pyscf.dft import numint
+        cache_key = numint.MIN_BLK_SIZE if blksize is None else blksize
+        entry = self._non0ao_idx.get(cache_key)
+        if entry is None:
+            entry = self._build_non0ao_idx_cache(opt, blksize=blksize)
+            self._non0ao_idx[cache_key] = entry
 
         ((idx, idx_sections),
          (non0shl_idx, non0shl_idx_sections),
          ctr_offsets_slice,
-         (ao_loc_slice, ao_loc_slice_sections)) = self._non0ao_idx
+         (ao_loc_slice, ao_loc_slice_sections)) = entry
         idx = cp.split(asarray(idx, dtype=np.int32), idx_sections)
         non0shl_idx = cp.split(asarray(non0shl_idx, dtype=np.int32), non0shl_idx_sections)
         ao_loc_slice = cp.split(asarray(ao_loc_slice, dtype=np.int32), ao_loc_slice_sections)
         paddings = [0] * len(idx)
         return list(zip(paddings, idx, non0shl_idx, ctr_offsets_slice, ao_loc_slice))
+
+    def get_partition_fix(self, opt=None, blksize=None):
+        '''MR1 (mainline repair 2026-10-21): per-coarse-block structures that
+        make an SCF loop block larger than MIN_BLK_SIZE reproduce the DEFAULT
+        MIN_BLK_SIZE partition's per-point AO screening exactly.
+
+        The default physics is defined by the MIN_BLK_SIZE screening: a shell
+        contributes to a grid point iff the fine block owning that point keeps
+        it.  A coarse block instead evaluates the UNION of its covered fine
+        blocks' shell sets (one big GEMM train -- the performance point of
+        GPU4PYSCF_XC_GRID_BLOCKSIZE), which silently keeps tail contributions
+        the default partition drops.  numint._block_loop uses this structure to
+        zero the AO rows of shells the owning fine block dropped, inside that
+        fine block's point range: every (shell, grid point) pair then
+        contributes iff the default partition evaluates it, so the block size
+        changes only the GEMM reduction order, never the screened physics.
+        (Measured before the fix, epinephrine/b3lyp/def2-svp: converged e_tot
+        shifted -1.932e-06 Ha at 16384 vs the default 4096; fixed-dm excsum
+        -1.9e-06, max|dvmat| 1.1e-04, dnelec +7.9e-6; with the fix all drop to
+        the reduction-order floor.  The default partition itself is untouched.)
+
+        Returns None for blksize <= MIN_BLK_SIZE (the default path), else a
+        list indexed by coarse block id of lists of
+        (fine_block_offset_in_coarse, union_positions_to_zero) tuples.
+        '''
+        from gpu4pyscf.dft import numint
+        if blksize is None or blksize <= numint.MIN_BLK_SIZE:
+            return None
+        # stored INSIDE the _non0ao_idx cache dict under a non-integer key
+        # (never collides with the integer blksize keys): the fix is a
+        # DERIVED structure, so every reset of the screening cache --
+        # build/prune/reset here, or an external `grids._non0ao_idx = None`
+        # following a screening-relevant change (AO_THRESHOLD) -- drops the
+        # fix with it.  A fix outliving its source caches would zero live
+        # AO rows (measured in the MR1 reproducer: a stale 1e-10-derived
+        # fix under a 1e-300 screen perturbed excsum by 7.6 Ha).
+        cache = self._non0ao_idx
+        if cache is None:
+            cache = self._non0ao_idx = {}
+        key = ('partition_fix', blksize)
+        entry = cache.get(key)
+        if entry is None:
+            entry = self._build_partition_fix(opt, blksize)
+            cache[key] = entry
+        return entry
+
+    def _build_partition_fix(self, opt, blksize):
+        '''Derive the per-coarse-block zeroing structure from the fine
+        (MIN_BLK_SIZE) and coarse screening caches.  Fails closed if the
+        coarse screen ever misses a shell a covered fine block keeps (the
+        coarse set is the union of the fine sets; a violation means the
+        invariance construction cannot reproduce the default partition and
+        must not run silently wrong).'''
+        from gpu4pyscf.dft import numint
+        MB = numint.MIN_BLK_SIZE
+        fine = self.get_non0ao_idx(opt, blksize=MB)
+        coarse = self.get_non0ao_idx(opt, blksize=blksize)
+        ngrids = self.size
+        n_coarse = (ngrids + blksize - 1) // blksize
+        out = []
+        for cb in range(n_coarse):
+            ip0 = cb * blksize
+            ip1 = min(ip0 + blksize, ngrids)
+            f0 = ip0 // MB
+            f1 = (ip1 + MB - 1) // MB
+            coarse_idx = cp.asnumpy(coarse[cb][1])
+            coarse_set = set(coarse_idx.tolist())
+            pos = {int(ao): i for i, ao in enumerate(coarse_idx)}
+            blocks = []
+            for j, f in enumerate(range(f0, f1)):
+                fine_set = set(cp.asnumpy(fine[f][1]).tolist())
+                missing = fine_set - coarse_set
+                if missing:
+                    raise RuntimeError(
+                        'partition-fix construction: coarse screen (block '
+                        f'{cb}, size {blksize}) is missing {len(missing)} '
+                        'shells a covered fine block keeps; the default-'
+                        'partition invariance cannot be guaranteed')
+                drop = numpy.asarray(
+                    [pos[ao] for ao in coarse_set if ao not in fine_set],
+                    dtype=numpy.int32)
+                blocks.append((j * MB, drop))
+            out.append(blocks)
+        return out
 
     def to_cpu(self):
         grids = gen_grid_cpu.Grids(self.mol)
