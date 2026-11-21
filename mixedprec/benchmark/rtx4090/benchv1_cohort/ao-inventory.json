@@ -1,0 +1,220 @@
+{
+  "scope": "CPU basis-table metadata only; no Mole.build, SCF, gradients or CUDA imports",
+  "molecules": [
+    {
+      "id": "acetaminophen",
+      "elements": {
+        "O": 2,
+        "N": 1,
+        "C": 8,
+        "H": 9
+      },
+      "nelec": 80,
+      "nao": {
+        "def2-svp": 199,
+        "def2-mtzvpp": 269
+      }
+    },
+    {
+      "id": "adenine",
+      "elements": {
+        "N": 5,
+        "C": 5,
+        "H": 5
+      },
+      "nelec": 70,
+      "nao": {
+        "def2-svp": 165,
+        "def2-mtzvpp": 240
+      }
+    },
+    {
+      "id": "benzoic_acid",
+      "elements": {
+        "O": 2,
+        "C": 7,
+        "H": 6
+      },
+      "nelec": 64,
+      "nao": {
+        "def2-svp": 156,
+        "def2-mtzvpp": 211
+      }
+    },
+    {
+      "id": "carbamazepine",
+      "elements": {
+        "O": 1,
+        "N": 2,
+        "C": 15,
+        "H": 12
+      },
+      "nelec": 124,
+      "nao": {
+        "def2-svp": 312,
+        "def2-mtzvpp": 417
+      }
+    },
+    {
+      "id": "cytosine",
+      "elements": {
+        "O": 1,
+        "N": 3,
+        "C": 4,
+        "H": 5
+      },
+      "nelec": 58,
+      "nao": {
+        "def2-svp": 137,
+        "def2-mtzvpp": 197
+      }
+    },
+    {
+      "id": "estradiol",
+      "elements": {
+        "O": 2,
+        "C": 18,
+        "H": 24
+      },
+      "nelec": 148,
+      "nao": {
+        "def2-svp": 400,
+        "def2-mtzvpp": 510
+      }
+    },
+    {
+      "id": "guanosine",
+      "elements": {
+        "O": 5,
+        "N": 5,
+        "C": 10,
+        "H": 13
+      },
+      "nelec": 148,
+      "nao": {
+        "def2-svp": 345,
+        "def2-mtzvpp": 495
+      }
+    },
+    {
+      "id": "ibuprofen",
+      "elements": {
+        "O": 2,
+        "C": 13,
+        "H": 18
+      },
+      "nelec": 112,
+      "nao": {
+        "def2-svp": 300,
+        "def2-mtzvpp": 385
+      }
+    },
+    {
+      "id": "naproxen",
+      "elements": {
+        "O": 3,
+        "C": 14,
+        "H": 14
+      },
+      "nelec": 122,
+      "nao": {
+        "def2-svp": 308,
+        "def2-mtzvpp": 408
+      }
+    },
+    {
+      "id": "phenacetin",
+      "elements": {
+        "O": 2,
+        "N": 1,
+        "C": 10,
+        "H": 13
+      },
+      "nelec": 96,
+      "nao": {
+        "def2-svp": 247,
+        "def2-mtzvpp": 327
+      }
+    },
+    {
+      "id": "propranolol",
+      "elements": {
+        "O": 2,
+        "N": 1,
+        "C": 16,
+        "H": 21
+      },
+      "nelec": 140,
+      "nao": {
+        "def2-svp": 371,
+        "def2-mtzvpp": 481
+      }
+    },
+    {
+      "id": "salicylic_acid",
+      "elements": {
+        "O": 3,
+        "C": 7,
+        "H": 6
+      },
+      "nelec": 72,
+      "nao": {
+        "def2-svp": 170,
+        "def2-mtzvpp": 235
+      }
+    },
+    {
+      "id": "testosterone",
+      "elements": {
+        "O": 2,
+        "C": 19,
+        "H": 28
+      },
+      "nelec": 158,
+      "nao": {
+        "def2-svp": 434,
+        "def2-mtzvpp": 549
+      }
+    },
+    {
+      "id": "uracil",
+      "elements": {
+        "O": 2,
+        "N": 2,
+        "C": 4,
+        "H": 4
+      },
+      "nelec": 58,
+      "nao": {
+        "def2-svp": 132,
+        "def2-mtzvpp": 192
+      }
+    },
+    {
+      "id": "vanillin",
+      "elements": {
+        "O": 3,
+        "C": 8,
+        "H": 8
+      },
+      "nelec": 80,
+      "nao": {
+        "def2-svp": 194,
+        "def2-mtzvpp": 264
+      }
+    },
+    {
+      "id": "warfarin",
+      "elements": {
+        "O": 4,
+        "C": 19,
+        "H": 16
+      },
+      "nelec": 162,
+      "nao": {
+        "def2-svp": 402,
+        "def2-mtzvpp": 537
+      }
+    }
+  ]
+}

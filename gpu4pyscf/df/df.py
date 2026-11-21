@@ -15,6 +15,8 @@
 
 import ctypes
 import contextlib
+import os
+import warnings
 import cupy
 import numpy as np
 import cupy as cp
@@ -39,6 +41,218 @@ MIN_BLK_SIZE = 256
 ALIGNED = getattr(__config__, 'ao_aligned', 32)
 
 LINEAR_DEP_THR = incore.LINEAR_DEP_THR
+
+# SP-28 (2026-10-26): a persistent float32 mirror of the CDERI serves
+# repeated fp32 get_jk calls (the 'auto' SCF policy runs its fp32 head
+# cycles against a float64 CDERI, re-casting the unchanged tensor on
+# every cycle otherwise).  The mirror is bitwise-identical to the
+# per-call astype; size-guarded and fail-closed to the per-call path.
+# Default ON; kill-switch GPU4PYSCF_CDERI_F32_CACHE=0; byte cap
+# GPU4PYSCF_CDERI_F32_CACHE_MAX_BYTES (default 2 GiB).
+_CDERI_F32_CACHE = None       # cached env value; None = not yet read
+_CDERI_F32_CACHE_MAX_BYTES = None
+_CDERI_F32_CACHE_DEFAULT_BYTES = 2 * 1024**3
+
+
+def _f32_cache_enabled():
+    global _CDERI_F32_CACHE
+    if _CDERI_F32_CACHE is None:
+        raw = os.environ.get('GPU4PYSCF_CDERI_F32_CACHE', '')
+        if raw in ('', '1'):
+            _CDERI_F32_CACHE = True
+        elif raw == '0':
+            _CDERI_F32_CACHE = False
+        else:
+            warnings.warn(f'GPU4PYSCF_CDERI_F32_CACHE={raw!r} ignored; '
+                          'expected 1 (fp32 cderi mirror, the default) or '
+                          '0 (per-call cast path)')
+            _CDERI_F32_CACHE = True
+    return _CDERI_F32_CACHE
+
+
+def _f32_cache_max_bytes():
+    global _CDERI_F32_CACHE_MAX_BYTES
+    if _CDERI_F32_CACHE_MAX_BYTES is None:
+        raw = os.environ.get('GPU4PYSCF_CDERI_F32_CACHE_MAX_BYTES', '')
+        try:
+            value = int(raw) if raw else _CDERI_F32_CACHE_DEFAULT_BYTES
+            if value <= 0:
+                raise ValueError(raw)
+        except ValueError:
+            warnings.warn(f'GPU4PYSCF_CDERI_F32_CACHE_MAX_BYTES={raw!r} '
+                          'ignored; expected a positive integer of bytes')
+            value = _CDERI_F32_CACHE_DEFAULT_BYTES
+        _CDERI_F32_CACHE_MAX_BYTES = value
+    return _CDERI_F32_CACHE_MAX_BYTES
+
+
+# MEM-RELEASE-01 (2026-11-18): the e726 MEMCYCLE-TRACE-01 walk (entry
+# 726, tamoxifen_r2scan3c_mtzvpp_687 at G0+6) identified the union
+# steady-restart memory sawtooth: each step's ~3.06-GiB cderi (with its
+# transpose view) survives the steady driver's mol/mf/g drop +
+# free_all_blocks because the whole per-step graph (cderi <- DF._cderi
+# <- mf.__dict__['with_df'] <- DFRKS <- Gradients.base <- bound-method
+# closures) is unreachable-but-CYCLIC garbage; it accumulates until a
+# rare generation-2 collection (the e724 9-10-step sawtooth, 16.7-GiB
+# peaks at 687; the deadskip VRAM-gate modulation 12-of-20; ONE forced
+# collect released 15.45 GiB).  The phase-A identification probe
+# (2026-11-18-mem-release01/phase-a, probe_identify_cycle.py, water
+# r2scan3c at a small cell, gc disabled for determinism) pinned the
+# cycle-closing assignments: exactly TWO protocol-side MethodType
+# self-edges -- the r2SCAN-3c D4/gCP hooks
+# mf.get_dispersion = MethodType(_r2scan3c_get_dispersion, mf)
+# (harness attach_3c_corrections) and
+# g.get_dispersion = MethodType(_r2scan3c_get_dispersion_grad, g)
+# (the steady driver's run_point) -- present in BOTH arms, part of the
+# frozen scientific contract; deleting them post-kernel/pre-drop
+# (value-neutral) makes the entire per-step graph die by refcount
+# under BOTH bare and union env, so the 15-knob union composition adds
+# NO library-side cycle-closing assignment of its own (the CAND/R
+# asymmetry is the natural generation-2 cadence: at 687 the union
+# arm's gen2 count stayed flat for 7 steps while the bare arm fired
+# naturally).  The self-edges are protocol/harness code, not library
+# defects, so the library-side mechanism is the card's option (b):
+# PACE the collection.  The opt-in GPU4PYSCF_STEADY_MEM_RELEASE knob
+# (DEFAULT OFF) runs one full gc.collect() at DF.build entry -- the
+# steady-restart protocol's per-step allocation boundary (each step
+# builds a fresh with_df AFTER dropping the previous step's graph, so
+# the previous step's cyclic garbage is already unreachable there and
+# the collection frees it BEFORE the new cderi allocation: peak ~=
+# one step's footprint instead of the 9-10-step accumulation).  Pure
+# memory management, no arithmetic anywhere: values are bitwise
+# identical by construction (a collection only frees unreachable
+# objects).  The collect cost is honestly included in the step wall
+# (the phase-B paired metric card; ~37-42 ms per collect at the probe
+# heap).  Fire-closed engagement evidence: _STEADY_MEM_RELEASE_FIRES
+# bumps ONLY on actually-run paced collections (knob-off arms exactly
+# 0), and _STEADY_MEM_RELEASE_STATS records one entry per DF.build
+# pass, armed or not (the 2faa55d class).  The strict fp64-reference
+# context never feels the mechanism (the _steady_mem_release_armed
+# gate).
+#
+# MEM-POOLTRIM-UKS-01 (2026-11-19): the e735 DEPTHCAP-UKS-01 depth-50
+# raws attribute the OPEN-SHELL trajectory accumulation to a SECOND
+# class the gc pacing cannot see: the CUPY pool's RETAINED FREE BLOCKS
+# (pool_used flat at 10-22 MiB while pool_total climbs +36.0-MiB stairs
+# and drops 144 MiB at the natural gen-2 releases; the e735 diagnostic
+# itself conflated gc.collect(2) with the kit's pool.free_all_blocks()
+# in released_mib).  Dead objects' memory, cached by the pool between
+# release events -- nothing for a gc.collect() to free.  The covering
+# mechanism for THIS class is a POOL TRIM at the same steady boundary:
+# the opt-in value 'trim' (GPU4PYSCF_STEADY_MEM_RELEASE=trim, DEFAULT
+# OFF, '1' keeps the landed gc-only semantics VERBATIM) runs the paced
+# full collection AND one pool.free_all_blocks() at the same DF.build
+# entry.  free_all_blocks() releases only FREE blocks -- no live
+# object is touched, values bitwise identical by construction (pure
+# pool management, no arithmetic; the trim cost honestly inside the
+# step wall).  Engagement stays fire-closed: _STEADY_MEM_RELEASE_TRIMS
+# bumps ONLY on actually-run trims, and every stats record carries its
+# mode.
+_STEADY_MEM_RELEASE = None       # cached mode; None = not yet read
+_STEADY_MEM_RELEASE_FIRES = 0    # paced collections actually run
+_STEADY_MEM_RELEASE_TRIMS = 0    # paced pool trims actually run
+_STEADY_MEM_RELEASE_STATS = []   # one record per DF.build pass
+
+
+def _steady_mem_release():
+    '''Whether GPU4PYSCF_STEADY_MEM_RELEASE is armed (the opt-in
+    GC-pacing knob for steady-restart trajectories, MEM-RELEASE-01;
+    DEFAULT OFF).  True for BOTH armed modes ('gc' and 'trim'); the
+    trim conjunct is read separately (_steady_mem_release_trims).'''
+    global _STEADY_MEM_RELEASE
+    if _STEADY_MEM_RELEASE is None:
+        _STEADY_MEM_RELEASE = _steady_mem_release_parse()
+    return _STEADY_MEM_RELEASE in ('gc', 'trim')
+
+
+def _steady_mem_release_parse():
+    '''The raw env parse -> cached mode string.  '1'/'true'/'True' ->
+    'gc' (the landed e727 semantics VERBATIM: one full collection at
+    each DF.build boundary); 'trim' -> 'trim' (the MEM-POOLTRIM-UKS-01
+    extension: the paced collection AND one pool free_all_blocks at
+    the same boundary); ''/'0'/'false'/'False' -> 'off' (DEFAULT);
+    anything else warns once and stays off.'''
+    raw = os.environ.get('GPU4PYSCF_STEADY_MEM_RELEASE', '')
+    if raw in ('1', 'true', 'True'):
+        return 'gc'
+    if raw == 'trim':
+        return 'trim'
+    if raw in ('', '0', 'false', 'False'):
+        return 'off'
+    warnings.warn(f'GPU4PYSCF_STEADY_MEM_RELEASE={raw!r} '
+                  'ignored; expected 1 (pace one full collection '
+                  'at each DF.build boundary of a steady-restart '
+                  'trajectory), trim (the collection plus one pool '
+                  'free_all_blocks at the same boundary) or 0 (the '
+                  'default: no paced collection)')
+    return 'off'
+
+
+def _steady_mem_release_trims():
+    '''Whether the armed mode carries the pool-trim conjunct
+    (GPU4PYSCF_STEADY_MEM_RELEASE=trim, MEM-POOLTRIM-UKS-01).  False
+    in every other mode, including 'gc'.'''
+    global _STEADY_MEM_RELEASE
+    if _STEADY_MEM_RELEASE is None:
+        _STEADY_MEM_RELEASE = _steady_mem_release_parse()
+    return _STEADY_MEM_RELEASE == 'trim'
+
+
+def _steady_mem_release_armed():
+    '''Armed = the env knob AND NOT the strict fp64-reference context
+    (dft.numint._strict_fp64_reference_active, armed by stability_verify
+    around its exact-fp64 sibling trajectories): the reference context
+    never feels the mechanism.  Lazy import so df.df does not pay the
+    dft import at module load (the df_jk reader idiom).'''
+    if not _steady_mem_release():
+        return False
+    from gpu4pyscf.dft import numint as _numint
+    return not bool(_numint._strict_fp64_reference_active)
+
+
+def _steady_mem_release_pace(build_cderi):
+    '''One DF.build boundary: records a stats entry on EVERY pass,
+    armed or not (the 2faa55d class); when armed, runs the paced full
+    collection BEFORE this build's new cderi allocation; when the
+    armed mode is 'trim' (MEM-POOLTRIM-UKS-01), additionally releases
+    the pool's retained free blocks at the same boundary (releasing
+    only FREE blocks -- no live object touched).  Returns None; pure
+    memory management, no arithmetic, no value change.'''
+    global _STEADY_MEM_RELEASE_FIRES, _STEADY_MEM_RELEASE_TRIMS
+    armed = _steady_mem_release_armed()
+    trims = armed and _steady_mem_release_trims()
+    rec = {'armed': armed, 'build_cderi': bool(build_cderi),
+           'fired': False, 'mode': (
+               'off' if not armed else
+               'trim' if trims else 'gc'),
+           'trimmed': False}
+    if armed:
+        import gc as _gc
+        import time as _time
+        t0 = _time.perf_counter()
+        gen2_before = _gc.get_stats()[2]['collections']
+        collected = _gc.collect()
+        rec.update(fired=True, collected_objects=int(collected),
+                   collect_s=round(_time.perf_counter() - t0, 6),
+                   gen2_before=int(gen2_before),
+                   gen2_after=int(_gc.get_stats()[2]['collections']))
+        _STEADY_MEM_RELEASE_FIRES += 1
+    if trims:
+        import time as _time
+        import cupy as _cp
+        pool = _cp.get_default_memory_pool()
+        total_before = pool.total_bytes()
+        t0 = _time.perf_counter()
+        pool.free_all_blocks()
+        rec.update(trimmed=True, trim_s=round(
+            _time.perf_counter() - t0, 6),
+            pool_total_before_b=int(total_before),
+            pool_total_after_b=int(pool.total_bytes()),
+            pool_used_after_b=int(pool.used_bytes()))
+        _STEADY_MEM_RELEASE_TRIMS += 1
+    _STEADY_MEM_RELEASE_STATS.append(rec)
+    return None
+
 
 class DF(lib.StreamObject):
 
@@ -66,13 +280,19 @@ class DF(lib.StreamObject):
 
         self.auxmol = None
         self._cderi = None
+        self._cderi_f32 = None
         self._cderi_idx = None
+        # GRAD-J3C-REUSE-01: the aux-side j2c^{-1/2} factor retained at
+        # build time (sorted-aux rows, reduced F columns, ~naux*nF*8 bytes).
+        # Consumed by the opt-in DF-gradient cderi-reuse path; None everywhere
+        # else and cleared by reset() like every other cderi artifact.
+        self._cderi_aux_coef = None
         self._cd_j2c = None
         self._rsh_df = {}
         self._rsh_parameters = None
 
     __getstate__, __setstate__ = lib.generate_pickle_methods(
-        excludes=('intopt', '_cderi'))
+        excludes=('intopt', '_cderi', '_cderi_f32'))
 
     @property
     def auxbasis(self):
@@ -93,6 +313,18 @@ class DF(lib.StreamObject):
     def build(self, *, direct_scf_tol=None,
               omega=None, lr_factor=None, sr_factor=None,
               build_cderi=True):
+        # MEM-RELEASE-01 / MEM-POOLTRIM-UKS-01: the opt-in
+        # GPU4PYSCF_STEADY_MEM_RELEASE knob (DEFAULT OFF) paces one
+        # full gc collection at this build boundary -- the
+        # steady-restart protocol's per-step allocation point, where
+        # the previous step's cyclic garbage is already unreachable
+        # and the collection frees it BEFORE the new cderi allocation
+        # ('trim' additionally releases the pool's retained free
+        # blocks, the e735 open-shell accumulation class).  Pure
+        # memory management; values bitwise identical.
+        _steady_mem_release_pace(build_cderi)
+        # a rebuilt tensor must never be served by a stale fp32 mirror
+        self._cderi_f32 = None
         mol = self.mol
         auxmol = self.auxmol
         log = logger.new_logger(mol, mol.verbose)
@@ -102,14 +334,28 @@ class DF(lib.StreamObject):
         self.nao = mol.nao
         self.naux = auxmol.nao
 
-        self.intopt = intopt = int3c2e_bdiv.Int3c2eOpt(mol, auxmol)
-        intopt.mol = SortedMole.from_mol(mol, decontract=True)
-        intopt.build()
+        # CDERI-B2D-HOSTPATH-01 (C1): serve the decontracted-sorted
+        # Int3c2eOpt from the identity-keyed molecular cache when this
+        # Mole/auxmol pair was already built this process (the gradient
+        # jk_energy_per_atom site reconstructs the identical opt); a token
+        # mismatch (e.g. an active range-coulomb context) builds fresh via
+        # the verbatim sequence below.
+        intopt = int3c2e_bdiv._molecular_int3c2e_opt(mol, auxmol, decontract=True)
+        if intopt is None:
+            intopt = int3c2e_bdiv.Int3c2eOpt(mol, auxmol)
+            intopt.mol = SortedMole.from_mol(mol, decontract=True)
+            intopt.build()
+        self.intopt = intopt
         if build_cderi:
             self._rsh_parameters = (omega, lr_factor, sr_factor)
-            self._cderi, self._cderi_idx = _cholesky_eri(
+            self._cderi, self._cderi_idx, self._cderi_aux_coef = _cholesky_eri(
                 intopt, omega=omega, lr_factor=lr_factor, sr_factor=sr_factor,
                 use_gpu_memory=self.use_gpu_memory)
+            n_canon = _canonicalize_duplicate_pair_columns(
+                self._cderi, self._cderi_idx[0], mol.nao)
+            if n_canon > 0:
+                log.debug1('canonicalized %d duplicate AO-pair cderi columns',
+                           n_canon)
             log.timer_debug1('cholesky_eri', *t0)
         return self
 
@@ -260,6 +506,13 @@ class DF(lib.StreamObject):
             io_stream = cp.cuda.stream.Stream(non_blocking=True)
             io_event = cp.cuda.Event()
 
+            # Issue #1031: buf_prefetch may reuse memory from CuPy's pool.
+            # When buf_prefetch.set() is launched on the non-blocking io_stream,
+            # this memory may still be in use by the main stream (comput_stream).
+            # io_stream must not access buf_prefetch until the main stream
+            # finishes accessing the reused memory pool.
+            compute_event.record(comput_stream)
+            io_stream.wait_event(compute_event)
             buf_prefetch.set(cderi_sparse[:blksize], stream=io_stream)
             io_event.record(io_stream)
 
@@ -283,6 +536,93 @@ class DF(lib.StreamObject):
                                          out=work[:,:,:p1-p0])
                     yield out.transpose(2,0,1), cderi_blk
 
+    def _get_cderi_f32_blocks(self, blksize):
+        '''Persistent per-block float32 copies of self._cderi serving
+        repeated fp32 get_jk calls (the 'auto' SCF policy's fp32 head
+        cycles otherwise re-cast the unchanged tensor on every cycle).
+        Each cached block is exactly the array the per-call
+        ``_cast_cderi`` produced (the order='K' astype of the F-ordered
+        tril slice), and the K-side unpack from it is a pure scatter, so
+        serving fp32 contractions from the cache cannot change any SCF
+        trajectory bitwise.  Fail-closed: the kill-switch env, a
+        total-bytes cap and a free-memory check each fall back to the
+        per-call cast path, as does a second distinct blksize on the
+        same device (one cached partition per device, no rebuild churn).
+        Invalidated by build()/reset().
+        '''
+        if self._cderi is None or self._cderi_idx is None:
+            return None
+        if not _f32_cache_enabled():
+            return None
+        device_id = cp.cuda.Device().id
+        key = (device_id, int(blksize))
+        cache = self._cderi_f32
+        if cache is not None:
+            if key in cache:
+                return cache[key]
+            for dev, _bs in cache:
+                if dev == device_id:
+                    return None    # a different partition is already live
+        total_bytes = 4 * sum(c.size for c in self._cderi)
+        if total_bytes > _f32_cache_max_bytes():
+            logger.debug1(self.mol, 'fp32 cderi mirror not cached: '
+                          f'{total_bytes/2**30:.2f} GiB above the cap')
+            return None
+        avail = get_avail_mem()
+        if total_bytes > avail * 0.5:
+            logger.debug1(self.mol, 'fp32 cderi mirror not cached: '
+                          f'{total_bytes/2**30:.2f} GiB above half of '
+                          f'the {avail/2**30:.2f} GiB available')
+            return None
+        c = self._cderi[device_id]
+        if not isinstance(c, cp.ndarray):
+            # host-resident CDERI (use_gpu_memory=False, or automatic
+            # host placement): the astype product stays a NumPy array
+            # while loop_f32()/fill_symmetric() need device pointers.
+            # Keep serving this device from the original loop() host
+            # upload path with its per-call casts (review 2026-10-27 F1)
+            logger.debug1(self.mol, 'fp32 cderi mirror not cached: '
+                          'host-resident cderi on device %d' % device_id)
+            return None
+        blocks = [c[p0:p1].astype(cp.float32)
+                  for p0, p1 in lib.prange(0, c.shape[0], blksize)]
+        if cache is None:
+            cache = self._cderi_f32 = {}
+        cache[key] = blocks
+        return blocks
+
+    def loop_f32(self, blksize=None, unpack=True):
+        '''fp32 counterpart of loop() over the cached per-block float32
+        cderi copies: the J side yields the cached blocks directly and
+        the K side unpacks with fill_symmetric into a reusable float32
+        work buffer, replacing the per-call _cast_cderi pass on both
+        sides.  Requires _get_cderi_f32_blocks() to have admitted the
+        cache; yields the same (unpacked (L,nao,nao) view, tril
+        (L,npairs) block) pairs as loop().
+        '''
+        blocks = self._get_cderi_f32_blocks(blksize)
+        assert blocks is not None
+        nao = self.nao
+        pair_idx = cp.asarray(self._cderi_idx[0], dtype=np.int32)
+        block_size = blocks[0].shape[0]
+        if unpack:
+            work = cp.zeros((nao, nao, block_size), dtype=cp.float32)
+        for i, cderi_blk in enumerate(blocks):
+            if not unpack:
+                yield None, cderi_blk
+            else:
+                out = fill_symmetric(cderi_blk.T, pair_idx, nao, 0,
+                                     cderi_blk.shape[0],
+                                     out=work[:,:,:cderi_blk.shape[0]])
+                blk = out.transpose(2,0,1)
+                if cderi_blk.shape[0] < block_size:
+                    # tail block: mirror the per-call cast's fallback
+                    # layout (plain astype on the strided view) so the
+                    # downstream contracts see the identical stride
+                    # pattern they would with _cast_cderi
+                    blk = blk.astype(cp.float32)
+                yield blk, cderi_blk
+
     def reset(self, mol=None):
         '''Reset mol and clean up relevant attributes for scanner mode'''
         if mol is not None:
@@ -291,7 +631,9 @@ class DF(lib.StreamObject):
             self.intopt = None
             self.j_engine = None
         self._cderi = None
+        self._cderi_f32 = None
         self._cderi_idx = None
+        self._cderi_aux_coef = None
         self._cd_j2c = None
         self._rsh_df = {}
         self._rsh_parameters = None
@@ -689,7 +1031,60 @@ def _cholesky_eri(intopt, *, omega=None, lr_factor=None, sr_factor=None,
             return out.T
 
         cderi = multi_gpu.run(proc, non_blocking=True)
-    return cderi, cderi_idx
+    # GRAD-J3C-REUSE-01: also return the aux-side factor so DF.build can
+    # retain it (self._cderi_aux_coef).  cderi = j3c . aux_coef with
+    # aux_coef . aux_coef^T = j2c^{-1} (up to the discarded small
+    # eigenvectors of the 'ed' branch), so the exact same reduced object
+    # the SCF energy consumed is available to downstream phases.
+    return cderi, cderi_idx, aux_coef
+
+def _canonicalize_duplicate_pair_columns(cderi, pair_addresses, nao):
+    '''Bitwise-equalize the duplicate AO-pair columns of the CDERI.
+
+    pair_and_diag_indices enumerates the full AO rectangle inside diagonal
+    shell-pair blocks, so the CDERI stores both (i,j) and (j,i) columns for
+    the cross AO pairs of one shell. The two columns hold the same integrals
+    but reach their values through different cart2sph/solve contraction
+    orders, so they can differ at the last bits. fill_symmetric writes both
+    symmetric cells from every column; when the duplicate columns are not
+    bitwise equal, the racing stores make the unpacked CDERI (and the DF
+    exchange matrix) vary between launches. The J path is unaffected (the
+    duplicate pairs carry the diagonal-block dm_sparse halving). Copying the
+    first-occurrence column onto its duplicates restores the intended
+    bitwise (ij|P) == (ji|P) symmetry, which makes the racing writes
+    harmless and the DF exchange build deterministic.
+
+    Returns the number of overwritten duplicate columns.
+    '''
+    if isinstance(pair_addresses, cp.ndarray):
+        pair_np = cp.asnumpy(pair_addresses)
+    else:
+        pair_np = np.asarray(pair_addresses)
+    pair_np = pair_np.astype(np.int64, copy=False).ravel()
+    i, j = np.divmod(pair_np, nao)
+    key = np.minimum(i * nao + j, j * nao + i)
+    order = np.argsort(key, kind='stable')
+    keys = key[order]
+    bounds = np.flatnonzero(np.concatenate(([True], keys[1:] != keys[:-1],
+                                             [True])))
+    src_cols = []
+    dst_cols = []
+    for b0, b1 in zip(bounds[:-1], bounds[1:]):
+        if b1 - b0 > 1:
+            group = order[b0:b1]
+            src_cols.extend([group[0]] * (b1 - b0 - 1))
+            dst_cols.extend(group[1:].tolist())
+    if not dst_cols:
+        return 0
+    src_np = np.asarray(src_cols)
+    dst_np = np.asarray(dst_cols)
+    arrays = cderi.values() if isinstance(cderi, dict) else cderi
+    for arr in arrays:
+        if isinstance(arr, cp.ndarray):
+            arr[:, cp.asarray(dst_np)] = arr[:, cp.asarray(src_np)]
+        else:
+            arr[:, dst_np] = arr[:, src_np]
+    return len(dst_cols)
 
 def _decompose_j2c(auxmol, aux_sorting=None,
                    omega=None, lr_factor=None, sr_factor=None):

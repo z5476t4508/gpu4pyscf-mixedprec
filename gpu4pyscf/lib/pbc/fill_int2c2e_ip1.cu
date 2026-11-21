@@ -267,11 +267,32 @@ void pbc_int2c2e_ip1_kernel(double *out, PBCIntEnvVars envs,
     }
 }
 
+/*
+ * GRADAUX-DET-REDUCTION-01 deterministic variant: the template parameter
+ * DET replaces the per-thread atomicAdd reassociation of the (out) aux
+ * response accumulation -- the e645-measured second carrier of the aux
+ * sub-chain k-repeat drift -- with the same-value fixed-order segmented
+ * reduction used in ejk_int3c2e_ip1_f32.cu: per pair iteration every
+ * thread stages its (ia, ja, v[6]) tail at its own slot of this block's
+ * PRIVATE global staging rows (sentinel for the inactive padding
+ * iterations -- the 2c scheme's shared memory is an exact nsp*unit*8
+ * fit with no spare bytes, so the staging lives in global memory), then
+ * the single owner thread of each gradient slot (slot % THREADS)
+ * consumes the entries in ascending thread order into this block's
+ * PRIVATE partial[block, slot] row; a trailing single-block kernel sums
+ * the rows in fixed block order.  The multiset of addends is exactly
+ * the atomicAdd multiset, so the only arithmetic delta is the
+ * deterministic reassociation.  DET=false (the deployed e_int2c2e_ip1
+ * entry) compiles the staging out and keeps the atomicAdd lane
+ * bit-for-bit.
+ */
+template <bool DET>
 __global__ static
 void e_int2c2e_ip1_kernel(double *out, double *dm, PBCIntEnvVars envs,
                           double omega, double lr_factor, double sr_factor,
                           int *shl_pair_offsets, uint32_t *bas_ij_idx,
-                          int *gout_stride_lookup)
+                          int *gout_stride_lookup, double *partial,
+                          double *stage_v, int *stage_atm)
 {
     int sp_block_id = blockIdx.x;
     int thread_id = threadIdx.x;
@@ -318,6 +339,19 @@ void e_int2c2e_ip1_kernel(double *out, double *dm, PBCIntEnvVars envs,
     double *Rpq = shared_memory + nsp_per_block * (g_size*3+nroots*2) + sp_id;
     int *idx_i = _c_cartesian_lexical_xyz + lex_xyz_offset(li);
     int *idx_j = _c_cartesian_lexical_xyz + lex_xyz_offset(lj);
+    // GRADAUX-DET-REDUCTION-01 staging for the deterministic lane: this
+    // block's PRIVATE global rows (one (ia, ja, v[6]) entry per thread;
+    // the 2c scheme's shared memory is an exact fit with no spare bytes).
+    // DET=false compiles the whole block out (dead computation, no
+    // register cost on the deployed lane).
+    int ns = 0;
+    size_t stage_v_base = 0;
+    size_t stage_atm_base = 0;
+    if (DET) {
+        stage_v_base = (size_t)blockIdx.x * THREADS * 6;
+        stage_atm_base = (size_t)blockIdx.x * THREADS * 2;
+        ns = envs.natm*3;
+    }
 
     for (int pair_ij = shl_pair0+sp_id; pair_ij < shl_pair1+sp_id; pair_ij += nsp_per_block) {
         double v_ix = 0;
@@ -478,9 +512,56 @@ void e_int2c2e_ip1_kernel(double *out, double *dm, PBCIntEnvVars envs,
                 }
             }
         }
-        if (pair_ij < shl_pair1) {
-            int ia = bas[ish*BAS_SLOTS+ATOM_OF];
-            int ja = bas[jsh*BAS_SLOTS+ATOM_OF];
+        int ia = bas[ish*BAS_SLOTS+ATOM_OF];
+        int ja = bas[jsh*BAS_SLOTS+ATOM_OF];
+        if (DET) {
+            // stage this thread's (ia, ja, v[6]) tail at its own slot of
+            // the block's private global staging rows -- the inactive
+            // padding iterations carry the -1 sentinel; the scan below is
+            // the only reader, separated by barriers
+            int active = pair_ij < shl_pair1;
+            stage_atm[stage_atm_base + thread_id*2+0] = active ? ia : -1;
+            stage_atm[stage_atm_base + thread_id*2+1] = active ? ja : -1;
+            if (active) {
+                stage_v[stage_v_base + thread_id*6+0] = v_ix;
+                stage_v[stage_v_base + thread_id*6+1] = v_iy;
+                stage_v[stage_v_base + thread_id*6+2] = v_iz;
+                stage_v[stage_v_base + thread_id*6+3] = v_jx;
+                stage_v[stage_v_base + thread_id*6+4] = v_jy;
+                stage_v[stage_v_base + thread_id*6+5] = v_jz;
+            } else {
+                for (int m = 0; m < 6; ++m) {
+                    stage_v[stage_v_base + thread_id*6+m] = 0.;
+                }
+            }
+            __syncthreads();
+            // deterministic segmented reduction: each gradient slot has
+            // exactly one owner thread (slot % THREADS) inside this block;
+            // every entry is consumed in ascending thread order into the
+            // block's PRIVATE partial row -- no atomics, a fixed summation
+            // order run-to-run
+            for (int e = 0; e < THREADS; ++e) {
+                int a0 = stage_atm[stage_atm_base + e*2+0];
+                if (a0 >= 0) {
+                    for (int m = 0; m < 3; ++m) {
+                        int s = a0*3+m;
+                        if (s % THREADS == thread_id) {
+                            partial[(size_t)blockIdx.x*ns + s] += stage_v[stage_v_base + e*6+m];
+                        }
+                    }
+                }
+                int a1 = stage_atm[stage_atm_base + e*2+1];
+                if (a1 >= 0) {
+                    for (int m = 0; m < 3; ++m) {
+                        int s = a1*3+m;
+                        if (s % THREADS == thread_id) {
+                            partial[(size_t)blockIdx.x*ns + s] += stage_v[stage_v_base + e*6+3+m];
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+        } else if (pair_ij < shl_pair1) {
             atomicAdd(out+ia*3+0, v_ix);
             atomicAdd(out+ia*3+1, v_iy);
             atomicAdd(out+ia*3+2, v_iz);
@@ -488,6 +569,24 @@ void e_int2c2e_ip1_kernel(double *out, double *dm, PBCIntEnvVars envs,
             atomicAdd(out+ja*3+1, v_jy);
             atomicAdd(out+ja*3+2, v_jz);
         }
+    }
+}
+
+// GRADAUX-DET-REDUCTION-01: fixed-order block reduction of the per-block
+// partial rows into the (out) aux response target.  One block; the owner
+// of slot s (thread s % THREADS) sums the rows in ascending block order --
+// a single writer per slot and a fixed summation order, so the result is
+// bitwise reproducible run-to-run for identical inputs.
+__global__ static
+void det_reduce_2c(double *out, double *partial, int nblocks, int natm)
+{
+    int ns = natm*3;
+    for (int s = threadIdx.x; s < ns; s += THREADS) {
+        double acc = 0.;
+        for (int b = 0; b < nblocks; ++b) {
+            acc += partial[(size_t)b*ns + s];
+        }
+        out[s] += acc;
     }
 }
 
@@ -514,13 +613,49 @@ int e_int2c2e_ip1(double *out, double *dm, PBCIntEnvVars *envs,
                   int nbatches_shl_pair, int *shl_pair_offsets,
                   uint32_t *bas_ij_idx, int *gout_stride_lookup)
 {
-    cudaFuncSetAttribute(e_int2c2e_ip1_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
-    e_int2c2e_ip1_kernel<<<nbatches_shl_pair, THREADS, shm_size>>>(
+    cudaFuncSetAttribute(e_int2c2e_ip1_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    e_int2c2e_ip1_kernel<false><<<nbatches_shl_pair, THREADS, shm_size>>>(
             out, dm, *envs, omega, lr_factor, sr_factor,
-            shl_pair_offsets, bas_ij_idx, gout_stride_lookup);
+            shl_pair_offsets, bas_ij_idx, gout_stride_lookup,
+            NULL, NULL, NULL);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA Error in int2c2e_ip1 kernel: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
+// GRADAUX-DET-REDUCTION-01 deterministic entry: identical arithmetic to
+// e_int2c2e_ip1 (same kernel, same operands, same per-addend values --
+// only the accumulation order is fixed); the caller provides a ZEROED
+// partial buffer of (nbatches_shl_pair, natm*3) doubles plus the
+// per-block staging rows (nbatches_shl_pair, THREADS, 6) doubles and
+// (nbatches_shl_pair, THREADS, 2) int32, and the wrapper folds partial
+// into out with the fixed-order det_reduce_2c kernel on the same stream.
+// The staging rows need no pre-zeroing: every thread overwrites its own
+// entry on every pair iteration (sentinel for the padding iterations).
+int e_int2c2e_ip1_det(double *out, double *dm, PBCIntEnvVars *envs,
+                  double omega, double lr_factor, double sr_factor, int shm_size,
+                  int nbatches_shl_pair, int *shl_pair_offsets,
+                  uint32_t *bas_ij_idx, int *gout_stride_lookup,
+                  double *partial, double *stage_v, int *stage_atm)
+{
+    cudaFuncSetAttribute(e_int2c2e_ip1_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    e_int2c2e_ip1_kernel<true><<<nbatches_shl_pair, THREADS, shm_size>>>(
+            out, dm, *envs, omega, lr_factor, sr_factor,
+            shl_pair_offsets, bas_ij_idx, gout_stride_lookup,
+            partial, stage_v, stage_atm);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error in e_int2c2e_ip1_det main launch (nbatches %d): %s\n",
+                nbatches_shl_pair, cudaGetErrorString(err));
+        return 1;
+    }
+    det_reduce_2c<<<1, THREADS>>>(out, partial, nbatches_shl_pair, envs->natm);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error in e_int2c2e_ip1_det reduce launch: %s\n", cudaGetErrorString(err));
         return 1;
     }
     return 0;
