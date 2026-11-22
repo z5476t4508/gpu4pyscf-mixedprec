@@ -191,7 +191,7 @@ class TestPerGridSemantics(unittest.TestCase):
         # UKS reachability via the uks.py rks.initialize_grids
         # delegation (the 573/819 anion-cell class path)
         mf0, e0, ev0 = _run_uks()
-        built_main = mf0.grids.coords.shape[0]
+        _built_main = mf0.grids.coords.shape[0]
         built_nlc = mf0.nlcgrids.coords.shape[0]
         self.assertEqual(ev0, [])
         mf, e, ev = _run_uks(cutoff=1e-7, nlc=0)

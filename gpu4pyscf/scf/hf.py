@@ -268,8 +268,8 @@ _ADAPTIVE_NEWTON_DEFAULT_DDM = 0.0285
 _ADAPTIVE_NEWTON_DEFAULT_MIN_CYCLE = 12
 _ADAPTIVE_NEWTON = None      # cached env value; None = not yet read
 _ADAPTIVE_NEWTON_FIRES = 0   # dispatcher fires across armed kernels
-_ADAPTIVE_NEWTON_RUN = None  # latest kernel's dispatcher state (None
-                             # when that kernel ran disarmed)
+# Latest kernel's dispatcher state, or None when that kernel ran disarmed.
+_ADAPTIVE_NEWTON_RUN = None
 
 def _note_adaptive_newton_fire():
     '''Bump the dispatcher engagement counter (home module: the
@@ -501,7 +501,6 @@ def _adaptive_veto_decision(trace):
 def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
            dump_chk=True, dm0=None, callback=None, conv_check=True, **kwargs):
     conv_tol = mf.conv_tol
-    mol = mf.mol
     verbose = mf.verbose
     log = logger.new_logger(mf, verbose)
     t0 = t1 = log.init_timer()

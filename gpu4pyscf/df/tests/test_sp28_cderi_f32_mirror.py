@@ -163,7 +163,8 @@ class KnownValues(unittest.TestCase):
             precision.set_precision('fp64')
         for a, b in ((vj0_1, vj1_1), (vk0_1, vk1_1),
                      (vj0_2, vj1_2), (vk0_2, vk1_2)):
-            a = np.asarray(a); b = np.asarray(b)
+            a = np.asarray(a)
+            b = np.asarray(b)
             self.assertEqual(a.dtype, b.dtype)
             self.assertTrue(np.array_equal(a, b))
             self.assertEqual(a.tobytes(), b.tobytes())

@@ -191,7 +191,7 @@ class TestSourceContract(unittest.TestCase):
     def test_resp32_contract_untouched(self):
         # absence-contract scope guard (green at the parent by
         # design): the RESPF32 vind wrapper keeps its own scope
-        src = open(SOSCF_SRC).read()
+        _src = open(SOSCF_SRC).read()
         gen = _func_src(SOSCF_SRC, 'gen_g_hop_uhf')
         self.assertIn('if _resp_f32_armed(mf):', gen)
         self.assertIn('vind = _wrap_vind_resp_f32(vind)', gen)

@@ -140,7 +140,7 @@ class TestPrefetchSyncDefense(unittest.TestCase):
         try:
             dfobj._cderi[dev] = cp.asnumpy(gpu_cderi)
             host1 = _collect_blocks(dfobj, blksize=blksize)
-            host2 = _collect_blocks(dfobj, blksize=blksize)
+            _host2 = _collect_blocks(dfobj, blksize=blksize)
         finally:
             dfobj._cderi[dev] = gpu_cderi  # restore the resident build
         self.assertEqual(len(ref), len(host1))

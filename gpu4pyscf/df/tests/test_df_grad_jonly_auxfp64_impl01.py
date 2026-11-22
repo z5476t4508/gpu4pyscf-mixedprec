@@ -306,7 +306,7 @@ class TestVerbatimAndArmed(_KnobState):
         mf = self._converged(mol_sph)
         c0 = grad_dfrhf._JONLY_AUXFP64_GRADS
         with _Ip1Recorder() as calls:
-            g_fp32 = mf.nuc_grad_method().kernel()
+            _g_fp32 = mf.nuc_grad_method().kernel()
         self.assertEqual(grad_dfrhf._JONLY_AUXFP64_GRADS, c0)
         self.assertIn('f32', calls)
         stats = dict(grad_dfrhf._JONLY_AUXFP64_STATS)

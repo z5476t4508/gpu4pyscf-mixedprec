@@ -470,8 +470,8 @@ class TestVerbatimAndArmed(_KnobState):
         c0 = grad_dfrhf._AUXDET_GRADS
         rec2 = _C2cRecorder()
         rec2.set_shapes(mol_sph.natm)
-        with _Ip1Recorder() as calls, rec2 as c2c:
-            g_fp32 = mf.nuc_grad_method().kernel()
+        with _Ip1Recorder() as calls, rec2:
+            _g_fp32 = mf.nuc_grad_method().kernel()
         self.assertEqual(grad_dfrhf._AUXDET_GRADS, c0)
         self.assertIn('f32', calls)
         self.assertNotIn('f32det', calls)
@@ -490,7 +490,7 @@ class TestVerbatimAndArmed(_KnobState):
         rec2 = _C2cRecorder()
         rec2.set_shapes(mol_sph.natm)
         with _Ip1Recorder() as calls, rec2 as c2c:
-            g_jl = mf.nuc_grad_method().kernel()
+            _g_jl = mf.nuc_grad_method().kernel()
         self.assertEqual(grad_dfrhf._AUXDET_GRADS, c0)
         self.assertEqual(sorted(calls), ['f64', 'f64'])
         self.assertEqual(c2c.count('2cdet'), 0)

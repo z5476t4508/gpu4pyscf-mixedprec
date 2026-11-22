@@ -15,7 +15,7 @@ jobs:
     - name: Check NumPy
       run: ruff check --select NPY --ignore NPY002 gpu4pyscf
   flake:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
     - name: Checkout
       uses: actions/checkout@v7

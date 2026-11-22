@@ -206,7 +206,7 @@ class GradRhoF32BranchUnit(unittest.TestCase):
                                  False)
         # the strict sibling keeps the plain fp64 branch
         ao, cpos, grids = self._operands()
-        c0 = numint._GRAD_RHO_F32_CALLS
+        _c0 = numint._GRAD_RHO_F32_CALLS
         with numint.strict_fp64_reference_ctx():
             numint._grad_rho_f32_lane = True   # a leak simulation
             _ = numint._eval_rho2(ao, cpos, 'GGA')

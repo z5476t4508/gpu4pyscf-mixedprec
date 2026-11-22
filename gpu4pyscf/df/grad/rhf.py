@@ -374,7 +374,7 @@ def _arm_jonly_auxvec_direct(mol, dm, pack):
     stay on the deployed pack construction (the direct identity contracts
     the plain dense dm; the hstack factor semantics of the symmetrize
     convention are out of its scope).'''
-    cderi, pair_addresses, aux_coef = pack[0], pack[1], pack[2]
+    cderi, _, aux_coef = pack[0], pack[1], pack[2]
     armed = (_jonly_auxvec() and not _strict_fp64_reference_active()
              and not hasattr(dm, 'symmetrize'))
     global _JONLY_AUXVEC_GRADS

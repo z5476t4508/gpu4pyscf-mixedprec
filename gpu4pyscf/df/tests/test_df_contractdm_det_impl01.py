@@ -383,7 +383,7 @@ class TestContractdmDetKnob(_KnobState):
         mf = self._converged(mol_sph)
         c0 = i3c._CONTRACTDM_DET_CALLS
         with _RysRecorder() as calls, _MdRecorder() as md_calls:
-            g1 = mf.nuc_grad_method().kernel()
+            _g1 = mf.nuc_grad_method().kernel()
         self.assertEqual(i3c._CONTRACTDM_DET_CALLS, c0)
         self.assertIn('rys', calls)
         self.assertNotIn('rysdet', calls)
