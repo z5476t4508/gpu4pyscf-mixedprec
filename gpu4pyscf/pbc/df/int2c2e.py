@@ -38,12 +38,73 @@ __all__ = [
 
 libpbc.fill_int2c2e.restype = ctypes.c_int
 
+# Int2c2eOpt construction is pure python-side glue over the fixed
+# (aux)cell: ~18 ms at naux=558 vs ~3 ms for the integral kernels
+# themselves (measured on RTX 4090, LC-35).  Molecular DF gradients
+# rebuild the identical opt 2-4x per gradient (once per int2c2e and
+# once per int2c2e_ip1_per_atom call; twice that for range-separated
+# hybrids), so the opt is cached on the Mole for the molecular path.
+# Only the default-kmesh molecular path is cached: an explicit
+# bvk_kmesh argument or a periodic (Cell) input always builds fresh.
+_INT2C2E_OPT_CONSTRUCT_COUNT = 0
+
+def _molecular_int2c2e_opt(cell):
+    '''Cached Int2c2eOpt for a molecular (non-periodic) auxmol.
+
+    The DF gradient path passes the SORTED auxmol of an Int3c2eOpt that
+    is rebuilt per gradient; its ``.mol`` back-reference is the original
+    auxmol, which is stable across those rebuilds, so the cache is keyed
+    there.  A plain Mole input keys on itself.
+
+    Identity token: the key cell's _bas/_env/_atm bytes and cart flag
+    (what the sorting consumes and what the output CT transform reads;
+    _atm covers coordinate-pointer edits, cart selects the spherical/
+    cartesian transform -- LC-66 audit A4: a key cart flip changes the
+    served output shape 224->262 while the cached opt stayed put) plus,
+    when the passed cell is a sorted view, the view's OWN _bas/_env/_atm
+    bytes and cart flag, natm/nao (which discriminate sorting variants
+    of the same original, e.g. a decontracted one).  The sorted view's
+    _env/_atm are distinct arrays from the key's (SortedGTO.from_mol
+    copies _env and shares _atm through copy(deep=False)), so without
+    the view's own bytes an in-place mutation of the PASSED view
+    silently served a stale GPU snapshot (LC-66 audit A1: cached-vs-
+    truth 0.72 on a moved aux coordinate).  ~9 us at naux=558 vs ~3 ms
+    kernel.  The opt snapshots GPU copies of atm/bas/env at
+    construction; any in-place mutation changes the token and pays a
+    fresh build.  The cache lives on the key cell itself, so it cannot
+    outlive it.'''
+    key = cell.mol if isinstance(cell, SortedGTO) else cell
+    if cell is key:
+        token = (key._bas.tobytes(), key._env.tobytes(),
+                 key._atm.tobytes(), bool(key.cart),
+                 cell.natm, cell.nao)
+    else:
+        token = (key._bas.tobytes(), key._env.tobytes(),
+                 key._atm.tobytes(), bool(key.cart),
+                 cell._bas.tobytes(), cell._env.tobytes(),
+                 cell._atm.tobytes(), bool(cell.cart),
+                 cell.natm, cell.nao)
+    cached = key.__dict__.get('_int2c2e_opt_cache')
+    if cached is not None and cached[0] == token:
+        return cached[1]
+    opt = Int2c2eOpt(cell)
+    key._int2c2e_opt_cache = (token, opt)
+    return opt
+
+def _is_molecular(cell):
+    return isinstance(cell, Mole) and getattr(cell, 'lattice', None) is None
+
 def int2c2e(auxcell, kpts=None, bvk_kmesh=None,
             omega=None, lr_factor=None, sr_factor=None):
     '''SR 2c2e Coulomb integrals for the auxiliary basis set'''
     if bvk_kmesh is None:
-        bvk_kmesh = kpts_to_kmesh(auxcell, kpts, bound_by_supmol=True)
-    opt = Int2c2eOpt(auxcell, bvk_kmesh)
+        if _is_molecular(auxcell):
+            opt = _molecular_int2c2e_opt(auxcell)
+        else:
+            bvk_kmesh = kpts_to_kmesh(auxcell, kpts, bound_by_supmol=True)
+            opt = Int2c2eOpt(auxcell, bvk_kmesh)
+    else:
+        opt = Int2c2eOpt(auxcell, bvk_kmesh)
     return opt.int2c2e(kpts, omega=omega, lr_factor=lr_factor, sr_factor=sr_factor)
 
 def sr_int2c2e(auxcell, omega, kpts=None, bvk_kmesh=None):
@@ -61,11 +122,28 @@ def sr_int2c2e(auxcell, omega, kpts=None, bvk_kmesh=None):
         auxcell.omega = omega_backup
 
 def int2c2e_ip1_per_atom(auxcell, dm, kpts=None,
-                         omega=None, lr_factor=None, sr_factor=None):
+                         omega=None, lr_factor=None, sr_factor=None,
+                         det_reduction=False):
     '''SR 2c2e Coulomb integrals for the auxiliary basis set'''
-    opt = Int2c2eOpt(auxcell)
+    # The kernel indexes dm with the CARTESIAN ao_loc of the (sorted)
+    # cell.  A spherical-sized dm silently reads out of bounds and
+    # produces garbage (compute-sanitizer confirmed; found while testing
+    # the opt cache with an invalid input).  Reject it loudly instead.
+    nao_cart = getattr(auxcell, 'nao_cart', None)
+    if callable(nao_cart):
+        nao_cart = nao_cart()
+    if nao_cart is not None and dm.shape[0] < nao_cart:
+        raise ValueError(
+            f'int2c2e_ip1_per_atom: dm has {dm.shape[0]} rows but the '
+            f'auxiliary basis needs {nao_cart} (cartesian) -- a '
+            f'spherical-sized density matrix is not a valid input')
+    if _is_molecular(auxcell):
+        opt = _molecular_int2c2e_opt(auxcell)
+    else:
+        opt = Int2c2eOpt(auxcell)
     return opt.energy_ip1_per_atom(
-        dm, kpts, omega=omega, lr_factor=lr_factor, sr_factor=sr_factor)
+        dm, kpts, omega=omega, lr_factor=lr_factor, sr_factor=sr_factor,
+        det_reduction=det_reduction)
 
 def int2c2e_ip1(auxcell, kpts=None, bvk_kmesh=None, sort_output=True,
                 omega=None, lr_factor=None, sr_factor=None):
@@ -126,6 +204,8 @@ def int2c2e_scheme(omega=0, gout_width=None, shm_size=SHM_SIZE):
 
 class Int2c2eOpt:
     def __init__(self, cell, bvk_kmesh=None):
+        global _INT2C2E_OPT_CONSTRUCT_COUNT
+        _INT2C2E_OPT_CONSTRUCT_COUNT += 1
         cell = self.cell = SortedGTO.from_cell(cell)
         assert cell.uniq_l_ctr[:,0].max() <= L_AUX_MAX
 
@@ -290,8 +370,16 @@ class Int2c2eOpt:
         return out
 
     def energy_ip1_per_atom(self, dm, kpts=None,
-                            omega=None, lr_factor=None, sr_factor=None):
-        '''SR 2c2e Coulomb integrals for the auxiliary basis set'''
+                            omega=None, lr_factor=None, sr_factor=None,
+                            det_reduction=False):
+        '''SR 2c2e Coulomb integrals for the auxiliary basis set
+
+        det_reduction=True (GRADAUX-DET-REDUCTION-01, opt-in, never the
+        default for any existing caller) routes the accumulation through
+        the deterministic atomic-free e_int2c2e_ip1_det entry: identical
+        arithmetic, the only delta is the fixed-order segmented reduction
+        replacing the atomicAdd reassociation (the e645-measured second
+        carrier of the aux sub-chain k-repeat gradient drift).'''
         if self.bas_ij_cache is None:
             self.build()
         cell = self.cell
@@ -318,17 +406,44 @@ class Int2c2eOpt:
         nbatches_shl_pair = len(shl_pair_offsets) - 1
         rys_envs = self._rys_envs
         out = cp.zeros((cell.natm, 3))
-        libpbc.e_int2c2e_ip1.restype = ctypes.c_int
-        err = libpbc.e_int2c2e_ip1(
-            ctypes.cast(out.data.ptr, ctypes.c_void_p),
-            ctypes.cast(dm.data.ptr, ctypes.c_void_p),
-            ctypes.byref(rys_envs), ctypes.c_double(omega),
-            ctypes.c_double(lr_factor), ctypes.c_double(sr_factor),
-            ctypes.c_int(shm_size_max),
-            ctypes.c_int(nbatches_shl_pair),
-            ctypes.cast(shl_pair_offsets.data.ptr, ctypes.c_void_p),
-            ctypes.cast(bas_ij_idx.data.ptr, ctypes.c_void_p),
-            ctypes.cast(gout_stride.data.ptr, ctypes.c_void_p))
+        if det_reduction:
+            # GRADAUX-DET-REDUCTION-01: the per-block partial buffer (one
+            # row per launch block, natm*3 slots; zeroed -- the staged
+            # lane accumulates into its own row with non-atomic
+            # read-modify-write) plus the per-block staging rows (one
+            # (ia, ja, v[6]) entry per thread; no zeroing needed, every
+            # thread overwrites its entry every pair iteration).  The
+            # wrapper's fixed-order det_reduce_2c kernel folds partial
+            # into out.
+            partial = cp.zeros((nbatches_shl_pair, cell.natm*3))
+            stage_v = cp.empty((nbatches_shl_pair, 256, 6))
+            stage_atm = cp.empty((nbatches_shl_pair, 256, 2), dtype=cp.int32)
+            libpbc.e_int2c2e_ip1_det.restype = ctypes.c_int
+            err = libpbc.e_int2c2e_ip1_det(
+                ctypes.cast(out.data.ptr, ctypes.c_void_p),
+                ctypes.cast(dm.data.ptr, ctypes.c_void_p),
+                ctypes.byref(rys_envs), ctypes.c_double(omega),
+                ctypes.c_double(lr_factor), ctypes.c_double(sr_factor),
+                ctypes.c_int(shm_size_max),
+                ctypes.c_int(nbatches_shl_pair),
+                ctypes.cast(shl_pair_offsets.data.ptr, ctypes.c_void_p),
+                ctypes.cast(bas_ij_idx.data.ptr, ctypes.c_void_p),
+                ctypes.cast(gout_stride.data.ptr, ctypes.c_void_p),
+                ctypes.cast(partial.data.ptr, ctypes.c_void_p),
+                ctypes.cast(stage_v.data.ptr, ctypes.c_void_p),
+                ctypes.cast(stage_atm.data.ptr, ctypes.c_void_p))
+        else:
+            libpbc.e_int2c2e_ip1.restype = ctypes.c_int
+            err = libpbc.e_int2c2e_ip1(
+                ctypes.cast(out.data.ptr, ctypes.c_void_p),
+                ctypes.cast(dm.data.ptr, ctypes.c_void_p),
+                ctypes.byref(rys_envs), ctypes.c_double(omega),
+                ctypes.c_double(lr_factor), ctypes.c_double(sr_factor),
+                ctypes.c_int(shm_size_max),
+                ctypes.c_int(nbatches_shl_pair),
+                ctypes.cast(shl_pair_offsets.data.ptr, ctypes.c_void_p),
+                ctypes.cast(bas_ij_idx.data.ptr, ctypes.c_void_p),
+                ctypes.cast(gout_stride.data.ptr, ctypes.c_void_p))
         if err != 0:
             raise RuntimeError('e_int2c2e_ip1 failed')
         return out.get()
